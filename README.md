@@ -1,11 +1,12 @@
-<p align="center">
-  <img src="logo.png" alt="Peregrine Logo" width="400">
-</p>
+
 
 # Peregrine Anti-Cheat
 
 An educational anti-cheat system for learning Windows kernel programming, process monitoring, and cheat detection techniques.
 
+<p align="center">
+  <img src="logo.png" alt="Peregrine Logo" width="400">
+</p>
 ## Overview
 
 Peregrine is a learning-focused anti-cheat project that demonstrates core concepts in game security and Windows internals. This project implements both kernel-mode and user-mode components to detect common cheating techniques used in games.
