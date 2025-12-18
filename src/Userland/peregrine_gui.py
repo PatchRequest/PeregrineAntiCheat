@@ -11,7 +11,7 @@ from ctypes import wintypes
 from DLL import InjectDLL
 
 from PatchDetection import check_process_modules
-from threadWork import checkThread
+from threadWork import checkThread, checkAllThreads
 from IPC import start_server as start_ipc_server
 
 # Constants/IOCTLs mirror the working Python sample
@@ -116,6 +116,7 @@ class PeregrineGUI:
         tk.Button(controls, text="Remove", command=self.on_remove_pid).pack(side=tk.LEFT, padx=(0, 4))
         tk.Button(controls, text="Clear All", command=self.on_clear_all_pids).pack(side=tk.LEFT)
         tk.Button(controls, text="Check Modules", command=self.on_check_modules).pack(side=tk.LEFT, padx=(6, 0))
+        tk.Button(controls, text="Check Threads", command=self.on_check_threads).pack(side=tk.LEFT, padx=(4, 0))
         controls.pack(anchor="w", padx=8, pady=(0, 8))
 
         self.log_view = scrolledtext.ScrolledText(root, wrap=tk.WORD, height=20, state="disabled")
@@ -230,6 +231,13 @@ class PeregrineGUI:
             if err:
                 msg += f" err={err}"
             self.append_log(msg)
+
+    def on_check_threads(self):
+        pid = self._parse_pid_input(require_connection=False)
+        if pid is None:
+            return
+        # Run checkAllThreads in a background thread to avoid blocking UI
+        threading.Thread(target=checkAllThreads, args=(pid, self), daemon=True).start()
 
     def on_ipc_message(self, msg):
         try:

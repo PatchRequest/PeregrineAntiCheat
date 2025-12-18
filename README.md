@@ -34,7 +34,13 @@ The kernel driver (`PeregrineKernelComponent`) operates at ring-0 and provides:
    - Detects thread execution originating outside trusted modules
    - Identifies shellcode execution patterns in non-module memory
 
-4. **DLL Injection Detection**
+4. **Thread Analysis & Module Mapping**
+   - Enumerates all threads in a process and checks their current instruction pointers (RIP)
+   - Maps each thread's execution location to its corresponding module (DLL)
+   - Identifies which code (from which modules) is actively running in the process
+   - Flags suspicious threads executing from unknown or unmapped memory regions
+
+5. **DLL Injection Detection**
    - Monitors unauthorized library loading
    - Tracks suspicious image load notifications
 
