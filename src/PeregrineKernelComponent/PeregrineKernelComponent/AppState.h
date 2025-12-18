@@ -1,0 +1,8 @@
+#pragma once
+#include <ntddk.h>
+
+VOID StateInit(VOID);
+NTSTATUS StateAddPid(HANDLE pid);      // STATUS_SUCCESS / STATUS_INSUFFICIENT_RESOURCES / STATUS_ALREADY_COMMITTED
+NTSTATUS StateRemovePid(HANDLE pid);   // STATUS_SUCCESS / STATUS_NOT_FOUND
+BOOLEAN StateIsPidProtected(HANDLE pid);
+VOID StateClearAll(VOID);

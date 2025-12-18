@@ -1,0 +1,376 @@
+import ctypes
+import json
+import os
+import struct
+import sys
+import threading
+import time
+import tkinter as tk
+from tkinter import scrolledtext
+from ctypes import wintypes
+from DLL import InjectDLL
+
+from PatchDetection import check_process_modules
+from threadWork import checkThread
+from IPC import start_server as start_ipc_server
+
+# Constants/IOCTLs mirror the working Python sample
+FILE_DEVICE_UNKNOWN = 0x00000022
+METHOD_BUFFERED = 0
+FILE_ANY_ACCESS = 0
+
+
+
+
+
+
+def CTL_CODE(dev, func, method, access):
+    return (dev << 16) | (access << 14) | (func << 2) | method
+
+
+IOCTL_PEREGRINE_SEND_FROM_USER = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
+IOCTL_PEREGRINE_RECV_TO_USER = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+GENERIC_READ = 0x80000000
+GENERIC_WRITE = 0x40000000
+OPEN_EXISTING = 3
+
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+kernel32.CreateFileW.restype = wintypes.HANDLE
+kernel32.CreateFileW.argtypes = [
+    wintypes.LPCWSTR,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.LPVOID,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.HANDLE,
+]
+kernel32.DeviceIoControl.restype = wintypes.BOOL
+kernel32.DeviceIoControl.argtypes = [
+    wintypes.HANDLE,
+    wintypes.DWORD,
+    wintypes.LPVOID,
+    wintypes.DWORD,
+    wintypes.LPVOID,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
+    wintypes.LPVOID,
+]
+kernel32.CloseHandle.restype = wintypes.BOOL
+kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+
+def raise_last_error(msg):
+    err = ctypes.get_last_error()
+    raise OSError(err, f"{msg} (err={err})")
+
+
+def open_device(path=r"\\.\\Peregrine"):
+    h = kernel32.CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, None, OPEN_EXISTING, 0, None)
+    if h == wintypes.HANDLE(-1).value:
+        raise_last_error(f"CreateFile({path}) failed")
+    return h
+
+
+def device_io_control(handle, code, in_buf):
+    in_size = len(in_buf) if in_buf else 0
+    in_ptr = ctypes.c_char_p(in_buf) if in_buf else None
+    out_size = 1024
+    out_buf = (ctypes.c_ubyte * out_size)()
+    returned = wintypes.DWORD(0)
+
+    ok = kernel32.DeviceIoControl(
+        handle,
+        code,
+        in_ptr,
+        in_size,
+        ctypes.byref(out_buf),
+        out_size,
+        ctypes.byref(returned),
+        None,
+    )
+    if not ok:
+        return None
+    return bytes(out_buf[: returned.value])
+
+
+class PeregrineGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Peregrine Monitor")
+
+        self.status_var = tk.StringVar(value="Disconnected")
+        self.status_label = tk.Label(root, textvariable=self.status_var, fg="#c83c3c", font=("Segoe UI", 12, "bold"))
+        status_row = tk.Frame(root)
+        tk.Label(status_row, text="Status:").pack(side=tk.LEFT, padx=(0, 6))
+        self.status_label.pack(in_=status_row, side=tk.LEFT)
+        status_row.pack(anchor="w", padx=8, pady=(8, 4))
+
+        controls = tk.Frame(root)
+        tk.Label(controls, text="PID:").pack(side=tk.LEFT, padx=(0, 6))
+        self.pid_var = tk.StringVar()
+        self.pid_entry = tk.Entry(controls, textvariable=self.pid_var, width=12)
+        self.pid_entry.pack(side=tk.LEFT, padx=(0, 6))
+        tk.Button(controls, text="Add", command=self.on_add_pid).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(controls, text="Remove", command=self.on_remove_pid).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(controls, text="Clear All", command=self.on_clear_all_pids).pack(side=tk.LEFT)
+        tk.Button(controls, text="Check Modules", command=self.on_check_modules).pack(side=tk.LEFT, padx=(6, 0))
+        controls.pack(anchor="w", padx=8, pady=(0, 8))
+
+        self.log_view = scrolledtext.ScrolledText(root, wrap=tk.WORD, height=20, state="disabled")
+        self.log_view.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        self.stop_event = threading.Event()
+        self.handle = None
+        self.log_lock = threading.Lock()
+        self.log_lines = []
+        self.max_log_lines = 2000
+        self.ipc_stop = start_ipc_server(on_message=self.on_ipc_message, on_error=self.on_ipc_error)
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        threading.Thread(target=self.connection_loop, daemon=True).start()
+
+    def _pack_handle(self, pid_val: int) -> bytes:
+        # HANDLE is pointer-sized; pack little-endian
+        handle_size = ctypes.sizeof(ctypes.c_void_p)
+        if handle_size == 8:
+            return struct.pack("<Q", pid_val & 0xFFFFFFFFFFFFFFFF)
+        return struct.pack("<L", pid_val & 0xFFFFFFFF)
+
+    def _parse_pid_input(self, require_connection=True):
+        text = self.pid_var.get().strip()
+        if not text:
+            self.append_log("PID input is empty")
+            return None
+        try:
+            pid = int(text, 0)
+        except ValueError:
+            self.append_log(f"invalid PID: {text}")
+            return None
+        if require_connection and not self.handle:
+            self.append_log("cannot set PID: not connected")
+            return None
+        return pid
+
+    def on_add_pid(self):
+        pid = self._parse_pid_input()
+        if pid is None:
+            return
+        payload = bytes([1]) + self._pack_handle(pid)
+        res = device_io_control(self.handle, IOCTL_PEREGRINE_SEND_FROM_USER, payload)
+        if res is None:
+            self.append_log("add PID failed")
+        else:
+            self.append_log(f"added PID {pid}")
+
+    def on_remove_pid(self):
+        pid = self._parse_pid_input()
+        if pid is None:
+            return
+        payload = bytes([2]) + self._pack_handle(pid)
+        res = device_io_control(self.handle, IOCTL_PEREGRINE_SEND_FROM_USER, payload)
+        if res is None:
+            self.append_log("remove PID failed")
+        else:
+            self.append_log(f"removed PID {pid}")
+
+    def on_clear_all_pids(self):
+        if not self.handle:
+            self.append_log("cannot clear PIDs: not connected")
+            return
+        payload = bytes([3])
+        res = device_io_control(self.handle, IOCTL_PEREGRINE_SEND_FROM_USER, payload)
+        if res is None:
+            self.append_log("clear all PIDs failed")
+        else:
+            self.append_log("cleared all PIDs")
+
+    def on_check_modules(self):
+        pid = self._parse_pid_input(require_connection=False)
+        if pid is None:
+            return
+        try:
+            results = check_process_modules(pid)
+        except Exception as exc:  # noqa: BLE001
+            self.append_log(f"module check failed: {exc}")
+            return
+
+        if not results:
+            self.append_log(f"module check: no modules enumerated for pid {pid}")
+            return
+
+        for r in results:
+            path = r.get("path") or "<unknown>"
+            err = r.get("error")
+            base = r.get("base")
+            base_str = f"0x{base:X}" if isinstance(base, int) else "<n/a>"
+            matched_val = r.get("matched")
+            matched = bool(matched_val) if matched_val is not None else None
+            mem_hash = r.get("mem_sha256")
+            disk_hash = r.get("disk_sha256")
+            section = r.get("section") or ""
+            sec_size = r.get("section_size")
+            if matched is True:
+                status = "[ok]"
+            elif matched is False:
+                status = "[tamper]"
+            else:
+                status = "[unknown]"
+            msg = f"{status} {path} base={base_str} size={r.get('size')} matched={matched_val}"
+            if section:
+                msg += f" section={section}"
+            if sec_size:
+                msg += f" sec_size={sec_size}"
+            if mem_hash:
+                msg += f" mem={mem_hash[:8]}"
+            if disk_hash:
+                msg += f" disk={disk_hash[:8]}"
+            if err:
+                msg += f" err={err}"
+            self.append_log(msg)
+
+    def on_ipc_message(self, msg):
+        try:
+            pretty = json.dumps(msg)
+        except Exception:
+            pretty = str(msg)
+        self.append_log(f"[ipc] {pretty}")
+
+    def on_ipc_error(self, err):
+        self.append_log(f"[ipc-error] {err}")
+
+    def set_status(self, text, color):
+        self.root.after(0, lambda: (self.status_var.set(text), self.status_label.configure(fg=color)))
+
+    def append_log(self, msg):
+        with self.log_lock:
+            self.log_lines.append(msg)
+            if len(self.log_lines) > self.max_log_lines:
+                self.log_lines = self.log_lines[-self.max_log_lines :]
+            text = "\n".join(self.log_lines)
+        self.root.after(0, lambda: self._render_log(text))
+
+    def _render_log(self, text):
+        self.log_view.configure(state="normal")
+        self.log_view.delete("1.0", tk.END)
+        self.log_view.insert(tk.END, text)
+        self.log_view.see(tk.END)
+        self.log_view.configure(state="disabled")
+
+    def connection_loop(self):
+        backoff = 0.5
+        max_backoff = 5.0
+        while not self.stop_event.is_set():
+            try:
+                h = open_device()
+                self.handle = h
+                self.set_status("Connected", "#3cb45a")
+                self.append_log("connected")
+                #self._add_own_pid()
+                backoff = 0.5
+                self.receiver_loop()
+            except Exception as exc:
+                self.handle = None
+                self.set_status("Disconnected", "#c83c3c")
+                self.append_log(f"connect failed: {exc} (retry in {backoff:.1f}s)")
+                time.sleep(backoff)
+                backoff = min(max_backoff, backoff * 2)
+
+    def receiver_loop(self):
+        while not self.stop_event.is_set() and self.handle:
+            data = device_io_control(self.handle, IOCTL_PEREGRINE_RECV_TO_USER, b"")
+            if data:
+                s = data.decode("utf-8", errors="ignore")
+                s_fixed = s.replace("\\", "\\\\")
+                try:
+                    obj = json.loads(s_fixed)
+                    if obj.get("event"):
+                        #self.append_log(f"[from kernel] event={obj['event']} raw={data!r}")
+                        if obj['event'] == "thread_create":
+                            # Run checkThread in background to avoid blocking receiver loop
+                            threading.Thread(target=checkThread, args=(obj, self), daemon=True).start()
+
+                        elif obj['event'] == "process_create":
+                            pid = obj.get("pid", "N/A")
+                            if pid != "N/A" and pid != os.getpid():
+                                threading.Thread(target=InjectDLL, args=(pid, b"PeregrineDLL.dll", self.append_log), daemon=True).start()
+
+                        elif obj["event"] == "image_load":
+                            self.append_log(f"[from kernel] event={obj['event']} raw={data!r}")
+
+                    else:
+                        self.append_log(f"[from kernel] {data!r}")
+                except Exception as exc:
+                    self.append_log(f"decode error: {exc} raw={data!r}")
+
+    def on_close(self):
+        self.stop_event.set()
+        if self.handle:
+            kernel32.CloseHandle(self.handle)
+        if self.ipc_stop:
+            self.ipc_stop.set()
+        self.root.destroy()
+
+    def _add_own_pid(self):
+        """Send our own process ID as protected right after connect."""
+        my_pid = os.getpid()
+        payload = bytes([1]) + self._pack_handle(my_pid)
+        res = device_io_control(self.handle, IOCTL_PEREGRINE_SEND_FROM_USER, payload)
+        if res is None:
+            self.append_log(f"auto-add self PID {my_pid} failed")
+        else:
+            self.append_log(f"auto-added self PID {my_pid}")
+
+def is_admin():
+    """Check if the script is running with administrator privileges."""
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except Exception:
+        return False
+
+
+def elevate():
+    """Re-launch the script with administrator privileges."""
+    try:
+        if sys.argv[0].endswith('.py'):
+            # Running as a Python script
+            params = ' '.join([f'"{arg}"' for arg in sys.argv])
+            ctypes.windll.shell32.ShellExecuteW(
+                None,
+                "runas",
+                sys.executable,
+                params,
+                None,
+                1  # SW_SHOWNORMAL
+            )
+        else:
+            # Running as a compiled executable
+            params = ' '.join([f'"{arg}"' for arg in sys.argv[1:]])
+            ctypes.windll.shell32.ShellExecuteW(
+                None,
+                "runas",
+                sys.argv[0],
+                params,
+                None,
+                1  # SW_SHOWNORMAL
+            )
+    except Exception as e:
+        print(f"Failed to elevate: {e}")
+        sys.exit(1)
+
+def main():
+    if not is_admin():
+        print("Not running as administrator. Requesting elevation...")
+        elevate()
+        sys.exit(0)
+
+    print("Running with administrator privileges")
+    root = tk.Tk()
+    PeregrineGUI(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

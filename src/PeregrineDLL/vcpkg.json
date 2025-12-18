@@ -1,0 +1,8 @@
+{
+  "name": "peregrine-dll",
+  "version-string": "1.0.0",
+  "builtin-baseline": "be2e197ea5bc32028dad3c651053ed926d91a2d7",
+  "dependencies": [
+    "minhook"
+  ]
+}

@@ -1,0 +1,66 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+      <Extensions>cpp;c;cc;cxx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
+    </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+      <Extensions>h;hpp;hxx;hm;inl;inc;xsd</Extensions>
+    </Filter>
+    <Filter Include="Resource Files">
+      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
+      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
+    </Filter>
+    <Filter Include="Driver Files">
+      <UniqueIdentifier>{8E41214B-6785-4CFE-B992-037D68949A14}</UniqueIdentifier>
+      <Extensions>inf;inv;inx;mof;mc;</Extensions>
+    </Filter>
+    <Filter Include="Source Files\Coms">
+      <UniqueIdentifier>{f40625b7-2c6f-46c7-9c4e-eba3dae9c425}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\obCallback">
+      <UniqueIdentifier>{41aa8f28-e747-4955-9acd-fb53c4d02324}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\NotifyRoutine">
+      <UniqueIdentifier>{0cc91913-b922-41f5-9875-856f6d4f2be2}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\AppState">
+      <UniqueIdentifier>{b05e5457-f145-4cd4-b615-d5012ee7f507}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="main.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Coms.c">
+      <Filter>Source Files\Coms</Filter>
+    </ClCompile>
+    <ClCompile Include="obCallback.c">
+      <Filter>Source Files\obCallback</Filter>
+    </ClCompile>
+    <ClCompile Include="NotifyRoutine.c">
+      <Filter>Source Files\NotifyRoutine</Filter>
+    </ClCompile>
+    <ClCompile Include="AppState.c">
+      <Filter>Source Files\AppState</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="Coms.h">
+      <Filter>Source Files\Coms</Filter>
+    </None>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="obCallback.h">
+      <Filter>Source Files\obCallback</Filter>
+    </ClInclude>
+    <ClInclude Include="NotifyRoutine.h">
+      <Filter>Source Files\NotifyRoutine</Filter>
+    </ClInclude>
+    <ClInclude Include="AppState.h">
+      <Filter>Source Files\AppState</Filter>
+    </ClInclude>
+  </ItemGroup>
+</Project>
