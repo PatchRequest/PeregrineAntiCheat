@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.png" alt="Peregrine Logo" width="400">
+</p>
+
 # Peregrine Anti-Cheat
 
 An educational anti-cheat system for learning Windows kernel programming, process monitoring, and cheat detection techniques.
