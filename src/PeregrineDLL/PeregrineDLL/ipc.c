@@ -2,9 +2,20 @@
 #include <stdio.h>
 #include "ipc.h"
 #include <string.h>
+#include <stdarg.h>
 #include <windows.h>
 
 #define IPC_PIPE_NAMEA "\\\\.\\pipe\\peregrine_ipc"
+
+// Helper to log to OutputDebugString (viewable in DebugView)
+static void DebugLog(const char* format, ...) {
+    char buf[512];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(buf, sizeof(buf), format, args);
+    va_end(args);
+    OutputDebugStringA(buf);
+}
 
 static ULONGLONG ptr_to_ull(const void* p) {
     return (ULONGLONG)(ULONG_PTR)p;
@@ -15,13 +26,10 @@ void ipc_write_json(const char* json) {
     if (!json) return;
 
     // Avoid blocking indefinitely if nobody is listening.
-    if (!WaitNamedPipeA(IPC_PIPE_NAMEA, 100)) {
+    if (!WaitNamedPipeA(IPC_PIPE_NAMEA, 500)) {
         DWORD err = GetLastError();
-        if (err == ERROR_FILE_NOT_FOUND || err == ERROR_SEM_TIMEOUT) {
-            fprintf(stderr, "[IPC] Pipe not available (is peregrine_gui.py running?)\n");
-        } else {
-            fprintf(stderr, "[IPC] WaitNamedPipe failed: %lu\n", err);
-        }
+        // Silently fail - pipe not being available is normal
+        DebugLog("[IPC] Pipe not available (err=%lu)\n", err);
         return;
     }
 
@@ -35,18 +43,18 @@ void ipc_write_json(const char* json) {
         NULL);
 
     if (h == INVALID_HANDLE_VALUE) {
-        fprintf(stderr, "[IPC] CreateFile failed: %lu\n", GetLastError());
+        DebugLog("[IPC] CreateFile failed: %lu\n", GetLastError());
         return;
     }
 
     DWORD len = (DWORD)strlen(json);
     DWORD written = 0;
     if (!WriteFile(h, json, len, &written, NULL)) {
-        fprintf(stderr, "[IPC] WriteFile failed: %lu\n", GetLastError());
+        DebugLog("[IPC] WriteFile failed: %lu\n", GetLastError());
     } else if (written != len) {
-        fprintf(stderr, "[IPC] Partial write: %lu/%lu bytes\n", written, len);
+        DebugLog("[IPC] Partial write: %lu/%lu bytes\n", written, len);
     } else {
-        printf("[IPC] Sent %lu bytes successfully\n", written);
+        DebugLog("[IPC] Sent %lu bytes successfully\n", written);
     }
     CloseHandle(h);
 }

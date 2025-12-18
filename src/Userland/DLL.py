@@ -123,9 +123,14 @@ def InjectDLL(target_pid: int, filename_dll: bytes, log_callback=None):
             kernel32.CloseHandle(h_thread)
             kernel32.VirtualFreeEx(h_proc, remote_mem, 0, MEM_RELEASE)
 
-            if log_callback:
-                dll_name = filename_dll.rstrip(b"\x00").decode('utf-8', errors='ignore')
-                log_callback(f"[DLL Inject] Successfully injected {dll_name} into PID={target_pid}")
+            # Check if LoadLibraryA succeeded (non-zero HMODULE)
+            dll_name = filename_dll.rstrip(b"\x00").decode('utf-8', errors='ignore')
+            if exit_code.value == 0:
+                if log_callback:
+                    log_callback(f"[DLL Inject] LoadLibraryA returned NULL for {dll_name} in PID={target_pid} - DLL not found or failed to load!")
+            else:
+                if log_callback:
+                    log_callback(f"[DLL Inject] Successfully injected {dll_name} into PID={target_pid} (HMODULE=0x{exit_code.value:X})")
 
             return exit_code.value
         finally:
@@ -133,7 +138,7 @@ def InjectDLL(target_pid: int, filename_dll: bytes, log_callback=None):
     except Exception as e:
         if log_callback:
             dll_name = filename_dll.rstrip(b"\x00").decode('utf-8', errors='ignore') if isinstance(filename_dll, bytes) else str(filename_dll)
-            #log_callback(f"[DLL Inject] Failed to inject {dll_name} into PID={target_pid}: {e}")
+            log_callback(f"[DLL Inject] Failed to inject {dll_name} into PID={target_pid}: {e}")
         else:
             # Re-raise if no callback provided (backward compatibility)
             raise

@@ -3,7 +3,18 @@
 #include "MinHook.h"
 #include "ipc.h"
 #include <stdio.h>
+#include <stdarg.h>
 #pragma comment(lib, "user32.lib")
+
+// Helper to log to OutputDebugString (viewable in DebugView)
+static void DebugLog(const char* format, ...) {
+    char buf[512];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(buf, sizeof(buf), format, args);
+    va_end(args);
+    OutputDebugStringA(buf);
+}
 
 static volatile LONG g_console_ready = 0;
 static void EnsureConsole() {
@@ -22,6 +33,16 @@ static void EnsureConsole() {
     freopen_s(&dummy, "CONIN$", "r", stdin);
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
+
+    // Make console visible and bring to front
+    HWND consoleWnd = GetConsoleWindow();
+    if (consoleWnd) {
+        SetWindowPos(consoleWnd, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        SetConsoleTitle(L"PeregrineDLL Debug Console");
+        ShowWindow(consoleWnd, SW_SHOW);
+        SetForegroundWindow(consoleWnd);
+    }
 }
 
 static int PID = GetCurrentProcessId();
@@ -38,16 +59,14 @@ static HANDLE WINAPI HookCreateRemoteThreadEx(
     LPTHREAD_START_ROUTINE start, LPVOID param, DWORD flags,
     LPPROC_THREAD_ATTRIBUTE_LIST attrList, LPDWORD tid)
 {
-    printf("[PeregrineDLL] CreateRemoteThreadEx hook called!\n");
-    fflush(stdout);
+    DebugLog("[PeregrineDLL] CreateRemoteThreadEx hook called!\n");
 
     HANDLE h = oCreateRemoteThreadEx
         ? oCreateRemoteThreadEx(hProcess, sa, stackSize, start, param, flags, attrList, tid)
         : NULL;
 
     DWORD gle = GetLastError();
-    printf("[PeregrineDLL] Logging CreateRemoteThreadEx to IPC...\n");
-    fflush(stdout);
+    DebugLog("[PeregrineDLL] Logging CreateRemoteThreadEx to IPC...\n");
 
     ipc_log_createremotethreadex(
         hProcess,
@@ -78,50 +97,43 @@ static void HookExport(HMODULE mod, LPCSTR name, void** pReal, void* hook) {
 
 static DWORD WINAPI InitThread(LPVOID) {
     if (InterlockedCompareExchange(&g_inited, 1, 0) != 0) return 0;
-    EnsureConsole();
-    printf("[PeregrineDLL] InitThread started (PID=%d)\n", PID);
-    fflush(stdout);
+    // EnsureConsole();  // Disabled to prevent console window from opening
+    DebugLog("[PeregrineDLL] InitThread started (PID=%d)\n", PID);
 
     if (MH_Initialize() != MH_OK) {
-        fprintf(stderr, "[PeregrineDLL] MH_Initialize failed; aborting hooks.\n");
+        DebugLog("[PeregrineDLL] MH_Initialize failed; aborting hooks.\n");
         return 0;
     }
-    printf("[PeregrineDLL] MinHook initialized successfully\n");
-    fflush(stdout);
+    DebugLog("[PeregrineDLL] MinHook initialized successfully\n");
 
     // write a hello world to the ipc pipe
-    printf("[PeregrineDLL] Attempting to send dll_loaded event via IPC...\n");
-    fflush(stdout);
+    DebugLog("[PeregrineDLL] Attempting to send dll_loaded event via IPC...\n");
     ipc_write_json("{\"event\":\"dll_loaded\",\"message\":\"PeregrineDLL loaded successfully.\"}");
-    printf("[PeregrineDLL] IPC message sent (or failed silently if pipe not available)\n");
-    fflush(stdout);
+    DebugLog("[PeregrineDLL] IPC message sent (or failed silently if pipe not available)\n");
 
     HMODULE kb = GetModuleHandleW(L"KernelBase.dll");
     HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
     if (!kb && !k32) {
-        fprintf(stderr, "[PeregrineDLL] Failed to locate KernelBase/kernel32 modules.\n");
+        DebugLog("[PeregrineDLL] Failed to locate KernelBase/kernel32 modules.\n");
     }
 
     HookExport(kb, "CreateRemoteThreadEx", (void**)&oCreateRemoteThreadEx, (void*)HookCreateRemoteThreadEx);
     if (!oCreateRemoteThreadEx)
         HookExport(k32, "CreateRemoteThreadEx", (void**)&oCreateRemoteThreadEx, (void*)HookCreateRemoteThreadEx);
     if (oCreateRemoteThreadEx) {
-        printf("[PeregrineDLL] Successfully hooked CreateRemoteThreadEx\n");
+        DebugLog("[PeregrineDLL] Successfully hooked CreateRemoteThreadEx\n");
     } else {
-        fprintf(stderr, "[PeregrineDLL] Failed to hook CreateRemoteThreadEx.\n");
+        DebugLog("[PeregrineDLL] Failed to hook CreateRemoteThreadEx.\n");
     }
-    fflush(stdout);
 
-    printf("[PeregrineDLL] Initialization complete\n");
-    fflush(stdout);
+    DebugLog("[PeregrineDLL] Initialization complete\n");
     return 0;
 }
 
 // Debug entry for rundll32 to force console visibility and keep process alive.
 extern "C" __declspec(dllexport) void CALLBACK DebugEntry(HWND, HINSTANCE, LPSTR, int) {
     EnsureConsole();
-    printf("[PeregrineDLL] DebugEntry running; press Ctrl+C or kill process to exit.\n");
-    fflush(stdout);
+    DebugLog("[PeregrineDLL] DebugEntry running; press Ctrl+C or kill process to exit.\n");
     Sleep(INFINITE);
 }
 

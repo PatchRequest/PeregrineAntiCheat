@@ -8,6 +8,7 @@ import time
 import tkinter as tk
 from tkinter import scrolledtext
 from ctypes import wintypes
+from pathlib import Path
 from DLL import InjectDLL
 
 from PatchDetection import check_process_modules
@@ -60,6 +61,65 @@ kernel32.DeviceIoControl.argtypes = [
 kernel32.CloseHandle.restype = wintypes.BOOL
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 
+kernel32.IsWow64Process.restype = wintypes.BOOL
+kernel32.IsWow64Process.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
+
+kernel32.OpenProcess.restype = wintypes.HANDLE
+kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+
+
+def is_process_32bit(pid):
+    """Check if a process is 32-bit. Returns None if unable to determine."""
+    import platform
+
+    # If we're on 32-bit Windows, all processes are 32-bit
+    if platform.machine().lower() not in ['amd64', 'x86_64']:
+        return True
+
+    PROCESS_QUERY_INFORMATION = 0x0400
+    h_process = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION, False, pid)
+    if not h_process:
+        return None
+
+    try:
+        is_wow64 = wintypes.BOOL()
+        if kernel32.IsWow64Process(h_process, ctypes.byref(is_wow64)):
+            # If IsWow64Process returns TRUE, the process is 32-bit running on 64-bit Windows
+            return bool(is_wow64.value)
+        return None
+    finally:
+        kernel32.CloseHandle(h_process)
+
+
+def find_dll_paths():
+    """Get the absolute paths to both x86 and x64 DLLs next to this script."""
+    script_dir = Path(__file__).parent.absolute()
+    dll_x64 = script_dir / "PeregrineDLL_x64.dll"
+    dll_x86 = script_dir / "PeregrineDLL_x86.dll"
+
+    # Also check for generic name (assume x64)
+    dll_generic = script_dir / "PeregrineDLL.dll"
+
+    paths = {}
+
+    if dll_x64.exists():
+        paths['x64'] = str(dll_x64).encode('ascii')
+        print(f"Found x64 DLL at: {dll_x64}")
+    elif dll_generic.exists():
+        paths['x64'] = str(dll_generic).encode('ascii')
+        print(f"Found DLL (assuming x64) at: {dll_generic}")
+    else:
+        print(f"WARNING: x64 DLL not found")
+        paths['x64'] = None
+
+    if dll_x86.exists():
+        paths['x86'] = str(dll_x86).encode('ascii')
+        print(f"Found x86 DLL at: {dll_x86}")
+    else:
+        print(f"WARNING: x86 DLL not found")
+        paths['x86'] = None
+
+    return paths
 
 def raise_last_error(msg):
     err = ctypes.get_last_error()
@@ -99,6 +159,9 @@ class PeregrineGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Peregrine Monitor")
+
+        # Find DLL paths once at startup
+        self.dll_paths = find_dll_paths()
 
         self.status_var = tk.StringVar(value="Disconnected")
         self.status_label = tk.Label(root, textvariable=self.status_var, fg="#c83c3c", font=("Segoe UI", 12, "bold"))
@@ -303,7 +366,22 @@ class PeregrineGUI:
                         elif obj['event'] == "process_create":
                             pid = obj.get("pid", "N/A")
                             if pid != "N/A" and pid != os.getpid():
-                                threading.Thread(target=InjectDLL, args=(pid, b"PeregrineDLL.dll", self.append_log), daemon=True).start()
+                                # Determine which DLL to inject based on process architecture
+                                is_32bit = is_process_32bit(pid)
+                                if is_32bit is None:
+                                    self.append_log(f"[DLL Inject] Cannot determine architecture for PID={pid}, skipping")
+                                elif is_32bit:
+                                    dll_path = self.dll_paths.get('x86')
+                                    if dll_path:
+                                        threading.Thread(target=InjectDLL, args=(pid, dll_path, self.append_log), daemon=True).start()
+                                    else:
+                                        self.append_log(f"[DLL Inject] No x86 DLL available for 32-bit PID={pid}")
+                                else:
+                                    dll_path = self.dll_paths.get('x64')
+                                    if dll_path:
+                                        threading.Thread(target=InjectDLL, args=(pid, dll_path, self.append_log), daemon=True).start()
+                                    else:
+                                        self.append_log(f"[DLL Inject] No x64 DLL available for 64-bit PID={pid}")
 
                         elif obj["event"] == "image_load":
                             self.append_log(f"[from kernel] event={obj['event']} raw={data!r}")

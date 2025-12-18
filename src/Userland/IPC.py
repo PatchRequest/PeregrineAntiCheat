@@ -8,57 +8,66 @@ import win32pipe
 import winerror
 import win32security
 import ntsecuritycon
+import win32event
 
 PIPE_NAME = r"\\.\pipe\peregrine_ipc"
 BUFSZ = 65536
+INITIAL_PIPE_INSTANCES = 10  # Create this many pipe instances upfront
 
 
-def read_message(h) -> bytes:
-    """Read a whole message (pipe in message mode); tolerates ERROR_MORE_DATA."""
-    chunks = []
-    while True:
+class PipeInstance:
+    """Represents a single pipe instance with overlapped I/O."""
+    def __init__(self, sa):
+        self.handle = win32pipe.CreateNamedPipe(
+            PIPE_NAME,
+            win32pipe.PIPE_ACCESS_DUPLEX | win32file.FILE_FLAG_OVERLAPPED,
+            win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_MESSAGE | win32pipe.PIPE_WAIT,
+            win32pipe.PIPE_UNLIMITED_INSTANCES,
+            BUFSZ,
+            BUFSZ,
+            0,
+            sa,
+        )
+        self.overlapped = pywintypes.OVERLAPPED()
+        self.overlapped.hEvent = win32event.CreateEvent(None, True, False, None)
+        self.state = "CONNECTING"  # CONNECTING, READING, DISCONNECTING
+        self.buffer = win32file.AllocateReadBuffer(BUFSZ)
+
+    def start_connect(self):
+        """Initiate an overlapped ConnectNamedPipe operation."""
+        self.state = "CONNECTING"
         try:
-            _, chunk = win32file.ReadFile(h, BUFSZ)
-            chunks.append(chunk)
-            break
+            win32pipe.ConnectNamedPipe(self.handle, self.overlapped)
         except pywintypes.error as e:
-            if e.winerror == winerror.ERROR_MORE_DATA:
-                chunks.append(e.args[2])
-                continue
-            raise
-    return b"".join(chunks)
+            # ERROR_IO_PENDING (997) is expected for overlapped operations
+            if e.winerror != winerror.ERROR_IO_PENDING:
+                # ERROR_PIPE_CONNECTED (535) means client connected before we called ConnectNamedPipe
+                if e.winerror != winerror.ERROR_PIPE_CONNECTED:
+                    raise
 
-
-def client_worker(
-    h,
-    on_message: Optional[Callable[[dict], None]] = None,
-    on_error: Optional[Callable[[str], None]] = None,
-    stop_event: Optional[threading.Event] = None,
-):
-    try:
-        while True:
-            if stop_event and stop_event.is_set():
-                break
-            payload = read_message(h)
-            msg = json.loads(payload.decode("utf-8"))
-
-            if on_message:
-                try:
-                    on_message(msg)
-                except Exception as cb_exc:  # noqa: BLE001
-                    if on_error:
-                        on_error(f"on_message error: {cb_exc}")
-
-    except pywintypes.error as e:
-        # ERROR_BROKEN_PIPE (109) means client disconnected - this is normal
-        if e.winerror != 109 and on_error:
-            on_error(f"ipc client error: {e}")
-    except (ValueError, json.JSONDecodeError) as e:
-        if on_error:
-            on_error(f"ipc client error: {e}")
-    finally:
+    def start_read(self):
+        """Initiate an overlapped ReadFile operation."""
+        self.state = "READING"
+        win32event.ResetEvent(self.overlapped.hEvent)
         try:
-            win32file.CloseHandle(h)
+            hr, self.buffer = win32file.ReadFile(self.handle, BUFSZ, self.overlapped)
+        except pywintypes.error as e:
+            if e.winerror != winerror.ERROR_IO_PENDING:
+                raise
+
+    def disconnect(self):
+        """Disconnect the client and prepare for reuse."""
+        self.state = "DISCONNECTING"
+        try:
+            win32pipe.DisconnectNamedPipe(self.handle)
+        except Exception:
+            pass
+
+    def close(self):
+        """Close the pipe handle and event."""
+        try:
+            win32file.CloseHandle(self.handle)
+            win32event.CloseHandle(self.overlapped.hEvent)
         except Exception:
             pass
 
@@ -95,45 +104,120 @@ def start_server(
     on_error: Optional[Callable[[str], None]] = None,
 ):
     """
-    Starts the named-pipe server in background threads.
+    Starts an overlapped I/O named-pipe server with multiple pipe instances.
     Returns a stop_event you can set() to request shutdown.
     """
     stop_event = threading.Event()
+    stop_event_handle = win32event.CreateEvent(None, True, False, None)
 
-    def accept_loop():
+    def server_loop():
         sa = create_permissive_security_attributes()
-        while not stop_event.is_set():
-            h = win32pipe.CreateNamedPipe(
-                PIPE_NAME,
-                win32pipe.PIPE_ACCESS_DUPLEX,
-                win32pipe.PIPE_TYPE_MESSAGE
-                | win32pipe.PIPE_READMODE_MESSAGE
-                | win32pipe.PIPE_WAIT,
-                win32pipe.PIPE_UNLIMITED_INSTANCES,
-                BUFSZ,
-                BUFSZ,
-                0,
-                sa,
-            )
+        pipes = []
 
-            try:
-                win32pipe.ConnectNamedPipe(h, None)
-            except pywintypes.error as e:
-                if on_error:
-                    on_error(f"ipc connect error: {e}")
+        try:
+            # Create initial pool of pipe instances
+            for _ in range(INITIAL_PIPE_INSTANCES):
                 try:
-                    win32file.CloseHandle(h)
-                except Exception:
-                    pass
-                continue
+                    pipe = PipeInstance(sa)
+                    pipe.start_connect()
+                    pipes.append(pipe)
+                except Exception as e:
+                    if on_error:
+                        on_error(f"Failed to create pipe instance: {e}")
 
-            threading.Thread(
-                target=client_worker,
-                args=(h, on_message, on_error, stop_event),
-                daemon=True,
-            ).start()
+            while not stop_event.is_set():
+                # Build list of events to wait on
+                events = [stop_event_handle] + [p.overlapped.hEvent for p in pipes]
 
-    threading.Thread(target=accept_loop, daemon=True).start()
+                try:
+                    # Wait for any event to signal (timeout every second to check stop_event)
+                    result = win32event.WaitForMultipleObjects(events, False, 1000)
+
+                    # Check if stop event was signaled
+                    if result == win32event.WAIT_OBJECT_0:
+                        break
+
+                    # Timeout - just loop back to check stop_event
+                    if result == win32event.WAIT_TIMEOUT:
+                        continue
+
+                    # Calculate which pipe signaled
+                    pipe_idx = result - win32event.WAIT_OBJECT_0 - 1
+                    if pipe_idx < 0 or pipe_idx >= len(pipes):
+                        continue
+
+                    pipe = pipes[pipe_idx]
+
+                    # Get the number of bytes transferred
+                    try:
+                        bytes_transferred = win32file.GetOverlappedResult(
+                            pipe.handle, pipe.overlapped, False
+                        )
+                    except pywintypes.error as e:
+                        # Client disconnected or error - recycle this pipe
+                        if on_error and e.winerror not in (109, 232):  # Not BROKEN_PIPE or PIPE_CLOSING
+                            on_error(f"GetOverlappedResult error: {e}")
+                        pipe.disconnect()
+                        pipe.start_connect()
+                        continue
+
+                    # Handle based on current state
+                    if pipe.state == "CONNECTING":
+                        # Client connected, start reading
+                        try:
+                            pipe.start_read()
+                        except Exception as e:
+                            if on_error:
+                                on_error(f"Failed to start read: {e}")
+                            pipe.disconnect()
+                            pipe.start_connect()
+
+                    elif pipe.state == "READING":
+                        # Read completed, process message
+                        try:
+                            data = bytes(pipe.buffer[:bytes_transferred])
+                            msg = json.loads(data.decode("utf-8"))
+
+                            if on_message:
+                                try:
+                                    on_message(msg)
+                                except Exception as cb_exc:
+                                    if on_error:
+                                        on_error(f"on_message error: {cb_exc}")
+
+                        except (ValueError, json.JSONDecodeError) as e:
+                            if on_error:
+                                on_error(f"json decode error: {e}")
+                        except Exception as e:
+                            if on_error:
+                                on_error(f"message processing error: {e}")
+
+                        # Disconnect and wait for next client
+                        pipe.disconnect()
+                        pipe.start_connect()
+
+                except Exception as e:
+                    if not stop_event.is_set() and on_error:
+                        on_error(f"server loop error: {e}")
+
+        finally:
+            # Cleanup
+            for pipe in pipes:
+                pipe.close()
+            win32event.CloseHandle(stop_event_handle)
+
+    def stop_callback():
+        """Called when stop_event is set to signal the server thread."""
+        win32event.SetEvent(stop_event_handle)
+
+    # Override the stop_event.set to also signal our Windows event
+    original_set = stop_event.set
+    def new_set():
+        original_set()
+        stop_callback()
+    stop_event.set = new_set
+
+    threading.Thread(target=server_loop, daemon=True).start()
     return stop_event
 
 
