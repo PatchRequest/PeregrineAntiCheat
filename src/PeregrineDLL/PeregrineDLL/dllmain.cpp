@@ -49,39 +49,155 @@ static int PID = GetCurrentProcessId();
 static volatile LONG g_inited = 0;
 
 
-typedef HANDLE(WINAPI* CreateRemoteThreadEx_t)(
-    HANDLE, LPSECURITY_ATTRIBUTES, SIZE_T, LPTHREAD_START_ROUTINE,
-    LPVOID, DWORD, LPPROC_THREAD_ATTRIBUTE_LIST, LPDWORD);
+typedef BOOL(WINAPI* ReadProcessMemory_t)(
+    HANDLE hProcess,
+    LPCVOID lpBaseAddress,
+    LPVOID lpBuffer,
+    SIZE_T nSize,
+    SIZE_T* lpNumberOfBytesRead);
 
-static CreateRemoteThreadEx_t oCreateRemoteThreadEx = nullptr;
-static HANDLE WINAPI HookCreateRemoteThreadEx(
-    HANDLE hProcess, LPSECURITY_ATTRIBUTES sa, SIZE_T stackSize,
-    LPTHREAD_START_ROUTINE start, LPVOID param, DWORD flags,
-    LPPROC_THREAD_ATTRIBUTE_LIST attrList, LPDWORD tid)
+typedef BOOL(WINAPI* WriteProcessMemory_t)(
+    HANDLE hProcess,
+    LPVOID lpBaseAddress,
+    LPCVOID lpBuffer,
+    SIZE_T nSize,
+    SIZE_T* lpNumberOfBytesWritten);
+
+// Native API typedefs (NTSTATUS return value)
+typedef LONG NTSTATUS;
+#define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
+
+typedef NTSTATUS(NTAPI* NtReadVirtualMemory_t)(
+    HANDLE ProcessHandle,
+    PVOID BaseAddress,
+    PVOID Buffer,
+    SIZE_T NumberOfBytesToRead,
+    PSIZE_T NumberOfBytesRead);
+
+typedef NTSTATUS(NTAPI* NtWriteVirtualMemory_t)(
+    HANDLE ProcessHandle,
+    PVOID BaseAddress,
+    PVOID Buffer,
+    SIZE_T NumberOfBytesToWrite,
+    PSIZE_T NumberOfBytesWritten);
+
+static ReadProcessMemory_t oReadProcessMemory = nullptr;
+static WriteProcessMemory_t oWriteProcessMemory = nullptr;
+static NtReadVirtualMemory_t oNtReadVirtualMemory = nullptr;
+static NtWriteVirtualMemory_t oNtWriteVirtualMemory = nullptr;
+
+static BOOL WINAPI HookReadProcessMemory(
+    HANDLE hProcess,
+    LPCVOID lpBaseAddress,
+    LPVOID lpBuffer,
+    SIZE_T nSize,
+    SIZE_T* lpNumberOfBytesRead)
 {
-    DebugLog("[PeregrineDLL] CreateRemoteThreadEx hook called!\n");
+    // Call original function first
+    BOOL result = oReadProcessMemory
+        ? oReadProcessMemory(hProcess, lpBaseAddress, lpBuffer, nSize, lpNumberOfBytesRead)
+        : FALSE;
 
-    HANDLE h = oCreateRemoteThreadEx
-        ? oCreateRemoteThreadEx(hProcess, sa, stackSize, start, param, flags, attrList, tid)
-        : NULL;
-
+    DWORD targetPID = GetProcessId(hProcess);
     DWORD gle = GetLastError();
-    DebugLog("[PeregrineDLL] Logging CreateRemoteThreadEx to IPC...\n");
 
-    ipc_log_createremotethreadex(
+    // Log to IPC
+    ipc_log_readprocessmemory(
         hProcess,
-        sa,
-        stackSize,
-        start,
-        param,
-        flags,
-        attrList,
-        tid,
-        h,
+        targetPID,
+        lpBaseAddress,
+        nSize,
+        lpNumberOfBytesRead ? *lpNumberOfBytesRead : 0,
+        result,
         gle,
         PID);
 
-    return h;
+    return result;
+}
+
+static BOOL WINAPI HookWriteProcessMemory(
+    HANDLE hProcess,
+    LPVOID lpBaseAddress,
+    LPCVOID lpBuffer,
+    SIZE_T nSize,
+    SIZE_T* lpNumberOfBytesWritten)
+{
+    // Call original function first
+    BOOL result = oWriteProcessMemory
+        ? oWriteProcessMemory(hProcess, lpBaseAddress, lpBuffer, nSize, lpNumberOfBytesWritten)
+        : FALSE;
+
+    DWORD targetPID = GetProcessId(hProcess);
+    DWORD gle = GetLastError();
+
+    // Log to IPC
+    ipc_log_writeprocessmemory(
+        hProcess,
+        targetPID,
+        lpBaseAddress,
+        nSize,
+        lpNumberOfBytesWritten ? *lpNumberOfBytesWritten : 0,
+        result,
+        gle,
+        PID);
+
+    return result;
+}
+
+static NTSTATUS NTAPI HookNtReadVirtualMemory(
+    HANDLE ProcessHandle,
+    PVOID BaseAddress,
+    PVOID Buffer,
+    SIZE_T NumberOfBytesToRead,
+    PSIZE_T NumberOfBytesRead)
+{
+    // Call original function first
+    NTSTATUS status = oNtReadVirtualMemory
+        ? oNtReadVirtualMemory(ProcessHandle, BaseAddress, Buffer, NumberOfBytesToRead, NumberOfBytesRead)
+        : -1;
+
+    DWORD targetPID = GetProcessId(ProcessHandle);
+
+    // Log to IPC
+    ipc_log_readprocessmemory(
+        ProcessHandle,
+        targetPID,
+        BaseAddress,
+        NumberOfBytesToRead,
+        NumberOfBytesRead ? *NumberOfBytesRead : 0,
+        NT_SUCCESS(status),
+        status,
+        PID);
+
+    return status;
+}
+
+static NTSTATUS NTAPI HookNtWriteVirtualMemory(
+    HANDLE ProcessHandle,
+    PVOID BaseAddress,
+    PVOID Buffer,
+    SIZE_T NumberOfBytesToWrite,
+    PSIZE_T NumberOfBytesWritten)
+{
+    // Call original function first
+    NTSTATUS status = oNtWriteVirtualMemory
+        ? oNtWriteVirtualMemory(ProcessHandle, BaseAddress, Buffer, NumberOfBytesToWrite, NumberOfBytesWritten)
+        : -1;
+
+    DWORD targetPID = GetProcessId(ProcessHandle);
+
+    // Log to IPC
+    ipc_log_writeprocessmemory(
+        ProcessHandle,
+        targetPID,
+        BaseAddress,
+        NumberOfBytesToWrite,
+        NumberOfBytesWritten ? *NumberOfBytesWritten : 0,
+        NT_SUCCESS(status),
+        status,
+        PID);
+
+    return status;
 }
 
 
@@ -113,17 +229,46 @@ static DWORD WINAPI InitThread(LPVOID) {
 
     HMODULE kb = GetModuleHandleW(L"KernelBase.dll");
     HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+
     if (!kb && !k32) {
         DebugLog("[PeregrineDLL] Failed to locate KernelBase/kernel32 modules.\n");
     }
 
-    HookExport(kb, "CreateRemoteThreadEx", (void**)&oCreateRemoteThreadEx, (void*)HookCreateRemoteThreadEx);
-    if (!oCreateRemoteThreadEx)
-        HookExport(k32, "CreateRemoteThreadEx", (void**)&oCreateRemoteThreadEx, (void*)HookCreateRemoteThreadEx);
-    if (oCreateRemoteThreadEx) {
-        DebugLog("[PeregrineDLL] Successfully hooked CreateRemoteThreadEx\n");
+    // Hook ReadProcessMemory (kernel32/kernelbase)
+    HookExport(kb, "ReadProcessMemory", (void**)&oReadProcessMemory, (void*)HookReadProcessMemory);
+    if (!oReadProcessMemory)
+        HookExport(k32, "ReadProcessMemory", (void**)&oReadProcessMemory, (void*)HookReadProcessMemory);
+    if (oReadProcessMemory) {
+        DebugLog("[PeregrineDLL] Successfully hooked ReadProcessMemory\n");
     } else {
-        DebugLog("[PeregrineDLL] Failed to hook CreateRemoteThreadEx.\n");
+        DebugLog("[PeregrineDLL] Failed to hook ReadProcessMemory.\n");
+    }
+
+    // Hook WriteProcessMemory (kernel32/kernelbase)
+    HookExport(kb, "WriteProcessMemory", (void**)&oWriteProcessMemory, (void*)HookWriteProcessMemory);
+    if (!oWriteProcessMemory)
+        HookExport(k32, "WriteProcessMemory", (void**)&oWriteProcessMemory, (void*)HookWriteProcessMemory);
+    if (oWriteProcessMemory) {
+        DebugLog("[PeregrineDLL] Successfully hooked WriteProcessMemory\n");
+    } else {
+        DebugLog("[PeregrineDLL] Failed to hook WriteProcessMemory.\n");
+    }
+
+    // Hook NtReadVirtualMemory (ntdll - used by sophisticated cheats)
+    HookExport(ntdll, "NtReadVirtualMemory", (void**)&oNtReadVirtualMemory, (void*)HookNtReadVirtualMemory);
+    if (oNtReadVirtualMemory) {
+        DebugLog("[PeregrineDLL] Successfully hooked NtReadVirtualMemory\n");
+    } else {
+        DebugLog("[PeregrineDLL] Failed to hook NtReadVirtualMemory.\n");
+    }
+
+    // Hook NtWriteVirtualMemory (ntdll - used by sophisticated cheats)
+    HookExport(ntdll, "NtWriteVirtualMemory", (void**)&oNtWriteVirtualMemory, (void*)HookNtWriteVirtualMemory);
+    if (oNtWriteVirtualMemory) {
+        DebugLog("[PeregrineDLL] Successfully hooked NtWriteVirtualMemory\n");
+    } else {
+        DebugLog("[PeregrineDLL] Failed to hook NtWriteVirtualMemory.\n");
     }
 
     DebugLog("[PeregrineDLL] Initialization complete\n");

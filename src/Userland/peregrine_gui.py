@@ -61,35 +61,6 @@ kernel32.DeviceIoControl.argtypes = [
 kernel32.CloseHandle.restype = wintypes.BOOL
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 
-kernel32.IsWow64Process.restype = wintypes.BOOL
-kernel32.IsWow64Process.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
-
-kernel32.OpenProcess.restype = wintypes.HANDLE
-kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-
-
-def is_process_32bit(pid):
-    """Check if a process is 32-bit. Returns None if unable to determine."""
-    import platform
-
-    # If we're on 32-bit Windows, all processes are 32-bit
-    if platform.machine().lower() not in ['amd64', 'x86_64']:
-        return True
-
-    PROCESS_QUERY_INFORMATION = 0x0400
-    h_process = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION, False, pid)
-    if not h_process:
-        return None
-
-    try:
-        is_wow64 = wintypes.BOOL()
-        if kernel32.IsWow64Process(h_process, ctypes.byref(is_wow64)):
-            # If IsWow64Process returns TRUE, the process is 32-bit running on 64-bit Windows
-            return bool(is_wow64.value)
-        return None
-    finally:
-        kernel32.CloseHandle(h_process)
-
 
 def find_dll_paths():
     """Get the absolute paths to both x86 and x64 DLLs next to this script."""
@@ -170,6 +141,13 @@ class PeregrineGUI:
         self.status_label.pack(in_=status_row, side=tk.LEFT)
         status_row.pack(anchor="w", padx=8, pady=(8, 4))
 
+        # Protected PIDs display
+        self.protected_pids_var = tk.StringVar(value="Protected PIDs: None")
+        protected_row = tk.Frame(root)
+        self.protected_label = tk.Label(protected_row, textvariable=self.protected_pids_var, font=("Segoe UI", 10))
+        self.protected_label.pack(side=tk.LEFT)
+        protected_row.pack(anchor="w", padx=8, pady=(0, 4))
+
         controls = tk.Frame(root)
         tk.Label(controls, text="PID:").pack(side=tk.LEFT, padx=(0, 6))
         self.pid_var = tk.StringVar()
@@ -190,6 +168,8 @@ class PeregrineGUI:
         self.log_lock = threading.Lock()
         self.log_lines = []
         self.max_log_lines = 2000
+        self.protected_pids = set()  # Track PIDs we've added to the kernel
+        self.protected_pids_lock = threading.Lock()
         self.ipc_stop = start_ipc_server(on_message=self.on_ipc_message, on_error=self.on_ipc_error)
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -227,7 +207,10 @@ class PeregrineGUI:
         if res is None:
             self.append_log("add PID failed")
         else:
+            with self.protected_pids_lock:
+                self.protected_pids.add(pid)
             self.append_log(f"added PID {pid}")
+            self.update_protected_pids_display()
 
     def on_remove_pid(self):
         pid = self._parse_pid_input()
@@ -238,7 +221,10 @@ class PeregrineGUI:
         if res is None:
             self.append_log("remove PID failed")
         else:
+            with self.protected_pids_lock:
+                self.protected_pids.discard(pid)
             self.append_log(f"removed PID {pid}")
+            self.update_protected_pids_display()
 
     def on_clear_all_pids(self):
         if not self.handle:
@@ -249,7 +235,10 @@ class PeregrineGUI:
         if res is None:
             self.append_log("clear all PIDs failed")
         else:
+            with self.protected_pids_lock:
+                self.protected_pids.clear()
             self.append_log("cleared all PIDs")
+            self.update_protected_pids_display()
 
     def on_check_modules(self):
         pid = self._parse_pid_input(require_connection=False)
@@ -302,18 +291,61 @@ class PeregrineGUI:
         # Run checkAllThreads in a background thread to avoid blocking UI
         threading.Thread(target=checkAllThreads, args=(pid, self), daemon=True).start()
 
+    def handle_process_create(self, obj):
+        """Handle process_create event - injects DLL into new process."""
+        pid = obj.get("pid", "N/A")
+        if pid == "N/A" or pid == os.getpid():
+            return
+
+        # Inject DLL into the new process
+        InjectDLL(pid, self.dll_paths, self.append_log)
+
     def on_ipc_message(self, msg):
+        event = msg.get("event", "")
+
+        # Handle Read/WriteProcessMemory with filtering
+        if event in ("ReadProcessMemory", "WriteProcessMemory"):
+            caller = msg.get("callerPID", "?")
+            target = msg.get("targetPID", "?")
+            addr = msg.get("address", 0)
+            size = msg.get("size", 0)
+            success = msg.get("success", 0)
+
+            # Only log if:
+            # - Target is protected (the victim is one we care about)
+            # - Caller is NOT protected (it's an external process, not our own)
+            # - It's not self-access
+            # - Operation succeeded
+            with self.protected_pids_lock:
+                target_protected = target in self.protected_pids
+                caller_protected = caller in self.protected_pids
+
+            if success and caller != target and target_protected and not caller_protected:
+                self.append_log(f"[External {event}] PID {caller} → PID {target} | {size} bytes at 0x{addr:X}")
+            return
+
+        # Log other IPC messages (dll_loaded, etc.)
         try:
             pretty = json.dumps(msg)
         except Exception:
             pretty = str(msg)
-        self.append_log(f"[ipc] {pretty}")
+        #self.append_log(f"[ipc] {pretty}")
 
     def on_ipc_error(self, err):
         self.append_log(f"[ipc-error] {err}")
 
     def set_status(self, text, color):
         self.root.after(0, lambda: (self.status_var.set(text), self.status_label.configure(fg=color)))
+
+    def update_protected_pids_display(self):
+        """Update the protected PIDs display label."""
+        with self.protected_pids_lock:
+            if self.protected_pids:
+                pids_str = ", ".join(str(pid) for pid in sorted(self.protected_pids))
+                display_text = f"Protected PIDs: {pids_str}"
+            else:
+                display_text = "Protected PIDs: None"
+        self.root.after(0, lambda: self.protected_pids_var.set(display_text))
 
     def append_log(self, msg):
         with self.log_lock:
@@ -360,28 +392,10 @@ class PeregrineGUI:
                     if obj.get("event"):
                         #self.append_log(f"[from kernel] event={obj['event']} raw={data!r}")
                         if obj['event'] == "thread_create":
-                            # Run checkThread in background to avoid blocking receiver loop
                             threading.Thread(target=checkThread, args=(obj, self), daemon=True).start()
 
                         elif obj['event'] == "process_create":
-                            pid = obj.get("pid", "N/A")
-                            if pid != "N/A" and pid != os.getpid():
-                                # Determine which DLL to inject based on process architecture
-                                is_32bit = is_process_32bit(pid)
-                                if is_32bit is None:
-                                    self.append_log(f"[DLL Inject] Cannot determine architecture for PID={pid}, skipping")
-                                elif is_32bit:
-                                    dll_path = self.dll_paths.get('x86')
-                                    if dll_path:
-                                        threading.Thread(target=InjectDLL, args=(pid, dll_path, self.append_log), daemon=True).start()
-                                    else:
-                                        self.append_log(f"[DLL Inject] No x86 DLL available for 32-bit PID={pid}")
-                                else:
-                                    dll_path = self.dll_paths.get('x64')
-                                    if dll_path:
-                                        threading.Thread(target=InjectDLL, args=(pid, dll_path, self.append_log), daemon=True).start()
-                                    else:
-                                        self.append_log(f"[DLL Inject] No x64 DLL available for 64-bit PID={pid}")
+                            threading.Thread(target=self.handle_process_create, args=(obj,), daemon=True).start()
 
                         elif obj["event"] == "image_load":
                             self.append_log(f"[from kernel] event={obj['event']} raw={data!r}")

@@ -59,42 +59,63 @@ void ipc_write_json(const char* json) {
     CloseHandle(h);
 }
 
-void ipc_log_createremotethreadex(
+void ipc_log_readprocessmemory(
     HANDLE hProcess,
-    LPSECURITY_ATTRIBUTES sa,
-    SIZE_T stackSize,
-    LPTHREAD_START_ROUTINE start,
-    LPVOID param,
-    DWORD flags,
-    LPPROC_THREAD_ATTRIBUTE_LIST attrList,
-    LPDWORD tid,
-    HANDLE threadHandle,
+    DWORD targetPID,
+    LPCVOID lpBaseAddress,
+    SIZE_T nSize,
+    SIZE_T bytesRead,
+    BOOL result,
     DWORD lastError,
     DWORD callerPid)
 {
     char buf[512] = {0};
-    DWORD tid_val = 0;
-    if (tid) {
-        __try { tid_val = *tid; }
-        __except (EXCEPTION_EXECUTE_HANDLER) { tid_val = 0; }
-    }
 
     _snprintf_s(
         buf,
         sizeof(buf),
         _TRUNCATE,
-        "{\"event\":\"CreateRemoteThreadEx\",\"callerPID\":%lu,\"hProcess\":%llu,"
-        "\"stackSize\":%llu,\"start\":%llu,\"param\":%llu,\"flags\":%lu,"
-        "\"attrList\":%llu,\"threadId\":%lu,\"resultHandle\":%llu,\"lastError\":%lu}",
+        "{\"event\":\"ReadProcessMemory\",\"callerPID\":%lu,\"targetPID\":%lu,"
+        "\"hProcess\":%llu,\"address\":%llu,\"size\":%llu,\"bytesRead\":%llu,"
+        "\"success\":%d,\"lastError\":%lu}",
         (unsigned long)callerPid,
+        (unsigned long)targetPID,
         (unsigned long long)ptr_to_ull(hProcess),
-        (unsigned long long)stackSize,
-        (unsigned long long)ptr_to_ull(start),
-        (unsigned long long)ptr_to_ull(param),
-        (unsigned long)flags,
-        (unsigned long long)ptr_to_ull(attrList),
-        (unsigned long)tid_val,
-        (unsigned long long)ptr_to_ull(threadHandle),
+        (unsigned long long)ptr_to_ull(lpBaseAddress),
+        (unsigned long long)nSize,
+        (unsigned long long)bytesRead,
+        result ? 1 : 0,
+        (unsigned long)lastError);
+
+    ipc_write_json(buf);
+}
+
+void ipc_log_writeprocessmemory(
+    HANDLE hProcess,
+    DWORD targetPID,
+    LPVOID lpBaseAddress,
+    SIZE_T nSize,
+    SIZE_T bytesWritten,
+    BOOL result,
+    DWORD lastError,
+    DWORD callerPid)
+{
+    char buf[512] = {0};
+
+    _snprintf_s(
+        buf,
+        sizeof(buf),
+        _TRUNCATE,
+        "{\"event\":\"WriteProcessMemory\",\"callerPID\":%lu,\"targetPID\":%lu,"
+        "\"hProcess\":%llu,\"address\":%llu,\"size\":%llu,\"bytesWritten\":%llu,"
+        "\"success\":%d,\"lastError\":%lu}",
+        (unsigned long)callerPid,
+        (unsigned long)targetPID,
+        (unsigned long long)ptr_to_ull(hProcess),
+        (unsigned long long)ptr_to_ull(lpBaseAddress),
+        (unsigned long long)nSize,
+        (unsigned long long)bytesWritten,
+        result ? 1 : 0,
         (unsigned long)lastError);
 
     ipc_write_json(buf);

@@ -1,6 +1,7 @@
 
 import ctypes
 from ctypes import wintypes
+import platform
 
 # Minimal LoadLibraryA-based DLL injection helper (Windows).
 # NOTE: caller must pass an ASCII/ANSI DLL path.
@@ -70,19 +71,71 @@ kernel32.GetExitCodeThread.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.
 kernel32.CloseHandle.restype = wintypes.BOOL
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 
+kernel32.IsWow64Process.restype = wintypes.BOOL
+kernel32.IsWow64Process.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
+
+kernel32.OpenProcess.restype = wintypes.HANDLE
+kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+
 
 def _raise_last_error(msg):
     err = ctypes.get_last_error()
     raise OSError(err, f"{msg} (err={err})")
 
 
-def InjectDLL(target_pid: int, filename_dll: bytes, log_callback=None):
+def _is_process_32bit(pid):
+    """Check if a process is 32-bit. Returns None if unable to determine."""
+    # If we're on 32-bit Windows, all processes are 32-bit
+    if platform.machine().lower() not in ['amd64', 'x86_64']:
+        return True
+
+    PROCESS_QUERY_INFORMATION = 0x0400
+    h_process = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION, False, pid)
+    if not h_process:
+        return None
+
+    try:
+        is_wow64 = wintypes.BOOL()
+        if kernel32.IsWow64Process(h_process, ctypes.byref(is_wow64)):
+            # If IsWow64Process returns TRUE, the process is 32-bit running on 64-bit Windows
+            return bool(is_wow64.value)
+        return None
+    finally:
+        kernel32.CloseHandle(h_process)
+
+
+def InjectDLL(target_pid: int, dll_paths, log_callback=None):
     """
     Inject DLL into target process using LoadLibraryA.
-    filename_dll must be bytes (ANSI), including the trailing null if desired.
+    dll_paths: either a dict with 'x86' and 'x64' keys containing DLL paths as bytes,
+               or a bytes object for backward compatibility.
     log_callback: optional function(msg) to log messages (success/failure).
     """
     try:
+        # Determine which DLL to use based on architecture
+        if isinstance(dll_paths, dict):
+            is_32bit = _is_process_32bit(target_pid)
+            if is_32bit is None:
+                # if log_callback:
+                #     log_callback(f"[DLL Inject] Cannot determine architecture for PID={target_pid}, skipping")
+                return None
+
+            if is_32bit:
+                filename_dll = dll_paths.get('x86')
+                if not filename_dll:
+                    # if log_callback:
+                    #     log_callback(f"[DLL Inject] No x86 DLL available for 32-bit PID={target_pid}")
+                    return None
+            else:
+                filename_dll = dll_paths.get('x64')
+                if not filename_dll:
+                    # if log_callback:
+                    #     log_callback(f"[DLL Inject] No x64 DLL available for 64-bit PID={target_pid}")
+                    return None
+        else:
+            # Backward compatibility: dll_paths is actually a bytes object
+            filename_dll = dll_paths
+
         if not isinstance(filename_dll, (bytes, bytearray)):
             raise TypeError("filename_dll must be bytes")
         if not filename_dll.endswith(b"\x00"):
@@ -125,20 +178,21 @@ def InjectDLL(target_pid: int, filename_dll: bytes, log_callback=None):
 
             # Check if LoadLibraryA succeeded (non-zero HMODULE)
             dll_name = filename_dll.rstrip(b"\x00").decode('utf-8', errors='ignore')
-            if exit_code.value == 0:
-                if log_callback:
-                    log_callback(f"[DLL Inject] LoadLibraryA returned NULL for {dll_name} in PID={target_pid} - DLL not found or failed to load!")
-            else:
-                if log_callback:
-                    log_callback(f"[DLL Inject] Successfully injected {dll_name} into PID={target_pid} (HMODULE=0x{exit_code.value:X})")
+            # if exit_code.value == 0:
+            #     if log_callback:
+            #         log_callback(f"[DLL Inject] LoadLibraryA returned NULL for {dll_name} in PID={target_pid} - DLL not found or failed to load!")
+            # else:
+            #     if log_callback:
+            #         log_callback(f"[DLL Inject] Successfully injected {dll_name} into PID={target_pid} (HMODULE=0x{exit_code.value:X})")
 
             return exit_code.value
         finally:
             kernel32.CloseHandle(h_proc)
     except Exception as e:
-        if log_callback:
-            dll_name = filename_dll.rstrip(b"\x00").decode('utf-8', errors='ignore') if isinstance(filename_dll, bytes) else str(filename_dll)
-            log_callback(f"[DLL Inject] Failed to inject {dll_name} into PID={target_pid}: {e}")
-        else:
-            # Re-raise if no callback provided (backward compatibility)
-            raise
+        # if log_callback:
+        #     dll_name = filename_dll.rstrip(b"\x00").decode('utf-8', errors='ignore') if isinstance(filename_dll, bytes) else str(filename_dll)
+        #     log_callback(f"[DLL Inject] Failed to inject {dll_name} into PID={target_pid}: {e}")
+        # else:
+        #     # Re-raise if no callback provided (backward compatibility)
+        #     raise
+        pass
