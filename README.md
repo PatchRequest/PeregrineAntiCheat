@@ -32,9 +32,12 @@ The kernel driver (`PeregrineKernelComponent`) operates at ring-0 and provides:
    - Monitors for unauthorized modifications to loaded modules
    - Detects runtime code patches in protected memory regions
 
-2. **Remote Thread Creation**
-   - Identifies threads created remotely in the protected process
-   - Flags suspicious cross-process thread injection attempts
+2. **External Memory Access Detection**
+   - Hooks `ReadProcessMemory` and `WriteProcessMemory` (kernel32/kernelbase)
+   - Hooks `NtReadVirtualMemory` and `NtWriteVirtualMemory` (ntdll) for advanced cheat detection
+   - Detects external processes attempting to read or write protected process memory
+   - Catches memory scanning and modification attempts from cheat tools
+   - Filters out legitimate inter-process communication to reduce false positives
 
 3. **Thread & Shellcode Execution**
    - Detects thread execution originating outside trusted modules
@@ -84,10 +87,11 @@ src/
 
 1. **Driver Loading**: The kernel component registers callbacks and notify routines
 2. **Process Protection**: When a protected process starts, the driver monitors its activity
-3. **DLL Injection**: The user-mode DLL is injected for in-process monitoring
-4. **Communication**: Kernel and user-mode components exchange data via IOCTL and IPC
-5. **Detection**: Multiple layers analyze behavior for suspicious patterns
-6. **Response**: Detected threats are logged and can trigger protective actions
+3. **DLL Injection**: The user-mode DLL is injected for in-process monitoring (both x86 and x64)
+4. **API Hooking**: MinHook hooks critical memory APIs to intercept external access attempts
+5. **Communication**: Kernel and user-mode components exchange data via IOCTL and named pipes
+6. **Detection**: Multiple layers analyze behavior for suspicious patterns
+7. **Response**: Detected threats are logged and can trigger protective actions
 
 ## Educational Purpose
 
