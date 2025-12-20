@@ -19,6 +19,7 @@ The kernel driver (`PeregrineKernelComponent`) operates at ring-0 and provides:
 - **ObCallback Registration**: Process and thread handle operation monitoring
 - **Notify Routines**: Process, thread, and image load notifications
 - **IOCTL Communications**: Bidirectional kernel-user communication channel
+- **Process Protection**: Protected Process Light (PPL) enforcement for enhanced security
 
 ### User-Mode Components
 - **DLL Component** (`PeregrineDLL`): Injected into protected processes for in-process monitoring
@@ -52,6 +53,21 @@ The kernel driver (`PeregrineKernelComponent`) operates at ring-0 and provides:
    - Monitors unauthorized library loading
    - Tracks suspicious image load notifications
 
+## Protection Features
+
+### Protected Process Light (PPL)
+Peregrine can elevate processes to Protected Process Light status, providing kernel-level protection:
+- **Enhanced Process Security**: PPL processes are protected from unauthorized memory access and tampering
+- **Kernel-Enforced Protection**: The kernel driver can set any process to PPL status via IOCTL
+- **Anti-Malware Signer**: Uses PPL-Antimalware protection level for security software scenarios
+- **GUI Control**: Easily set processes to PPL status through the GUI interface
+
+This protection makes it significantly harder for external tools to:
+- Read or write process memory
+- Inject code or DLLs
+- Terminate or manipulate the protected process
+- Attach debuggers or analysis tools
+
 ## Technical Stack
 
 - **Kernel Driver**: C (WDM/WDF)
@@ -68,6 +84,7 @@ src/
 │   ├── obCallback.c             # Object callback routines
 │   ├── NotifyRoutine.c          # Process/thread/image notifications
 │   ├── Coms.c                   # IOCTL communication handler
+│   ├── Protection.c             # PPL (Protected Process Light) implementation
 │   └── AppState.c               # Driver state management
 │
 ├── PeregrineDLL/                # User-mode DLL
