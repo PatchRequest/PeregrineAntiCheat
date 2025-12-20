@@ -98,6 +98,7 @@
     <ClCompile Include="main.c" />
     <ClCompile Include="NotifyRoutine.c" />
     <ClCompile Include="obCallback.c" />
+    <ClCompile Include="Protection.c" />
   </ItemGroup>
   <ItemGroup>
     <None Include="Coms.h" />
@@ -106,6 +107,7 @@
     <ClInclude Include="AppState.h" />
     <ClInclude Include="NotifyRoutine.h" />
     <ClInclude Include="obCallback.h" />
+    <ClInclude Include="Protection.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

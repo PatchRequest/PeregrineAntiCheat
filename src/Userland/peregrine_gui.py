@@ -156,7 +156,8 @@ class PeregrineGUI:
         tk.Button(controls, text="Add", command=self.on_add_pid).pack(side=tk.LEFT, padx=(0, 4))
         tk.Button(controls, text="Remove", command=self.on_remove_pid).pack(side=tk.LEFT, padx=(0, 4))
         tk.Button(controls, text="Clear All", command=self.on_clear_all_pids).pack(side=tk.LEFT)
-        tk.Button(controls, text="Check Modules", command=self.on_check_modules).pack(side=tk.LEFT, padx=(6, 0))
+        tk.Button(controls, text="Set PPL", command=self.on_set_ppl, bg="#4a90e2", fg="white").pack(side=tk.LEFT, padx=(6, 0))
+        tk.Button(controls, text="Check Modules", command=self.on_check_modules).pack(side=tk.LEFT, padx=(4, 0))
         tk.Button(controls, text="Check Threads", command=self.on_check_threads).pack(side=tk.LEFT, padx=(4, 0))
         controls.pack(anchor="w", padx=8, pady=(0, 8))
 
@@ -239,6 +240,20 @@ class PeregrineGUI:
                 self.protected_pids.clear()
             self.append_log("cleared all PIDs")
             self.update_protected_pids_display()
+
+    def on_set_ppl(self):
+        """Set a process to Protected Process Light (PPL) status."""
+        pid = self._parse_pid_input()
+        if pid is None:
+            return
+        self.append_log(f"Sending PPL command for PID {pid}...")
+        payload = bytes([4]) + self._pack_handle(pid)
+        self.append_log(f"Payload: {payload.hex()}")
+        res = device_io_control(self.handle, IOCTL_PEREGRINE_SEND_FROM_USER, payload)
+        if res is None:
+            self.append_log(f"IOCTL returned None - set PPL failed for PID {pid}")
+        else:
+            self.append_log(f"IOCTL succeeded - set PID {pid} to PPL (check DebugView for kernel confirmation)")
 
     def on_check_modules(self):
         pid = self._parse_pid_input(require_connection=False)
@@ -345,6 +360,7 @@ class PeregrineGUI:
                 display_text = f"Protected PIDs: {pids_str}"
             else:
                 display_text = "Protected PIDs: None"
+
         self.root.after(0, lambda: self.protected_pids_var.set(display_text))
 
     def append_log(self, msg):

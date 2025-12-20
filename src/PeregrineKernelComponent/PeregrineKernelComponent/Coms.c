@@ -1,4 +1,5 @@
 #include "Coms.h"
+#include "Protection.h"
 
 static PDEVICE_OBJECT g_ComsDevice = NULL;
 static KSPIN_LOCK g_ComsLock;
@@ -21,14 +22,15 @@ static VOID ComsHandleUserCommand(_In_reads_bytes_(DataSize) const UCHAR* Data,
         KdPrint(("Peregrine: empty/NULL user command\n"));
         return;
     }
-
+    KdPrint(("Peregrine: Received command 0x%02X, DataSize=%lu\n", Data[0], DataSize));
+    HANDLE pid = 0;
     switch (Data[0]) {
     case 1: { // set PID
         if (DataSize < 1 + sizeof(HANDLE)) {
             KdPrint(("Peregrine: cmd=1 too small (%lu)\n", DataSize));
             return;
         }
-        HANDLE pid = 0;
+        
         RtlCopyMemory(&pid, Data + 1, sizeof(pid)); // avoid unaligned deref
 		StateAddPid(pid);
         KdPrint(("Peregrine: user set target PID to %ld\n", pid));
@@ -39,7 +41,7 @@ static VOID ComsHandleUserCommand(_In_reads_bytes_(DataSize) const UCHAR* Data,
             KdPrint(("Peregrine: cmd=1 too small (%lu)\n", DataSize));
             return;
         }
-        HANDLE pid = 0;
+        
         RtlCopyMemory(&pid, Data + 1, sizeof(pid)); // avoid unaligned deref
         StateRemovePid(pid);
         KdPrint(("Peregrine: user set target PID to %ld\n", pid));
@@ -47,10 +49,27 @@ static VOID ComsHandleUserCommand(_In_reads_bytes_(DataSize) const UCHAR* Data,
 
     case 3:
 	{ // clear all PIDs
-		StateClearPids();
+        StateClearPids();
 		KdPrint(("Peregrine: user cleared all target PIDs\n"));
 		break;
 	}
+
+    case 4: { // set process to PPL
+        if (DataSize < 1 + sizeof(HANDLE)) {
+            KdPrint(("Peregrine: cmd=4 too small (%lu)\n", DataSize));
+            return;
+        }
+        
+        RtlCopyMemory(&pid, Data + 1, sizeof(pid));
+
+        NTSTATUS status = ProtectionSetProcessPPL(pid);
+        if (NT_SUCCESS(status)) {
+            KdPrint(("Peregrine: Set PID %lu to PPL successfully\n", (ULONG)(ULONG_PTR)pid));
+        } else {
+            KdPrint(("Peregrine: Failed to set PID %lu to PPL: 0x%X\n", (ULONG)(ULONG_PTR)pid, status));
+        }
+        break;
+    }
 
     default:
         KdPrint(("Peregrine: unknown command 0x%02X\n", Data[0]));

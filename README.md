@@ -34,10 +34,9 @@ The kernel driver (`PeregrineKernelComponent`) operates at ring-0 and provides:
 
 2. **External Memory Access Detection**
    - Hooks `ReadProcessMemory` and `WriteProcessMemory` (kernel32/kernelbase)
-   - Hooks `NtReadVirtualMemory` and `NtWriteVirtualMemory` (ntdll) for advanced cheat detection
+   - Hooks `NtReadVirtualMemory` and `NtWriteVirtualMemory` (ntdll)
    - Detects external processes attempting to read or write protected process memory
-   - Catches memory scanning and modification attempts from cheat tools
-   - Filters out legitimate inter-process communication to reduce false positives
+   - Fast in-process detection of memory access attempts
 
 3. **Thread & Shellcode Execution**
    - Detects thread execution originating outside trusted modules
@@ -109,6 +108,7 @@ This project is designed for learning:
 - Visual Studio 2019 or later
 - Windows Driver Kit (WDK)
 - Python 3.8+
+- Python packages: `pip install pywin32`
 - Test signing enabled (for driver development)
 
 ## Disclaimer

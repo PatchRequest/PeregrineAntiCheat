@@ -29,6 +29,9 @@
     <Filter Include="Source Files\AppState">
       <UniqueIdentifier>{b05e5457-f145-4cd4-b615-d5012ee7f507}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Source Files\Protection">
+      <UniqueIdentifier>{ebcca43a-270d-429d-b7e1-b970f49e7b72}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="main.c">
@@ -46,6 +49,9 @@
     <ClCompile Include="AppState.c">
       <Filter>Source Files\AppState</Filter>
     </ClCompile>
+    <ClCompile Include="Protection.c">
+      <Filter>Source Files\Protection</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <None Include="Coms.h">
@@ -61,6 +67,9 @@
     </ClInclude>
     <ClInclude Include="AppState.h">
       <Filter>Source Files\AppState</Filter>
+    </ClInclude>
+    <ClInclude Include="Protection.h">
+      <Filter>Source Files\Protection</Filter>
     </ClInclude>
   </ItemGroup>
 </Project>
