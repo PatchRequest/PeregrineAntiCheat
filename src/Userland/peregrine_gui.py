@@ -14,6 +14,7 @@ from DLL import InjectDLL
 from PatchDetection import check_process_modules
 from threadWork import checkThread, checkAllThreads
 from IPC import start_server as start_ipc_server
+from ProcessBlacklist import scan_processes_for_blacklist, DEFAULT_BLACKLIST
 
 # Constants/IOCTLs mirror the working Python sample
 FILE_DEVICE_UNKNOWN = 0x00000022
@@ -159,6 +160,7 @@ class PeregrineGUI:
         tk.Button(controls, text="Set PPL", command=self.on_set_ppl, bg="#4a90e2", fg="white").pack(side=tk.LEFT, padx=(6, 0))
         tk.Button(controls, text="Check Modules", command=self.on_check_modules).pack(side=tk.LEFT, padx=(4, 0))
         tk.Button(controls, text="Check Threads", command=self.on_check_threads).pack(side=tk.LEFT, padx=(4, 0))
+        tk.Button(controls, text="Scan Blacklist", command=self.on_scan_blacklist, bg="#e67e22", fg="white").pack(side=tk.LEFT, padx=(4, 0))
         controls.pack(anchor="w", padx=8, pady=(0, 8))
 
         self.log_view = scrolledtext.ScrolledText(root, wrap=tk.WORD, height=20, state="disabled")
@@ -306,6 +308,25 @@ class PeregrineGUI:
         # Run checkAllThreads in a background thread to avoid blocking UI
         threading.Thread(target=checkAllThreads, args=(pid, self), daemon=True).start()
 
+    def on_scan_blacklist(self):
+        """Scan all processes for blacklisted keywords."""
+        self.append_log("[Blacklist] Starting scan...")
+        try:
+            matches = scan_processes_for_blacklist()
+
+            if matches:
+                self.append_log(f"[Blacklist] Found {len(matches)} suspicious process(es):")
+                for match in matches:
+                    pid = match['pid']
+                    path = match['path']
+                    keyword = match['keyword']
+                    self.append_log(f"[Blacklist] PID {pid}: {path} (matched: {keyword})")
+            else:
+                self.append_log("[Blacklist] No blacklisted processes found")
+
+        except Exception as exc:
+            self.append_log(f"[Blacklist] Error during scan: {exc}")
+
     def handle_process_create(self, obj):
         """Handle process_create event - injects DLL into new process."""
         pid = obj.get("pid", "N/A")
@@ -387,7 +408,6 @@ class PeregrineGUI:
                 self.handle = h
                 self.set_status("Connected", "#3cb45a")
                 self.append_log("connected")
-                #self._add_own_pid()
                 backoff = 0.5
                 self.receiver_loop()
             except Exception as exc:
