@@ -53,6 +53,12 @@ The kernel driver (`PeregrineKernelComponent`) operates at ring-0 and provides:
    - Monitors unauthorized library loading
    - Tracks suspicious image load notifications
 
+6. **Process Blacklist Scanning**
+   - Enumerates all running processes and checks executable paths against a blacklist
+   - Detects known cheat tools and debugging software by name/path
+   - Default blacklist includes: CheatEngine, x64dbg, IDA, ProcessHacker, GuidedHacking, and more
+   - Customizable keyword-based detection for identifying suspicious processes
+
 ## Protection Features
 
 ### Protected Process Light (PPL)
@@ -96,6 +102,7 @@ src/
     ├── IPC.py                   # IPC client implementation
     ├── PatchDetection.py        # Patch detection logic
     ├── threadWork.py            # Thread analysis
+    ├── ProcessBlacklist.py      # Process blacklist scanning
     └── self_tamper.py           # Self-integrity checks
 ```
 
@@ -108,6 +115,48 @@ src/
 5. **Communication**: Kernel and user-mode components exchange data via IOCTL and named pipes
 6. **Detection**: Multiple layers analyze behavior for suspicious patterns
 7. **Response**: Detected threats are logged and can trigger protective actions
+
+## Usage
+
+### GUI Interface
+The GUI provides an easy-to-use interface for monitoring and protection:
+
+- **Add/Remove PIDs**: Protect specific processes by PID
+- **Set PPL**: Elevate processes to Protected Process Light status
+- **Check Modules**: Scan a process for module tampering
+- **Check Threads**: Analyze thread execution locations
+- **Scan Blacklist**: Scan all running processes for known cheat tools (via "Scan Blacklist" button)
+
+### Process Blacklist Scanning
+The blacklist scanner can be used standalone or through the GUI:
+
+**Via GUI:**
+Click the "Scan Blacklist" button to scan all running processes for blacklisted keywords.
+
+**Standalone:**
+```python
+from ProcessBlacklist import scan_processes_for_blacklist
+
+# Use default blacklist
+results = scan_processes_for_blacklist()
+
+# Or use custom keywords
+custom_blacklist = ["CheatEngine", "x64dbg", "MyCustomTool"]
+results = scan_processes_for_blacklist(custom_blacklist)
+
+for match in results:
+    print(f"PID {match['pid']}: {match['path']} (matched: {match['keyword']})")
+```
+
+**Default Blacklist Keywords:**
+- GuidedHacking
+- CheatEngine
+- x64dbg / x32dbg
+- IDA
+- dnSpy
+- ProcessHacker
+- ReClass
+- Cheat / Trainer / Injector / DLLInjector
 
 ## Educational Purpose
 
