@@ -125,7 +125,7 @@ The GUI provides an easy-to-use interface for monitoring and protection:
 - **Set PPL**: Elevate processes to Protected Process Light status
 - **Check Modules**: Scan a process for module tampering
 - **Check Threads**: Analyze thread execution locations
-- **Scan Blacklist**: Scan all running processes for known cheat tools (via "Scan Blacklist" button)
+- **Scan Blacklist**: Scan all running processes for known cheat tools
 
 ### Process Blacklist Scanning
 The blacklist scanner can be used standalone or through the GUI:
