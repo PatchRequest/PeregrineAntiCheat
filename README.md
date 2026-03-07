@@ -22,6 +22,7 @@ The kernel driver (`PeregrineKernelComponent`) operates at ring-0 and provides:
 - **Process Protection**: Protected Process Light (PPL) enforcement
 - **Driver Scanning**: Enumerates loaded kernel drivers and checks against a blacklist
 - **ObCallback Scanning**: Enumerates registered object callbacks to detect tampering
+- **System Integrity Checks**: Test-signing, HVCI, and CPU/hypervisor detection
 
 ### User-Mode Components
 - **DLL Component** (`PeregrineDLL`): Injected into protected processes for in-process monitoring
@@ -78,6 +79,21 @@ The kernel driver (`PeregrineKernelComponent`) operates at ring-0 and provides:
    - Identifies which drivers have registered process/thread handle callbacks
    - Detects potential callback tampering or unauthorized registrations
 
+10. **IAT Hook Detection**
+    - Walks each module's Import Address Table in the target process
+    - Flags IAT entries pointing outside all known loaded modules
+    - Detects hooks redirecting to shellcode or manually mapped code
+
+11. **EAT Hook Detection**
+    - Walks each module's Export Address Table
+    - Validates exported function RVAs stay within module bounds
+    - Correctly skips legitimate PE forwarder entries
+
+12. **System Integrity Checks**
+    - **Test-Sign Detection**: Queries CodeIntegrityOptions to detect test-signing mode
+    - **HVCI Detection**: Checks if Hypervisor Code Integrity is enabled or disabled
+    - **CPU Vendor / Hypervisor Detection**: CPUID-based check for VM/hypervisor presence
+
 ## Protection Features
 
 ### Protected Process Light (PPL)
@@ -105,7 +121,8 @@ src/
 │   ├── Protection.c             # PPL implementation
 │   ├── AppState.c               # Driver state management
 │   ├── DriverScan.c             # Loaded driver enumeration & blacklist
-│   └── ObCallbackScan.c         # ObCallback enumeration
+│   ├── ObCallbackScan.c         # ObCallback enumeration
+│   └── SystemCheck.c            # Test-sign, HVCI, CPU/hypervisor checks
 │
 ├── PeregrineDLL/                # User-mode DLL (x86 + x64)
 │   ├── dllmain.cpp              # Hook setup and detour functions
@@ -118,6 +135,7 @@ src/
     ├── PatchDetection.py        # Module integrity checking with relocation handling
     ├── threadWork.py            # Thread analysis
     ├── ProcessBlacklist.py      # Process blacklist scanning
+    ├── HookDetection.py         # IAT and EAT hook detection
     └── self_tamper.py           # Self-integrity checks
 ```
 
@@ -166,6 +184,9 @@ The GUI auto-elevates to administrator if needed.
 - **Scan Blacklist**: Scan all running processes for known cheat tools
 - **Scan Drivers**: Enumerate loaded kernel drivers and check blacklist
 - **Scan ObCallbacks**: Enumerate registered object callbacks
+- **Check IAT**: Scan for Import Address Table hooks
+- **Check EAT**: Scan for Export Address Table hooks
+- **System Check**: Test-signing, HVCI, and hypervisor detection
 
 ## Disclaimer
 

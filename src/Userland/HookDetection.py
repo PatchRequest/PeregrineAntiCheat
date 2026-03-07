@@ -99,8 +99,9 @@ def _get_data_directory(proc, pe_info, index):
 
 
 def _build_module_map(proc):
-    """Build a dict mapping lowercase DLL name -> (base, size)."""
+    """Build a dict mapping lowercase DLL name -> (base, size) and a list of all module ranges."""
     mod_map = {}
+    mod_ranges = []
     modules = _get_modules(proc)
     for hmod in modules:
         info = MODULEINFO()
@@ -113,10 +114,27 @@ def _build_module_map(proc):
         size = info.SizeOfImage
         name = path.rsplit("\\", 1)[-1].lower()
         mod_map[name] = (base, size)
+        mod_ranges.append((base, size, name))
         # Also store without extension for matching flexibility
         if name.endswith(".dll"):
             mod_map[name[:-4]] = (base, size)
-    return mod_map
+    return mod_map, mod_ranges
+
+
+def _addr_in_any_module(addr, mod_ranges):
+    """Check if an address falls within any known loaded module."""
+    for base, size, _ in mod_ranges:
+        if base <= addr < base + size:
+            return True
+    return False
+
+
+def _resolve_module_for_addr(addr, mod_ranges):
+    """Return the module name containing the address, or None."""
+    for base, size, name in mod_ranges:
+        if base <= addr < base + size:
+            return name
+    return None
 
 
 def check_iat_hooks(pid):
@@ -131,7 +149,7 @@ def check_iat_hooks(pid):
 
     results = []
     try:
-        mod_map = _build_module_map(proc)
+        mod_map, mod_ranges = _build_module_map(proc)
         modules = _get_modules(proc)
 
         for hmod in modules:
@@ -171,13 +189,6 @@ def check_iat_hooks(pid):
                     break
 
                 dll_name = _read_cstring(proc, base + name_rva) if name_rva else "?"
-                dll_name_lower = dll_name.lower() if dll_name else "?"
-
-                # Resolve expected DLL base/size
-                dll_key = dll_name_lower.replace(".dll", "") if dll_name_lower.endswith(".dll") else dll_name_lower
-                expected_base, expected_size = mod_map.get(dll_key, (None, None))
-                if expected_base is None:
-                    expected_base, expected_size = mod_map.get(dll_name_lower, (None, None))
 
                 # Use OriginalFirstThunk (ILT) for names if available, else use IAT
                 name_table_rva = ilt_rva if ilt_rva else iat_rva
@@ -203,20 +214,17 @@ def check_iat_hooks(pid):
                     if not func_name:
                         func_name = f"ordinal_{idx}"
 
-                    # Check if IAT pointer falls within expected DLL
-                    hooked = False
-                    if expected_base is not None:
-                        if not (expected_base <= iat_value < expected_base + expected_size):
-                            hooked = True
-
-                    if hooked:
+                    # A real IAT hook points outside ALL known modules
+                    # (forwarding between DLLs like kernel32->ntdll is normal)
+                    if not _addr_in_any_module(iat_value, mod_ranges):
+                        actual_mod = _resolve_module_for_addr(iat_value, mod_ranges)
                         mod_name = path.rsplit("\\", 1)[-1]
                         results.append({
                             "module": mod_name,
                             "imported_dll": dll_name,
                             "function": func_name,
                             "iat_value": iat_value,
-                            "expected_range": (expected_base, expected_base + expected_size) if expected_base else None,
+                            "actual_module": actual_mod,
                             "hooked": True,
                         })
 
