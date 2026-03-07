@@ -364,12 +364,28 @@ def check_process_modules(pid, max_bytes=8 * 1024 * 1024):
 
             size = info.SizeOfImage
             path = _module_path(proc, hmod)
-            entry = {"path": path, "base": ctypes.cast(info.lpBaseOfDll, ctypes.c_void_p).value, "size": size}
+            base_addr = ctypes.cast(info.lpBaseOfDll, ctypes.c_void_p).value
+            entry = {"path": path, "base": base_addr, "size": size}
+
+            # For WoW64 processes: 32-bit modules report System32 paths but the
+            # actual 32-bit DLLs live in SysWOW64. Our 64-bit Python would read
+            # the wrong (64-bit) file without this fixup.
+            disk_path = path
+            if disk_path and base_addr < 0x100000000:
+                sys32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+                if disk_path.lower().startswith(sys32.lower()):
+                    wow64_path = os.path.join(
+                        os.environ.get("SystemRoot", r"C:\Windows"),
+                        "SysWOW64",
+                        disk_path[len(sys32) + 1:],
+                    )
+                    if os.path.exists(wow64_path):
+                        disk_path = wow64_path
 
             # Prefer comparing .text section to avoid expected runtime differences elsewhere.
-            if path and os.path.exists(path):
+            if disk_path and os.path.exists(disk_path):
                 try:
-                    with open(path, "rb") as f:
+                    with open(disk_path, "rb") as f:
                         file_bytes = f.read()
                 except Exception as exc:  # noqa: BLE001
                     entry["error"] = f"disk read failed: {exc}"
