@@ -448,6 +448,12 @@ class PeregrineGUI:
                         name = obj.get("image") or obj.get("image_name") or "?"
                         pid = obj.get("pid", "?")
                         self.append_log(f"[Image Load] PID={pid} {name}")
+                    elif event == "ob_callback":
+                        op = obj.get("op", "?")
+                        target = obj.get("target_pid", "?")
+                        caller = obj.get("caller_pid", "?")
+                        access = obj.get("desired_access", "?")
+                        self.append_log(f"[Handle Access] PID={caller} -> PID={target} op={op} access={access}")
                 except Exception as exc:
                     self.append_log(f"[Kernel Parse Error] {exc}")
 
