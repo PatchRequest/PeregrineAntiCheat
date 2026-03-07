@@ -123,43 +123,94 @@ def device_io_control(handle, code, in_buf):
 
 
 class PeregrineGUI:
+    # Color tags: (prefix_match, tag_name, foreground_color)
+    LOG_COLORS = [
+        ("[ok]",                    "ok",         "#4ec94e"),
+        ("[tamper]",                "tamper",      "#ff4444"),
+        ("[SUSPICIOUS",             "suspicious",  "#ff3333"),
+        ("[Remote Thread]",         "remote_thr",  "#ff6644"),
+        ("[External WriteProcessMemory]", "ext_wpm", "#e8a838"),
+        ("[External ReadProcessMemory]",  "ext_rpm", "#c8a848"),
+        ("[External VirtualAllocEx]",     "ext_va",  "#e8a838"),
+        ("[External VirtualProtectEx]",   "ext_vp",  "#e8a838"),
+        ("[External CreateRemoteThread]", "ext_crt", "#ff6644"),
+        ("[External OpenProcess]",        "ext_op",  "#c8a848"),
+        ("[Handle Access]",         "handle",      "#e8a838"),
+        ("[Image Load]",            "imgload",     "#6ab0f3"),
+        ("[Thread OK]",             "thr_ok",      "#4ec94e"),
+        ("[Thread Scan]",           "thr_scan",    "#6ab0f3"),
+        ("[Blacklist]",             "blacklist",   "#e67e22"),
+        ("[PPL]",                   "ppl",         "#4a90e2"),
+        ("[DLL Inject FAIL]",       "inj_fail",    "#ff4444"),
+        ("[Kernel Parse Error]",    "kerr",        "#ff4444"),
+        ("connected",               "connected",   "#4ec94e"),
+        ("connect failed",          "conn_fail",   "#c83c3c"),
+        ("[unknown]",               "unknown",     "#888888"),
+    ]
+
     def __init__(self, root):
         self.root = root
         self.root.title("Peregrine Monitor")
+        self.root.configure(bg="#1e1e2e")
+        self.root.geometry("1000x600")
 
         # Find DLL paths once at startup
         self.dll_paths = find_dll_paths()
 
+        # Style constants
+        BG = "#1e1e2e"
+        FG = "#cdd6f4"
+        BG_ENTRY = "#313244"
+        BG_BTN = "#45475a"
+        FG_BTN = "#cdd6f4"
+        FONT = ("Consolas", 10)
+        FONT_BOLD = ("Consolas", 11, "bold")
+
+        # Status bar
+        status_row = tk.Frame(root, bg=BG)
+        tk.Label(status_row, text="STATUS:", font=FONT_BOLD, bg=BG, fg="#888888").pack(side=tk.LEFT, padx=(0, 6))
         self.status_var = tk.StringVar(value="Disconnected")
-        self.status_label = tk.Label(root, textvariable=self.status_var, fg="#c83c3c", font=("Segoe UI", 12, "bold"))
-        status_row = tk.Frame(root)
-        tk.Label(status_row, text="Status:").pack(side=tk.LEFT, padx=(0, 6))
-        self.status_label.pack(in_=status_row, side=tk.LEFT)
-        status_row.pack(anchor="w", padx=8, pady=(8, 4))
+        self.status_label = tk.Label(status_row, textvariable=self.status_var, fg="#c83c3c", bg=BG, font=FONT_BOLD)
+        self.status_label.pack(side=tk.LEFT)
+        status_row.pack(anchor="w", padx=10, pady=(10, 2))
 
         # Protected PIDs display
         self.protected_pids_var = tk.StringVar(value="Protected PIDs: None")
-        protected_row = tk.Frame(root)
-        self.protected_label = tk.Label(protected_row, textvariable=self.protected_pids_var, font=("Segoe UI", 10))
+        protected_row = tk.Frame(root, bg=BG)
+        self.protected_label = tk.Label(protected_row, textvariable=self.protected_pids_var, font=FONT, bg=BG, fg="#888888")
         self.protected_label.pack(side=tk.LEFT)
-        protected_row.pack(anchor="w", padx=8, pady=(0, 4))
+        protected_row.pack(anchor="w", padx=10, pady=(0, 4))
 
-        controls = tk.Frame(root)
-        tk.Label(controls, text="PID:").pack(side=tk.LEFT, padx=(0, 6))
+        # Controls
+        controls = tk.Frame(root, bg=BG)
+        tk.Label(controls, text="PID:", font=FONT, bg=BG, fg=FG).pack(side=tk.LEFT, padx=(0, 6))
         self.pid_var = tk.StringVar()
-        self.pid_entry = tk.Entry(controls, textvariable=self.pid_var, width=12)
-        self.pid_entry.pack(side=tk.LEFT, padx=(0, 6))
-        tk.Button(controls, text="Add", command=self.on_add_pid).pack(side=tk.LEFT, padx=(0, 4))
-        tk.Button(controls, text="Remove", command=self.on_remove_pid).pack(side=tk.LEFT, padx=(0, 4))
-        tk.Button(controls, text="Clear All", command=self.on_clear_all_pids).pack(side=tk.LEFT)
-        tk.Button(controls, text="Set PPL", command=self.on_set_ppl, bg="#4a90e2", fg="white").pack(side=tk.LEFT, padx=(6, 0))
-        tk.Button(controls, text="Check Modules", command=self.on_check_modules).pack(side=tk.LEFT, padx=(4, 0))
-        tk.Button(controls, text="Check Threads", command=self.on_check_threads).pack(side=tk.LEFT, padx=(4, 0))
-        tk.Button(controls, text="Scan Blacklist", command=self.on_scan_blacklist, bg="#e67e22", fg="white").pack(side=tk.LEFT, padx=(4, 0))
-        controls.pack(anchor="w", padx=8, pady=(0, 8))
+        self.pid_entry = tk.Entry(controls, textvariable=self.pid_var, width=12, font=FONT,
+                                  bg=BG_ENTRY, fg=FG, insertbackground=FG, relief=tk.FLAT, bd=4)
+        self.pid_entry.pack(side=tk.LEFT, padx=(0, 8))
 
-        self.log_view = scrolledtext.ScrolledText(root, wrap=tk.WORD, height=20, state="disabled")
-        self.log_view.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        btn_cfg = dict(font=FONT, bg=BG_BTN, fg=FG_BTN, relief=tk.FLAT, bd=0, padx=10, pady=4, cursor="hand2")
+        tk.Button(controls, text="Add", command=self.on_add_pid, **btn_cfg).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(controls, text="Remove", command=self.on_remove_pid, **btn_cfg).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(controls, text="Clear All", command=self.on_clear_all_pids, **btn_cfg).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(controls, text="Set PPL", command=self.on_set_ppl, bg="#4a90e2", fg="white", font=FONT,
+                  relief=tk.FLAT, bd=0, padx=10, pady=4, cursor="hand2").pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(controls, text="Check Modules", command=self.on_check_modules, **btn_cfg).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(controls, text="Check Threads", command=self.on_check_threads, **btn_cfg).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(controls, text="Scan Blacklist", command=self.on_scan_blacklist, bg="#e67e22", fg="white", font=FONT,
+                  relief=tk.FLAT, bd=0, padx=10, pady=4, cursor="hand2").pack(side=tk.LEFT, padx=(0, 4))
+        controls.pack(anchor="w", padx=10, pady=(0, 8))
+
+        # Log view
+        self.log_view = scrolledtext.ScrolledText(root, wrap=tk.WORD, height=20, state="disabled",
+                                                   bg="#11111b", fg="#cdd6f4", font=("Consolas", 10),
+                                                   insertbackground="#cdd6f4", relief=tk.FLAT, bd=8,
+                                                   selectbackground="#45475a", selectforeground="#cdd6f4")
+        self.log_view.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        # Configure color tags
+        for _, tag_name, color in self.LOG_COLORS:
+            self.log_view.tag_configure(tag_name, foreground=color)
 
         self.stop_event = threading.Event()
         self.handle = None
@@ -426,7 +477,7 @@ class PeregrineGUI:
         self.append_log(f"[ipc-error] {err}")
 
     def set_status(self, text, color):
-        self.root.after(0, lambda: (self.status_var.set(text), self.status_label.configure(fg=color)))
+        self.root.after(0, lambda: (self.status_var.set(text), self.status_label.configure(fg=color, bg="#1e1e2e")))
 
     def update_protected_pids_display(self):
         """Update the protected PIDs display label."""
@@ -444,13 +495,24 @@ class PeregrineGUI:
             self.log_lines.append(msg)
             if len(self.log_lines) > self.max_log_lines:
                 self.log_lines = self.log_lines[-self.max_log_lines :]
-            text = "\n".join(self.log_lines)
-        self.root.after(0, lambda: self._render_log(text))
+            snapshot = list(self.log_lines)
+        self.root.after(0, lambda: self._render_log(snapshot))
 
-    def _render_log(self, text):
+    def _render_log(self, lines):
         self.log_view.configure(state="normal")
         self.log_view.delete("1.0", tk.END)
-        self.log_view.insert(tk.END, text)
+        for i, line in enumerate(lines):
+            if i > 0:
+                self.log_view.insert(tk.END, "\n")
+            tag = None
+            for prefix, tag_name, _ in self.LOG_COLORS:
+                if line.startswith(prefix):
+                    tag = tag_name
+                    break
+            if tag:
+                self.log_view.insert(tk.END, line, tag)
+            else:
+                self.log_view.insert(tk.END, line)
         self.log_view.see(tk.END)
         self.log_view.configure(state="disabled")
 
