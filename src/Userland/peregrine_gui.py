@@ -449,25 +449,25 @@ class PeregrineGUI:
                         pid = obj.get("pid", "?")
                         self.append_log(f"[Image Load] PID={pid} {name}")
                     elif event == "ob_callback":
-                        op = obj.get("op", "?")
-                        target = obj.get("target_pid", "?")
-                        caller = obj.get("caller_pid", "?")
                         access_str = obj.get("desired_access", "0x0")
                         access = int(access_str, 16) if isinstance(access_str, str) else access_str
-                        flags = []
-                        ACCESS_FLAGS = {
-                            0x0001: "TERMINATE", 0x0002: "CREATE_THREAD",
-                            0x0008: "VM_OPERATION", 0x0010: "VM_READ",
-                            0x0020: "VM_WRITE", 0x0040: "DUP_HANDLE",
-                            0x0080: "CREATE_PROCESS", 0x0100: "SET_QUOTA",
-                            0x0200: "SET_INFORMATION", 0x0400: "QUERY_INFORMATION",
-                            0x0800: "SUSPEND_RESUME", 0x1000: "QUERY_LIMITED_INFORMATION",
-                        }
-                        for bit, name in ACCESS_FLAGS.items():
-                            if access & bit:
-                                flags.append(name)
-                        flag_str = "|".join(flags) if flags else access_str
-                        self.append_log(f"[Handle Access] PID={caller} -> PID={target} op={op} [{flag_str}]")
+                        DANGEROUS = 0x0001 | 0x0002 | 0x0008 | 0x0010 | 0x0020 | 0x0040 | 0x0800  # TERMINATE|CREATE_THREAD|VM_OP|VM_R|VM_W|DUP_HANDLE|SUSPEND_RESUME
+                        if access & DANGEROUS:
+                            op = obj.get("op", "?")
+                            target = obj.get("target_pid", "?")
+                            caller = obj.get("caller_pid", "?")
+                            flags = []
+                            ACCESS_FLAGS = {
+                                0x0001: "TERMINATE", 0x0002: "CREATE_THREAD",
+                                0x0008: "VM_OPERATION", 0x0010: "VM_READ",
+                                0x0020: "VM_WRITE", 0x0040: "DUP_HANDLE",
+                                0x0800: "SUSPEND_RESUME",
+                            }
+                            for bit, name in ACCESS_FLAGS.items():
+                                if access & bit:
+                                    flags.append(name)
+                            flag_str = "|".join(flags)
+                            self.append_log(f"[Handle Access] PID={caller} -> PID={target} op={op} [{flag_str}]")
                 except Exception as exc:
                     self.append_log(f"[Kernel Parse Error] {exc}")
 
