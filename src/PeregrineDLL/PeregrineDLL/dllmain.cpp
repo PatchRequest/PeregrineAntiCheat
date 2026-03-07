@@ -137,7 +137,9 @@ static HANDLE WINAPI HookCreateRemoteThread(HANDLE hProcess, LPSECURITY_ATTRIBUT
 
 static HANDLE WINAPI HookOpenProcess(DWORD dwAccess, BOOL bInherit, DWORD dwPID) {
     HANDLE result = oOpenProcess(dwAccess, bInherit, dwPID);
-    if (dwPID != PID) {
+    // Only log dangerous access flags, skip query-only
+    const DWORD DANGEROUS = 0x0001 | 0x0002 | 0x0008 | 0x0010 | 0x0020 | 0x0040 | 0x0800;
+    if (dwPID != PID && (dwAccess & DANGEROUS)) {
         ipc_log_event("OpenProcess",
             "\"callerPID\":%lu,\"targetPID\":%lu,\"access\":\"0x%08X\"",
             PID, dwPID, dwAccess);
