@@ -16,6 +16,8 @@ from threadWork import checkThread, checkAllThreads
 from IPC import start_server as start_ipc_server
 from ProcessBlacklist import scan_processes_for_blacklist, DEFAULT_BLACKLIST
 from HookDetection import check_iat_hooks, check_eat_hooks
+from ManualMapDetection import scan_manual_map
+from OverlayDetection import scan_overlays
 
 # Constants/IOCTLs mirror the working Python sample
 FILE_DEVICE_UNKNOWN = 0x00000022
@@ -152,6 +154,10 @@ class PeregrineGUI:
         ("[IAT Scan]",              "iat_scan",    "#6ab0f3"),
         ("[EAT Hook]",              "eat_hook",    "#ff4444"),
         ("[EAT Scan]",              "eat_scan",    "#6ab0f3"),
+        ("[Manual-Map]",            "mmap",        "#ff4444"),
+        ("[Memory Scan]",           "memscan",     "#6ab0f3"),
+        ("[Overlay]",               "overlay",     "#ff4444"),
+        ("[Overlay Scan]",          "ovlscan",     "#6ab0f3"),
         ("[PPL]",                   "ppl",         "#4a90e2"),
         ("[DLL Inject FAIL]",       "inj_fail",    "#ff4444"),
         ("[Kernel Parse Error]",    "kerr",        "#ff4444"),
@@ -211,6 +217,9 @@ class PeregrineGUI:
         tk.Button(controls, text="Check Threads", command=self.on_check_threads, **btn_cfg).pack(side=tk.LEFT, padx=(0, 4))
         tk.Button(controls, text="Check IAT", command=self.on_check_iat, **btn_cfg).pack(side=tk.LEFT, padx=(0, 4))
         tk.Button(controls, text="Check EAT", command=self.on_check_eat, **btn_cfg).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(controls, text="Scan Memory", command=self.on_scan_memory, **btn_cfg).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(controls, text="Scan Overlays", command=self.on_scan_overlays, bg="#ff6644", fg="white", font=FONT,
+                  relief=tk.FLAT, bd=0, padx=10, pady=4, cursor="hand2").pack(side=tk.LEFT, padx=(0, 4))
         tk.Button(controls, text="Scan Blacklist", command=self.on_scan_blacklist, bg="#e67e22", fg="white", font=FONT,
                   relief=tk.FLAT, bd=0, padx=10, pady=4, cursor="hand2").pack(side=tk.LEFT, padx=(0, 4))
         tk.Button(controls, text="Scan Drivers", command=self.on_scan_drivers, bg="#e67e22", fg="white", font=FONT,
@@ -415,6 +424,47 @@ class PeregrineGUI:
             return
         self.append_log(f"[EAT Scan] Scanning PID {pid}...")
         threading.Thread(target=self._run_eat_check, args=(pid,), daemon=True).start()
+
+    def _run_memory_scan(self, pid):
+        """Background worker for manual-map / shellcode scan."""
+        try:
+            regions = scan_manual_map(pid)
+            if regions:
+                self.append_log(f"[Manual-Map] Found {len(regions)} suspicious executable region(s) in PID {pid}:")
+                for r in regions:
+                    self.append_log(
+                        f"[Manual-Map] 0x{r['address']:X} size={r['size']:#x} "
+                        f"prot={r['protection']} type={r['type']} alloc=0x{r['alloc_base']:X}")
+            else:
+                self.append_log(f"[Memory Scan] PID {pid}: No suspicious executable regions found")
+        except Exception as exc:
+            self.append_log(f"[Memory Scan] Error: {exc}")
+
+    def on_scan_memory(self):
+        pid = self._parse_pid_input(require_connection=False)
+        if pid is None:
+            return
+        self.append_log(f"[Memory Scan] Scanning PID {pid} for manual-mapped code...")
+        threading.Thread(target=self._run_memory_scan, args=(pid,), daemon=True).start()
+
+    def _run_overlay_scan(self):
+        """Background worker for overlay window scan."""
+        try:
+            overlays = scan_overlays()
+            if overlays:
+                self.append_log(f"[Overlay] Found {len(overlays)} suspicious overlay window(s):")
+                for o in overlays:
+                    self.append_log(
+                        f"[Overlay] PID={o['pid']} \"{o['title']}\" "
+                        f"{o['width']}x{o['height']} alpha={o['alpha']} [{o['flags']}]")
+            else:
+                self.append_log("[Overlay Scan] No suspicious overlay windows found")
+        except Exception as exc:
+            self.append_log(f"[Overlay Scan] Error: {exc}")
+
+    def on_scan_overlays(self):
+        self.append_log("[Overlay Scan] Scanning for overlay windows...")
+        threading.Thread(target=self._run_overlay_scan, daemon=True).start()
 
     def on_scan_blacklist(self):
         """Scan all processes for blacklisted keywords."""

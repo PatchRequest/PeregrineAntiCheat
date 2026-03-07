@@ -89,7 +89,17 @@ The kernel driver (`PeregrineKernelComponent`) operates at ring-0 and provides:
     - Validates exported function RVAs stay within module bounds
     - Correctly skips legitimate PE forwarder entries
 
-12. **System Integrity Checks**
+12. **Manual-Map / Shellcode Detection**
+    - Walks process virtual address space with `VirtualQueryEx`
+    - Flags committed, executable memory regions not backed by any loaded module
+    - Detects manually mapped DLLs, shellcode, and injected executable code
+
+13. **Overlay Window Detection**
+    - Enumerates all top-level windows via `EnumWindows`
+    - Flags large/fullscreen windows with overlay traits (layered, transparent, topmost)
+    - Detects ESP/wallhack overlays commonly used in game cheats
+
+14. **System Integrity Checks**
     - **Test-Sign Detection**: Queries CodeIntegrityOptions to detect test-signing mode
     - **HVCI Detection**: Checks if Hypervisor Code Integrity is enabled or disabled
     - **CPU Vendor / Hypervisor Detection**: CPUID-based check for VM/hypervisor presence
@@ -136,6 +146,8 @@ src/
     ├── threadWork.py            # Thread analysis
     ├── ProcessBlacklist.py      # Process blacklist scanning
     ├── HookDetection.py         # IAT and EAT hook detection
+    ├── ManualMapDetection.py    # Manual-map and shellcode detection
+    ├── OverlayDetection.py      # Overlay window detection
     └── self_tamper.py           # Self-integrity checks
 ```
 
@@ -186,6 +198,8 @@ The GUI auto-elevates to administrator if needed.
 - **Scan ObCallbacks**: Enumerate registered object callbacks
 - **Check IAT**: Scan for Import Address Table hooks
 - **Check EAT**: Scan for Export Address Table hooks
+- **Scan Memory**: Detect manually mapped code and shellcode in a process
+- **Scan Overlays**: Detect suspicious overlay windows (ESP/wallhack)
 - **System Check**: Test-signing, HVCI, and hypervisor detection
 
 ## Disclaimer
