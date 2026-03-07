@@ -2,6 +2,7 @@
 #include "Protection.h"
 #include "DriverScan.h"
 #include "ObCallbackScan.h"
+#include "SystemCheck.h"
 
 static PDEVICE_OBJECT g_ComsDevice = NULL;
 static KSPIN_LOCK g_ComsLock;
@@ -82,6 +83,12 @@ static VOID ComsHandleUserCommand(_In_reads_bytes_(DataSize) const UCHAR* Data,
     case 6: { // scan ObCallbacks
         KdPrint(("Peregrine: user requested ObCallback scan\n"));
         ObCallbackScanEnumerate();
+        break;
+    }
+
+    case 7: { // system integrity checks
+        KdPrint(("Peregrine: user requested system check\n"));
+        SystemCheckRunAll();
         break;
     }
 

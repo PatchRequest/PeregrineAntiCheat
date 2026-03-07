@@ -5,6 +5,7 @@
 #include "AppState.h"
 #include "DriverScan.h"
 #include "ObCallbackScan.h"
+#include "SystemCheck.h"
 
 VOID DriverUnload(PDRIVER_OBJECT DriverObject) {
     UNREFERENCED_PARAMETER(DriverObject);

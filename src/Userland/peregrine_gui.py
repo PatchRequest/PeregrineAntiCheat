@@ -143,6 +143,10 @@ class PeregrineGUI:
         ("[Driver Blacklist]",      "drv_bl",      "#ff4444"),
         ("[Driver Scan]",           "drv_scan",    "#6ab0f3"),
         ("[ObCallback]",            "obcb",        "#e8a838"),
+        ("[System Check]",          "syschk",      "#a78bfa"),
+        ("[Test-Sign]",             "testsign",    "#ff4444"),
+        ("[HVCI]",                  "hvci",        "#ff4444"),
+        ("[CPU]",                   "cpu",         "#6ab0f3"),
         ("[PPL]",                   "ppl",         "#4a90e2"),
         ("[DLL Inject FAIL]",       "inj_fail",    "#ff4444"),
         ("[Kernel Parse Error]",    "kerr",        "#ff4444"),
@@ -205,6 +209,8 @@ class PeregrineGUI:
         tk.Button(controls, text="Scan Drivers", command=self.on_scan_drivers, bg="#e67e22", fg="white", font=FONT,
                   relief=tk.FLAT, bd=0, padx=10, pady=4, cursor="hand2").pack(side=tk.LEFT, padx=(0, 4))
         tk.Button(controls, text="Scan ObCallbacks", command=self.on_scan_ob_callbacks, bg="#e8a838", fg="white", font=FONT,
+                  relief=tk.FLAT, bd=0, padx=10, pady=4, cursor="hand2").pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(controls, text="System Check", command=self.on_system_check, bg="#a78bfa", fg="white", font=FONT,
                   relief=tk.FLAT, bd=0, padx=10, pady=4, cursor="hand2").pack(side=tk.LEFT, padx=(0, 4))
         controls.pack(anchor="w", padx=10, pady=(0, 8))
 
@@ -401,6 +407,18 @@ class PeregrineGUI:
             self.append_log("[ObCallback] command failed")
         else:
             self.append_log("[ObCallback] Scanning registered callbacks...")
+
+    def on_system_check(self):
+        """Send command 7 to kernel to run system integrity checks."""
+        if not self.handle:
+            self.append_log("cannot run system check: not connected")
+            return
+        payload = bytes([7])
+        res = device_io_control(self.handle, IOCTL_PEREGRINE_SEND_FROM_USER, payload)
+        if res is None:
+            self.append_log("[System Check] command failed")
+        else:
+            self.append_log("[System Check] Running integrity checks...")
 
     def handle_process_create(self, obj):
         """Handle process_create event - injects DLL into new process."""
@@ -637,6 +655,37 @@ class PeregrineGUI:
                         cb_type = obj.get("type", "?")
                         error = obj.get("error", "unknown")
                         self.append_log(f"[ObCallback] Error scanning {cb_type}: {error}")
+
+                    elif event == "system_check":
+                        check = obj.get("check", "?")
+                        error = obj.get("error")
+                        if error:
+                            self.append_log(f"[System Check] {check}: ERROR - {error}")
+                        elif check == "test_sign":
+                            ts = obj.get("test_signing", False)
+                            ci = obj.get("code_integrity_enabled", False)
+                            if ts:
+                                self.append_log(f"[Test-Sign] DETECTED - Test signing is ENABLED (CI={ci})")
+                            else:
+                                self.append_log(f"[System Check] Test signing disabled, Code Integrity={ci}")
+                        elif check == "hvci":
+                            enabled = obj.get("hvci_enabled", False)
+                            audit = obj.get("hvci_audit_mode", False)
+                            if not enabled:
+                                self.append_log(f"[HVCI] WARNING - HVCI is DISABLED (audit={audit})")
+                            else:
+                                self.append_log(f"[System Check] HVCI enabled (audit={audit})")
+                        elif check == "cpu_vendor":
+                            vendor = obj.get("cpu_vendor", "?")
+                            hv = obj.get("hypervisor_present", False)
+                            hv_vendor = obj.get("hypervisor_vendor", "none")
+                            if hv:
+                                self.append_log(f"[CPU] {vendor} - Hypervisor DETECTED: {hv_vendor}")
+                            else:
+                                self.append_log(f"[CPU] {vendor} - No hypervisor detected")
+
+                    elif event == "system_check_complete":
+                        self.append_log("[System Check] All checks complete")
 
                 except Exception as exc:
                     self.append_log(f"[Kernel Parse Error] {exc}")

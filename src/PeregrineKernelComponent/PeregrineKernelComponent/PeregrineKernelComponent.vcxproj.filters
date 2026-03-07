@@ -38,6 +38,9 @@
     <Filter Include="Source Files\ObCallbackScan">
       <UniqueIdentifier>{a1b2c3d4-1111-2222-3333-444455557777}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Source Files\SystemCheck">
+      <UniqueIdentifier>{a1b2c3d4-1111-2222-3333-444455558888}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="main.c">
@@ -64,6 +67,9 @@
     <ClCompile Include="ObCallbackScan.c">
       <Filter>Source Files\ObCallbackScan</Filter>
     </ClCompile>
+    <ClCompile Include="SystemCheck.c">
+      <Filter>Source Files\SystemCheck</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <None Include="Coms.h">
@@ -88,6 +94,9 @@
     </ClInclude>
     <ClInclude Include="ObCallbackScan.h">
       <Filter>Source Files\ObCallbackScan</Filter>
+    </ClInclude>
+    <ClInclude Include="SystemCheck.h">
+      <Filter>Source Files\SystemCheck</Filter>
     </ClInclude>
   </ItemGroup>
 </Project>

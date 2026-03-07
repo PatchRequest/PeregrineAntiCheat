@@ -101,6 +101,7 @@
     <ClCompile Include="obCallback.c" />
     <ClCompile Include="ObCallbackScan.c" />
     <ClCompile Include="Protection.c" />
+    <ClCompile Include="SystemCheck.c" />
   </ItemGroup>
   <ItemGroup>
     <None Include="Coms.h" />
@@ -112,6 +113,7 @@
     <ClInclude Include="obCallback.h" />
     <ClInclude Include="ObCallbackScan.h" />
     <ClInclude Include="Protection.h" />
+    <ClInclude Include="SystemCheck.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
