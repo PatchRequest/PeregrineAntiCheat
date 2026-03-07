@@ -175,9 +175,6 @@ def InjectDLL(target_pid: int, dll_paths, log_callback=None):
             if exit_code.value == 0:
                 if log_callback:
                     log_callback(f"[DLL Inject FAIL] LoadLibraryA returned NULL for PID={target_pid}")
-            else:
-                if log_callback:
-                    log_callback(f"[DLL Inject] PID={target_pid} OK (HMODULE=0x{exit_code.value:X})")
 
             return exit_code.value
         finally:

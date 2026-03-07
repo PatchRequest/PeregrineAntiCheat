@@ -336,7 +336,6 @@ class PeregrineGUI:
         h_process = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | SYNCHRONIZE, False, pid)
 
         if not h_process:
-            self.append_log(f"[Process Check] PID={pid} is no longer running, skipping injection")
             return
 
         # Check exit code - if still running, exit code is STILL_ACTIVE (259)
@@ -346,7 +345,6 @@ class PeregrineGUI:
 
         STILL_ACTIVE = 259
         if exit_code.value != STILL_ACTIVE:
-            self.append_log(f"[Process Check] PID={pid} has exited (code={exit_code.value}), skipping injection")
             return
 
         # Inject DLL into the new process
@@ -447,7 +445,7 @@ class PeregrineGUI:
                     elif event == "process_create":
                         threading.Thread(target=self.handle_process_create, args=(obj,), daemon=True).start()
                     elif event == "image_load":
-                        name = obj.get("image_name") or obj.get("name") or "?"
+                        name = obj.get("image") or obj.get("image_name") or "?"
                         pid = obj.get("pid", "?")
                         self.append_log(f"[Image Load] PID={pid} {name}")
                 except Exception as exc:
