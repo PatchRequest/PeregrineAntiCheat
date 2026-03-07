@@ -15,6 +15,7 @@ from PatchDetection import check_process_modules
 from threadWork import checkThread, checkAllThreads
 from IPC import start_server as start_ipc_server
 from ProcessBlacklist import scan_processes_for_blacklist, DEFAULT_BLACKLIST
+from HookDetection import check_iat_hooks, check_eat_hooks
 
 # Constants/IOCTLs mirror the working Python sample
 FILE_DEVICE_UNKNOWN = 0x00000022
@@ -147,6 +148,10 @@ class PeregrineGUI:
         ("[Test-Sign]",             "testsign",    "#ff4444"),
         ("[HVCI]",                  "hvci",        "#ff4444"),
         ("[CPU]",                   "cpu",         "#6ab0f3"),
+        ("[IAT Hook]",              "iat_hook",    "#ff4444"),
+        ("[IAT Scan]",              "iat_scan",    "#6ab0f3"),
+        ("[EAT Hook]",              "eat_hook",    "#ff4444"),
+        ("[EAT Scan]",              "eat_scan",    "#6ab0f3"),
         ("[PPL]",                   "ppl",         "#4a90e2"),
         ("[DLL Inject FAIL]",       "inj_fail",    "#ff4444"),
         ("[Kernel Parse Error]",    "kerr",        "#ff4444"),
@@ -204,6 +209,8 @@ class PeregrineGUI:
                   relief=tk.FLAT, bd=0, padx=10, pady=4, cursor="hand2").pack(side=tk.LEFT, padx=(0, 4))
         tk.Button(controls, text="Check Modules", command=self.on_check_modules, **btn_cfg).pack(side=tk.LEFT, padx=(0, 4))
         tk.Button(controls, text="Check Threads", command=self.on_check_threads, **btn_cfg).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(controls, text="Check IAT", command=self.on_check_iat, **btn_cfg).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(controls, text="Check EAT", command=self.on_check_eat, **btn_cfg).pack(side=tk.LEFT, padx=(0, 4))
         tk.Button(controls, text="Scan Blacklist", command=self.on_scan_blacklist, bg="#e67e22", fg="white", font=FONT,
                   relief=tk.FLAT, bd=0, padx=10, pady=4, cursor="hand2").pack(side=tk.LEFT, padx=(0, 4))
         tk.Button(controls, text="Scan Drivers", command=self.on_scan_drivers, bg="#e67e22", fg="white", font=FONT,
@@ -364,6 +371,50 @@ class PeregrineGUI:
             return
         # Run checkAllThreads in a background thread to avoid blocking UI
         threading.Thread(target=checkAllThreads, args=(pid, self), daemon=True).start()
+
+    def _run_iat_check(self, pid):
+        """Background worker for IAT hook scan."""
+        try:
+            hooks = check_iat_hooks(pid)
+            if hooks:
+                self.append_log(f"[IAT Hook] Found {len(hooks)} IAT hook(s) in PID {pid}:")
+                for h in hooks:
+                    self.append_log(
+                        f"[IAT Hook] {h['module']} -> {h['imported_dll']}!{h['function']} "
+                        f"IAT=0x{h['iat_value']:X}")
+            else:
+                self.append_log(f"[IAT Scan] PID {pid}: No IAT hooks detected")
+        except Exception as exc:
+            self.append_log(f"[IAT Scan] Error: {exc}")
+
+    def on_check_iat(self):
+        pid = self._parse_pid_input(require_connection=False)
+        if pid is None:
+            return
+        self.append_log(f"[IAT Scan] Scanning PID {pid}...")
+        threading.Thread(target=self._run_iat_check, args=(pid,), daemon=True).start()
+
+    def _run_eat_check(self, pid):
+        """Background worker for EAT hook scan."""
+        try:
+            hooks = check_eat_hooks(pid)
+            if hooks:
+                self.append_log(f"[EAT Hook] Found {len(hooks)} EAT hook(s) in PID {pid}:")
+                for h in hooks:
+                    self.append_log(
+                        f"[EAT Hook] {h['module']}!{h['function']} "
+                        f"RVA=0x{h['rva']:X} -> 0x{h['target_addr']:X}")
+            else:
+                self.append_log(f"[EAT Scan] PID {pid}: No EAT hooks detected")
+        except Exception as exc:
+            self.append_log(f"[EAT Scan] Error: {exc}")
+
+    def on_check_eat(self):
+        pid = self._parse_pid_input(require_connection=False)
+        if pid is None:
+            return
+        self.append_log(f"[EAT Scan] Scanning PID {pid}...")
+        threading.Thread(target=self._run_eat_check, args=(pid,), daemon=True).start()
 
     def on_scan_blacklist(self):
         """Scan all processes for blacklisted keywords."""
