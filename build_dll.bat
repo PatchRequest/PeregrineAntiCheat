@@ -32,5 +32,14 @@ copy /Y "src\PeregrineDLL\x64\Release\PeregrineDLL.dll" "%DEST%\PeregrineDLL_x64
 copy /Y "src\PeregrineDLL\Release\PeregrineDLL.dll" "%DEST%\PeregrineDLL_x86.dll"
 copy /Y "src\PeregrineKernelComponent\x64\Release\PeregrineKernelComponent.sys" "%DEST%\PeregrineKernelComponent.sys"
 
+echo === Copying to C:\Peregrine ===
+if not exist "C:\Peregrine" mkdir "C:\Peregrine"
+copy /Y "src\PeregrineDLL\x64\Release\PeregrineDLL.dll" "C:\Peregrine\Peregrine64.dll"
+copy /Y "src\PeregrineDLL\Release\PeregrineDLL.dll" "C:\Peregrine\Peregrine32.dll"
+copy /Y "src\PeregrineKernelComponent\x64\Release\PeregrineKernelComponent.sys" "C:\Peregrine\PeregrineKernelComponent.sys"
+if exist "src\peregrine-tauri\src-tauri\target\release\peregrine-tauri.exe" (
+    copy /Y "src\peregrine-tauri\src-tauri\target\release\peregrine-tauri.exe" "C:\Peregrine\peregrine-tauri.exe"
+)
+
 echo === Done ===
-dir "%DEST%\PeregrineDLL_x64.dll" "%DEST%\PeregrineDLL_x86.dll" "%DEST%\PeregrineKernelComponent.sys"
+dir "C:\Peregrine\"

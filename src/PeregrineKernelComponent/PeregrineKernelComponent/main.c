@@ -3,6 +3,7 @@
 #include "obCallback.h"
 #include "NotifyRoutine.h"
 #include "AppState.h"
+#include "ApcInjection.h"
 #include "DriverScan.h"
 #include "ObCallbackScan.h"
 #include "SystemCheck.h"
@@ -11,6 +12,7 @@ VOID DriverUnload(PDRIVER_OBJECT DriverObject) {
     UNREFERENCED_PARAMETER(DriverObject);
     unregisterNotifyRoutine();
     unregisterRegistration();
+    InjCleanup();
     ComsCleanup();
     KdPrint(("Peregrine: Unload called\n"));
 }
@@ -43,6 +45,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     DriverObject->DriverUnload = DriverUnload;
 
 	StateInit();
+    InjInit();
 
    
 

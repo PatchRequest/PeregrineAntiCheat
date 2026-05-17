@@ -23,11 +23,12 @@ The kernel driver (`PeregrineKernelComponent`) operates at ring-0 and provides:
 - **Driver Scanning**: Enumerates loaded kernel drivers and checks against a blacklist
 - **ObCallback Scanning**: Enumerates registered object callbacks to detect tampering
 - **System Integrity Checks**: Test-signing, HVCI, and CPU/hypervisor detection
+- **APC DLL Injection**: Kernel-mode APC-based DLL injection into target processes at kernel32.dll load time — no user-mode CreateRemoteThread needed
 
 ### User-Mode Components
-- **DLL Component** (`PeregrineDLL`): Injected into protected processes for in-process monitoring
-- **Userland Service**: Python-based service that manages communication and analysis
-- **GUI Interface**: Dark-themed real-time monitoring and control interface with colored log output
+- **DLL Component** (`PeregrineDLL`): Injected into protected processes for in-process API hook monitoring (x86 + x64)
+- **Rust/Tauri GUI** (`peregrine-tauri`): Native desktop app with dark-themed real-time monitoring, detection scans, and injection control
+- **Legacy Python GUI** (`src/Userland/`): Original Python/Tkinter interface (still functional)
 
 ## Detection Capabilities
 
@@ -38,7 +39,12 @@ The kernel driver (`PeregrineKernelComponent`) operates at ring-0 and provides:
    - Handles WoW64 path redirection for 32-bit processes on 64-bit Windows
    - Detects runtime code patches, inline hooks, and trampolines
 
-2. **External Memory Access Detection**
+2. **IAT & EAT Hook Detection**
+   - Scans Import Address Tables for entries pointing outside known modules
+   - Scans Export Address Tables for tampered function RVAs
+   - Full PE parsing from process memory with forwarder handling
+
+3. **External Memory Access Detection**
    - Hooks `ReadProcessMemory` and `WriteProcessMemory` (kernel32/kernelbase)
    - Hooks `NtReadVirtualMemory` and `NtWriteVirtualMemory` (ntdll)
    - Hooks `VirtualAllocEx` and `VirtualProtectEx` (remote memory manipulation)
@@ -46,38 +52,39 @@ The kernel driver (`PeregrineKernelComponent`) operates at ring-0 and provides:
    - Hooks `OpenProcess` (handle acquisition with dangerous access flags)
    - Filters out harmless query-only access to reduce noise
 
-3. **Thread & Shellcode Detection**
+4. **Thread & Shellcode Detection**
    - Detects thread execution originating outside trusted modules
-   - Uses kernel-reported Win32 start address for accuracy
+   - Enumerates all threads and checks instruction pointers (RIP) against module ranges
    - Identifies shellcode execution in non-module memory regions
-
-4. **Thread Analysis & Module Mapping**
-   - Enumerates all threads in a process and checks their instruction pointers (RIP)
-   - Maps each thread's execution location to its corresponding module
-   - Flags suspicious threads executing from unknown or unmapped memory regions
 
 5. **Handle Access Monitoring**
    - Kernel ObCallback intercepts handle creation/duplication to protected processes
    - Logs dangerous access flags (VM_READ, VM_WRITE, CREATE_THREAD, TERMINATE, etc.)
-   - Filters out harmless query-only handle requests
 
-6. **DLL Injection Detection**
-   - Monitors image load notifications from the kernel
-   - Tracks all modules loaded into protected processes
-   - Pre-injection process liveness check to avoid injecting into exited processes
-
-7. **Process Blacklist Scanning**
+6. **Process Blacklist Scanning**
    - Enumerates all running processes and checks against a keyword blacklist
    - Detects known cheat tools: CheatEngine, x64dbg, IDA, ProcessHacker, etc.
 
-8. **Driver Blacklist Scanning**
+7. **Driver Blacklist Scanning**
    - Enumerates all loaded kernel drivers from ring-0
    - Checks against a blacklist of known cheat/bypass drivers
 
-9. **ObCallback Enumeration**
+8. **ObCallback Enumeration**
    - Scans registered object callbacks from ring-0
    - Identifies which drivers have registered process/thread handle callbacks
-   - Detects potential callback tampering or unauthorized registrations
+
+## Kernel APC DLL Injection
+
+The driver performs autonomous DLL injection via kernel APC queuing:
+- Userland configures target process names and DLL paths via IOCTL
+- On process creation, the driver matches the image name against targets
+- When `kernel32.dll` loads in the target (loader is initialized), the driver:
+  - Resolves `LdrLoadDll` by parsing ntdll's export table from kernel mode
+  - Allocates RWX memory and writes position-independent shellcode + DLL path
+  - Queues a user-mode APC with `KeInitializeApc` / `KeInsertQueueApc`
+  - Forces delivery via `KeTestAlertThread(UserMode)`
+- Supports both x64 native and x86 WoW64 processes (`PsWrapApcWow64Thread`)
+- Injected DLL sends a "hello" IPC message back to confirm successful load
 
 10. **IAT Hook Detection**
     - Walks each module's Import Address Table in the target process
@@ -114,20 +121,22 @@ Peregrine can elevate processes to Protected Process Light status:
 
 ## Technical Stack
 
-- **Kernel Driver**: C (WDM/WDF)
+- **Kernel Driver**: C (WDM)
 - **DLL Component**: C/C++ with MinHook for API hooking
-- **Userland Service**: Python 3 with Tkinter GUI
-- **IPC Mechanism**: Named pipes
-- **Kernel Communication**: IOCTL (I/O Control) codes
+- **Tauri GUI**: Rust backend + Svelte/TypeScript frontend
+- **Legacy GUI**: Python 3 with Tkinter
+- **IPC**: Named pipes (`\\.\pipe\peregrine_ipc`)
+- **Kernel Communication**: IOCTL codes (commands 1-11)
 
 ## Components
 
 ```
 src/
 ├── PeregrineKernelComponent/    # Kernel driver (ring-0)
+│   ├── ApcInjection.c           # Kernel APC injection (shellcode, PE export parsing)
 │   ├── obCallback.c             # Object callback routines
 │   ├── NotifyRoutine.c          # Process/thread/image notifications
-│   ├── Coms.c                   # IOCTL communication handler
+│   ├── Coms.c                   # IOCTL communication handler (commands 1-11)
 │   ├── Protection.c             # PPL implementation
 │   ├── AppState.c               # Driver state management
 │   ├── DriverScan.c             # Loaded driver enumeration & blacklist
@@ -135,60 +144,91 @@ src/
 │   └── SystemCheck.c            # Test-sign, HVCI, CPU/hypervisor checks
 │
 ├── PeregrineDLL/                # User-mode DLL (x86 + x64)
-│   ├── dllmain.cpp              # Hook setup and detour functions
-│   └── ipc.c                    # Generic IPC event logging
+│   ├── dllmain.cpp              # Hook setup, detour functions, IPC hello
+│   └── ipc.c                    # Named pipe IPC event logging
 │
-└── Userland/                    # Python service layer
-    ├── peregrine_gui.py         # Dark-themed GUI with colored logs
+├── peregrine-tauri/             # Rust/Tauri desktop GUI
+│   ├── src-tauri/src/
+│   │   ├── lib.rs               # Tauri commands, driver polling, IPC polling
+│   │   ├── driver_comm.rs       # IOCTL driver communication
+│   │   ├── ipc.rs               # Named pipe server for DLL messages
+│   │   └── detections/          # Detection modules (Rust ports)
+│   │       ├── pe.rs            # PE parsing, process memory reading
+│   │       ├── hooks.rs         # IAT & EAT hook detection
+│   │       ├── patch.rs         # .text section integrity checking
+│   │       ├── threads.rs       # Thread RIP analysis
+│   │       └── blacklist.rs     # Process blacklist scanning
+│   └── src/routes/+page.svelte  # Dark-themed Svelte frontend
+│
+└── Userland/                    # Legacy Python service layer
+    ├── peregrine_gui.py         # Original Tkinter GUI
     ├── IPC.py                   # Named pipe IPC server
-    ├── DLL.py                   # DLL injection (LoadLibraryA, x86/x64 aware)
-    ├── PatchDetection.py        # Module integrity checking with relocation handling
+    ├── DLL.py                   # DLL injection (LoadLibraryA)
+    ├── PatchDetection.py        # Module integrity checking
+    ├── HookDetection.py         # IAT/EAT hook detection
     ├── threadWork.py            # Thread analysis
     ├── ProcessBlacklist.py      # Process blacklist scanning
+<<<<<<< HEAD
     ├── HookDetection.py         # IAT and EAT hook detection
     ├── ManualMapDetection.py    # Manual-map and shellcode detection
     ├── OverlayDetection.py      # Overlay window detection
     └── self_tamper.py           # Self-integrity checks
+=======
+    └── ManualMapDetection.py    # Manual-map detection
+>>>>>>> 23bba78 (add kernel APC DLL injection and Rust/Tauri GUI rewrite)
 ```
 
 ## Building
 
-Run `build_dll.bat` from the project root to build everything:
+### Full Build (DLLs + Driver)
+
+Run `build_dll.bat` from the project root:
 
 ```batch
 build_dll.bat
 ```
 
-This builds:
-- `PeregrineDLL_x64.dll` (Release x64)
-- `PeregrineDLL_x86.dll` (Release x86)
-- `PeregrineKernelComponent.sys` (Release x64)
+This builds and copies everything to `C:\Peregrine\`:
+- `Peregrine64.dll` (x64 Release)
+- `Peregrine32.dll` (x86 Release)
+- `PeregrineKernelComponent.sys` (x64 Release)
+- `peregrine-tauri.exe` (if previously built)
 
-All outputs are copied to `src/Userland/` where the Python GUI expects them.
+### Tauri GUI
+
+```batch
+cd src\peregrine-tauri
+npm install
+npx tauri build
+```
+
+Produces `peregrine-tauri.exe` (~9 MB standalone).
 
 ### Requirements
 - Windows 10/11 (x64)
 - Visual Studio 2022 with C++ workload
 - Windows Driver Kit (WDK)
-- Python 3.8+
+- Rust 1.70+ with cargo
+- Node.js 18+ with npm
 - Test signing enabled (`bcdedit /set testsigning on`)
 
 ## Usage
 
 ### Starting the Driver
 ```
-sc.exe create PeregrineKernelComponent type= kernel binPath= "C:\path\to\PeregrineKernelComponent.sys"
-sc.exe start PeregrineKernelComponent
+sc.exe create Peregrine type= kernel binPath= "C:\Peregrine\PeregrineKernelComponent.sys"
+sc.exe start Peregrine
 ```
 
 ### Running the GUI
 ```
-cd src/Userland
-python peregrine_gui.py
+C:\Peregrine\peregrine-tauri.exe
 ```
-The GUI auto-elevates to administrator if needed.
+
+On connect, the app auto-detects DLLs in `C:\Peregrine\` and configures the driver.
 
 ### GUI Controls
+<<<<<<< HEAD
 - **Add/Remove PIDs**: Protect specific processes by PID
 - **Set PPL**: Elevate processes to Protected Process Light status
 - **Check Modules**: Scan a process for module tampering
@@ -201,6 +241,30 @@ The GUI auto-elevates to administrator if needed.
 - **Scan Memory**: Detect manually mapped code and shellcode in a process
 - **Scan Overlays**: Detect suspicious overlay windows (ESP/wallhack)
 - **System Check**: Test-signing, HVCI, and hypervisor detection
+=======
+- **PID Management**: Add/Remove/Clear protected PIDs
+- **Set PPL**: Elevate processes to Protected Process Light
+- **Inject**: Add target process names for kernel APC injection
+- **Modules/IAT/EAT/Threads**: Per-process detection scans
+- **Blacklist**: Scan all processes for known cheat tools
+- **Drivers/ObCB/SysChk**: Kernel-level scans via IOCTL
+
+### IOCTL Protocol
+
+| Cmd | Description |
+|-----|-------------|
+| 1 | Add PID to protected list |
+| 2 | Remove PID |
+| 3 | Clear all PIDs |
+| 4 | Set process to PPL |
+| 5 | Scan loaded drivers |
+| 6 | Scan ObCallbacks |
+| 7 | System integrity checks |
+| 8 | Set x64 DLL injection path |
+| 9 | Set x86 DLL injection path |
+| 10 | Add injection target process name |
+| 11 | Enable/disable auto-injection |
+>>>>>>> 23bba78 (add kernel APC DLL injection and Rust/Tauri GUI rewrite)
 
 ## Disclaimer
 

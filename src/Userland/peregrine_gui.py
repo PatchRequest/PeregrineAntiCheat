@@ -91,6 +91,37 @@ def find_dll_paths():
 
     return paths
 
+
+def _send_injection_config(handle, dll_paths, targets, log_fn):
+    """Send DLL paths and target process names to the driver for kernel APC injection."""
+    # Command 8: x64 DLL path (wide string)
+    if dll_paths.get('x64'):
+        path_str = dll_paths['x64'].decode('ascii') if isinstance(dll_paths['x64'], bytes) else dll_paths['x64']
+        path_wide = path_str.encode('utf-16-le')
+        payload = bytes([8]) + path_wide
+        device_io_control(handle, IOCTL_PEREGRINE_SEND_FROM_USER, payload)
+        log_fn(f"[APC] Set x64 DLL: {path_str}")
+
+    # Command 9: x86 DLL path (wide string)
+    if dll_paths.get('x86'):
+        path_str = dll_paths['x86'].decode('ascii') if isinstance(dll_paths['x86'], bytes) else dll_paths['x86']
+        path_wide = path_str.encode('utf-16-le')
+        payload = bytes([9]) + path_wide
+        device_io_control(handle, IOCTL_PEREGRINE_SEND_FROM_USER, payload)
+        log_fn(f"[APC] Set x86 DLL: {path_str}")
+
+    # Command 10: add target process names
+    for target in targets:
+        name_bytes = target.encode('ascii') if isinstance(target, str) else target
+        payload = bytes([10]) + name_bytes
+        device_io_control(handle, IOCTL_PEREGRINE_SEND_FROM_USER, payload)
+        log_fn(f"[APC] Added target: {target}")
+
+    # Command 11: enable injection
+    payload = bytes([11, 1])
+    device_io_control(handle, IOCTL_PEREGRINE_SEND_FROM_USER, payload)
+    log_fn("[APC] Kernel injection enabled")
+
 def raise_last_error(msg):
     err = ctypes.get_last_error()
     raise OSError(err, f"{msg} (err={err})")
@@ -172,8 +203,12 @@ class PeregrineGUI:
         self.root.configure(bg="#1e1e2e")
         self.root.geometry("1000x600")
 
-        # Find DLL paths once at startup
-        self.dll_paths = find_dll_paths()
+        # Hardcoded DLL paths (built by build_dll.bat into this directory)
+        script_dir = Path(__file__).parent.absolute()
+        self.dll_paths = {
+            'x64': str(script_dir / "PeregrineDLL_x64.dll").encode('ascii'),
+            'x86': str(script_dir / "PeregrineDLL_x86.dll").encode('ascii'),
+        }
 
         # Style constants
         BG = "#1e1e2e"
@@ -248,6 +283,8 @@ class PeregrineGUI:
         self.max_log_lines = 2000
         self.protected_pids = set()  # Track PIDs we've added to the kernel
         self.protected_pids_lock = threading.Lock()
+        self.injection_targets = []  # Process names for kernel APC injection
+        self.kernel_injection = True  # Use kernel APC injection instead of user-mode
         self.ipc_stop = start_ipc_server(on_message=self.on_ipc_message, on_error=self.on_ipc_error)
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -522,15 +559,21 @@ class PeregrineGUI:
             self.append_log("[System Check] Running integrity checks...")
 
     def handle_process_create(self, obj):
-        """Handle process_create event - injects DLL into new process."""
+        """Handle process_create event.
+
+        With kernel APC injection enabled, the driver injects autonomously
+        for matching target processes.  This handler only does user-mode
+        fallback injection when kernel injection is disabled.
+        """
+        if self.kernel_injection:
+            return
+
         pid = obj.get("pid", "N/A")
         if pid == "N/A" or pid == os.getpid():
             return
 
-        # Wait 2 seconds before injecting to let the process initialize
         time.sleep(2)
 
-        # Check if process is still running before injecting
         kernel32 = ctypes.windll.kernel32
         PROCESS_QUERY_INFORMATION = 0x0400
         SYNCHRONIZE = 0x00100000
@@ -539,7 +582,6 @@ class PeregrineGUI:
         if not h_process:
             return
 
-        # Check exit code - if still running, exit code is STILL_ACTIVE (259)
         exit_code = wintypes.DWORD()
         kernel32.GetExitCodeProcess(h_process, ctypes.byref(exit_code))
         kernel32.CloseHandle(h_process)
@@ -548,7 +590,6 @@ class PeregrineGUI:
         if exit_code.value != STILL_ACTIVE:
             return
 
-        # Inject DLL into the new process
         InjectDLL(pid, self.dll_paths, self.append_log)
 
     def on_ipc_message(self, msg):
@@ -666,6 +707,17 @@ class PeregrineGUI:
         self.log_view.see(tk.END)
         self.log_view.configure(state="disabled")
 
+    def _configure_kernel_injection(self):
+        """Send hardcoded DLL paths and injection targets to the driver."""
+        if not self.handle or not self.kernel_injection:
+            return
+        _send_injection_config(
+            self.handle,
+            self.dll_paths,
+            self.injection_targets,
+            self.append_log,
+        )
+
     def connection_loop(self):
         backoff = 0.5
         max_backoff = 5.0
@@ -675,6 +727,7 @@ class PeregrineGUI:
                 self.handle = h
                 self.set_status("Connected", "#3cb45a")
                 self.append_log("connected")
+                self._configure_kernel_injection()
                 backoff = 0.5
                 self.receiver_loop()
             except Exception as exc:
@@ -787,6 +840,24 @@ class PeregrineGUI:
 
                     elif event == "system_check_complete":
                         self.append_log("[System Check] All checks complete")
+
+                    elif event == "apc_inject":
+                        pid = obj.get("pid", "?")
+                        tid = obj.get("tid", "?")
+                        status = obj.get("status", "?")
+                        if status == "success":
+                            self.append_log(f"[ok] APC injection PID={pid} TID={tid}")
+                            payload = bytes([1]) + self._pack_handle(pid)
+                            device_io_control(self.handle, IOCTL_PEREGRINE_SEND_FROM_USER, payload)
+                            with self.protected_pids_lock:
+                                self.protected_pids.add(pid)
+                            self.update_protected_pids_display()
+
+                            threading.Thread(target=checkAllThreads, args=(pid, self), daemon=True).start()
+                            threading.Thread(target=lambda p=pid: check_process_modules(p), daemon=True).start()
+                        else:
+                            err = obj.get("error", "?")
+                            self.append_log(f"[DLL Inject FAIL] APC injection PID={pid} error={err}")
 
                 except Exception as exc:
                     self.append_log(f"[Kernel Parse Error] {exc}")

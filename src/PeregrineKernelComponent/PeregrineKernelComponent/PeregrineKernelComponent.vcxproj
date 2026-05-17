@@ -93,6 +93,7 @@
     <FilesToPackage Include="$(TargetPath)" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="ApcInjection.c" />
     <ClCompile Include="AppState.c" />
     <ClCompile Include="Coms.c" />
     <ClCompile Include="DriverScan.c" />
@@ -107,6 +108,7 @@
     <None Include="Coms.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="ApcInjection.h" />
     <ClInclude Include="AppState.h" />
     <ClInclude Include="DriverScan.h" />
     <ClInclude Include="NotifyRoutine.h" />

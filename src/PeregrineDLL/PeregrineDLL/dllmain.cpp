@@ -184,8 +184,6 @@ static DWORD WINAPI InitThread(LPVOID) {
         return 0;
     }
 
-    ipc_write_json("{\"event\":\"dll_loaded\",\"message\":\"PeregrineDLL loaded successfully.\"}");
-
     HMODULE kb    = GetModuleHandleW(L"KernelBase.dll");
     HMODULE k32   = GetModuleHandleW(L"kernel32.dll");
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
@@ -205,6 +203,15 @@ static DWORD WINAPI InitThread(LPVOID) {
     InstallHook(kb, k32, "OpenProcess",        (void**)&oOpenProcess,        (void*)HookOpenProcess);
 
     DebugLog("[PeregrineDLL] Initialization complete\n");
+
+    char exeName[MAX_PATH] = {0};
+    GetModuleFileNameA(NULL, exeName, MAX_PATH);
+    const char* baseName = exeName;
+    for (const char* p = exeName; *p; p++)
+        if (*p == '\\' || *p == '/') baseName = p + 1;
+
+    ipc_log_event("hello", "\"callerPID\":%lu,\"image\":\"%s\"", PID, baseName);
+
     return 0;
 }
 

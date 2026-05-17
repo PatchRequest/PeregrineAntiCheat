@@ -3,6 +3,7 @@
 #include "DriverScan.h"
 #include "ObCallbackScan.h"
 #include "SystemCheck.h"
+#include "ApcInjection.h"
 
 static PDEVICE_OBJECT g_ComsDevice = NULL;
 static KSPIN_LOCK g_ComsLock;
@@ -89,6 +90,38 @@ static VOID ComsHandleUserCommand(_In_reads_bytes_(DataSize) const UCHAR* Data,
     case 7: { // system integrity checks
         KdPrint(("Peregrine: user requested system check\n"));
         SystemCheckRunAll();
+        break;
+    }
+
+    case 8: { // set x64 DLL injection path (wide string)
+        if (DataSize <= 1) { KdPrint(("Peregrine: cmd=8 empty\n")); return; }
+        USHORT pathBytes = (USHORT)(DataSize - 1);
+        InjSetDllPath(FALSE, (const WCHAR*)(Data + 1), pathBytes);
+        KdPrint(("Peregrine: set x64 DLL path (%u bytes)\n", pathBytes));
+        break;
+    }
+
+    case 9: { // set x86 DLL injection path (wide string)
+        if (DataSize <= 1) { KdPrint(("Peregrine: cmd=9 empty\n")); return; }
+        USHORT pathBytes = (USHORT)(DataSize - 1);
+        InjSetDllPath(TRUE, (const WCHAR*)(Data + 1), pathBytes);
+        KdPrint(("Peregrine: set x86 DLL path (%u bytes)\n", pathBytes));
+        break;
+    }
+
+    case 10: { // add injection target process name (ANSI)
+        if (DataSize <= 1) { KdPrint(("Peregrine: cmd=10 empty\n")); return; }
+        ULONG nameLen = DataSize - 1;
+        InjAddTarget((const CHAR*)(Data + 1), nameLen);
+        KdPrint(("Peregrine: added injection target\n"));
+        break;
+    }
+
+    case 11: { // enable (1) or disable (0) auto-injection
+        if (DataSize < 2) { KdPrint(("Peregrine: cmd=11 too small\n")); return; }
+        BOOLEAN enable = Data[1] != 0;
+        InjSetEnabled(enable);
+        KdPrint(("Peregrine: injection %s\n", enable ? "enabled" : "disabled"));
         break;
     }
 

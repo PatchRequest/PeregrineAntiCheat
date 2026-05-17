@@ -1,5 +1,6 @@
 #include "NotifyRoutine.h"
 #include "Coms.h"
+#include "ApcInjection.h"
 #include <ntstrsafe.h>
 
 // Forward declarations for thread functions
@@ -66,7 +67,8 @@ VOID CreateProcessNotifyRoutineEx(
 
     CHAR json[COMS_MAX_MESSAGE_SIZE];
     if (CreateInfo != NULL) {
-        // Process creation event
+        InjOnProcessCreate(ProcessId, CreateInfo);
+
         RtlStringCchPrintfA(
             json,
             ARRAYSIZE(json),
@@ -75,7 +77,8 @@ VOID CreateProcessNotifyRoutineEx(
             (ULONG)(ULONG_PTR)CreateInfo->ParentProcessId,
             imageName);
     } else {
-        // Process exit event
+        InjOnProcessExit(ProcessId);
+
         RtlStringCchPrintfA(
             json,
             ARRAYSIZE(json),
@@ -91,8 +94,12 @@ VOID CreateThreadNotifyRoutine(
     _In_ HANDLE ThreadId,
     _In_ BOOLEAN Create
 ) {
-    const CHAR* ev = Create ? "thread_create" : "thread_exit";
+    if (Create && InjOnThreadCreate(ProcessId, ThreadId)) {
+        /* Injection was performed; also let the normal logging proceed
+           once the PID gets added to the protected list by userland. */
+    }
 
+    const CHAR* ev = Create ? "thread_create" : "thread_exit";
 
 	if (!StateIsPidProtected(ProcessId)) {
 		return;
@@ -153,9 +160,10 @@ VOID CreateThreadNotifyRoutine(
 
 VOID LoadImageNotifyRoutine(
     _In_opt_ PUNICODE_STRING FullImageName,
-    _In_ HANDLE ProcessId, // pid of process loading the image
+    _In_ HANDLE ProcessId,
     _In_ PIMAGE_INFO ImageInfo
 ) {
+    InjOnImageLoad(ProcessId, FullImageName, ImageInfo);
 
 	if (!StateIsPidProtected(ProcessId)) {
 		return;
