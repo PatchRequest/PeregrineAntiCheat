@@ -13,10 +13,10 @@ An educational anti-cheat system demonstrating Windows kernel programming, proce
 ┌─────────────────────────────────────────────────────────────┐
 │  Tauri GUI (Rust + Svelte)                                  │
 │  peregrine-tauri.exe                                        │
-│  ┌──────────┐ ┌──────────┐ ┌───────────┐ ┌──────────────┐  │
-│  │ Driver   │ │ IPC Pipe │ │ Detection │ │ ETW-TI       │  │
-│  │ Polling  │ │ Server   │ │ Scans     │ │ Consumer     │  │
-│  └────┬─────┘ └────┬─────┘ └───────────┘ └──────────────┘  │
+│  ┌──────────┐ ┌──────────┐ ┌───────────┐ ┌──────────────┐   │
+│  │ Driver   │ │ IPC Pipe │ │ Detection │ │ ETW-TI       │   │
+│  │ Polling  │ │ Server   │ │ Scans     │ │ Consumer     │   │
+│  └────┬─────┘ └────┬─────┘ └───────────┘ └──────────────┘   │
 │       │IOCTL       │Named Pipe                PPL+ETW       │
 ├───────┼────────────┼────────────────────────────────────────┤
 │       ▼            ▼                                        │
@@ -30,17 +30,17 @@ An educational anti-cheat system demonstrating Windows kernel programming, proce
 │  │  • Minifilter (file access monitoring)              │    │
 │  │  • Driver/ObCallback scanning                       │    │
 │  └─────────┬───────────────────────────────────────────┘    │
-│            │ APC Injection                                   │
-│            ▼                                                 │
+│            │ APC Injection                                  │
+│            ▼                                                │
 │  ┌──────────────────────┐      ┌─────────────────────┐      │
-│  │  PeregrineDLL        │      │  Target Process      │      │
-│  │  (injected into      │─────▶│  (game / cheat)      │      │
-│  │   target processes)  │ IPC  │                      │      │
-│  │  • MinHook API hooks │pipe  │  APIs hooked:        │      │
-│  │  • RPM/WPM/NtR/NtW  │      │  ReadProcessMemory   │      │
-│  │  • VirtualAlloc/Prot │      │  WriteProcessMemory  │      │
-│  │  • CreateRemoteThread│      │  VirtualAllocEx ...   │      │
-│  │  • OpenProcess       │      │                      │      │
+│  │  PeregrineDLL        │      │  Target Process     │      │
+│  │  (injected into      │─────▶│  (game / cheat)     │      │
+│  │   target processes)  │ IPC  │                     │      │
+│  │  • MinHook API hooks │pipe  │  APIs hooked:       │      │
+│  │  • RPM/WPM/NtR/NtW   │      │  ReadProcessMemory  │      │
+│  │  • VirtualAlloc/Prot │      │  WriteProcessMemory │      │
+│  │  • CreateRemoteThread│      │  VirtualAllocEx ... │      │
+│  │  • OpenProcess       │      │                     │      │
 │  └──────────────────────┘      └─────────────────────┘      │
 └─────────────────────────────────────────────────────────────┘
 ```
