@@ -14,7 +14,6 @@ An educational anti-cheat system demonstrating Windows kernel programming, proce
 | **Kernel Driver** | C (Minifilter) | ObCallbacks, notify routines, APC injection, PPL, driver/ObCallback scanning, file access monitoring |
 | **Injection DLL** | C++ (MinHook) | API hooks in target processes, IPC reporting via named pipes |
 | **Tauri GUI** | Rust + Svelte | Real-time monitoring, detection scans, injection control, ETW-TI consumer |
-| **Legacy GUI** | Python/Tkinter | Original interface (still functional) |
 
 ## Detection Capabilities
 
@@ -83,8 +82,7 @@ Start `game.exe` first — it prints its PID and a health variable address for t
 src/
 ├── PeregrineKernelComponent/    # Kernel minifilter driver (ring-0)
 ├── PeregrineDLL/                # Injected API hook DLL (x86 + x64)
-├── peregrine-tauri/             # Rust/Tauri desktop GUI
-└── Userland/                    # Legacy Python GUI
+└── peregrine-tauri/             # Rust/Tauri desktop GUI
 test/                            # Cheat test tools (game.exe, cheat_*.exe)
 ```
 
