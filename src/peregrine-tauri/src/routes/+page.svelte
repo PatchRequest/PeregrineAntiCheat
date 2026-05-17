@@ -135,18 +135,6 @@
       addLog(`clear_pids failed: ${e}`, "err");
     }
   }
-  async function setPic() {
-    const pid = requirePid();
-    if (pid === null) return;
-    if (!requireDriver()) return;
-    try {
-      const msg: string = await invoke("pic_set", { pid });
-      addLog(`[PIC] ${msg}`, "ok");
-    } catch (e: any) {
-      addLog(`[PIC] failed: ${e}`, "err");
-    }
-  }
-
   async function setPpl() {
     const pid = requirePid();
     if (pid === null) return;
@@ -290,9 +278,6 @@
         addLog(`[File Access] PID=${d.pid} op=${d.op} ${d.path}`, "handle");
         break;
 
-      case "pic_set":
-        addLog(`[PIC] Instrumentation callback set on PID=${d.pid} buffer=0x${(d.buffer ?? 0).toString(16).toUpperCase()}`, "ok");
-        break;
 
       case "image_load":
         addLog(`[Image Load] PID=${d.pid} ${d.image ?? "?"}`, "imgload");
@@ -460,7 +445,6 @@
     <button class="btn" onclick={removePid}>Remove</button>
     <button class="btn" onclick={clearAll}>Clear</button>
     <button class="btn accent" onclick={setPpl}>PPL</button>
-    <button class="btn" style="background:#9b59b6;color:white" onclick={setPic}>PIC</button>
     <span style="color:#585b70">|</span>
     <input type="text" bind:value={targetInput} placeholder="target.exe" class="pid-input" style="width:110px" />
     <button class="btn accent" onclick={addTarget}>Inject</button>

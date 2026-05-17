@@ -4,7 +4,6 @@
 #include "ObCallbackScan.h"
 #include "SystemCheck.h"
 #include "ApcInjection.h"
-#include "PicCallback.h"
 
 static PDEVICE_OBJECT g_ComsDevice = NULL;
 static KSPIN_LOCK g_ComsLock;
@@ -123,24 +122,6 @@ static VOID ComsHandleUserCommand(_In_reads_bytes_(DataSize) const UCHAR* Data,
         BOOLEAN enable = Data[1] != 0;
         InjSetEnabled(enable);
         KdPrint(("Peregrine: injection %s\n", enable ? "enabled" : "disabled"));
-        break;
-    }
-
-    case 12: { // set PIC (process instrumentation callback) on PID
-        if (DataSize < 1 + sizeof(HANDLE)) { KdPrint(("Peregrine: cmd=12 too small\n")); return; }
-        HANDLE picPid = 0;
-        RtlCopyMemory(&picPid, Data + 1, sizeof(picPid));
-        KdPrint(("Peregrine: PIC set PID=%lu => 0x%08X\n",
-            (ULONG)(ULONG_PTR)picPid, PicSet(picPid)));
-        break;
-    }
-
-    case 13: { // remove PIC from PID
-        if (DataSize < 1 + sizeof(HANDLE)) { KdPrint(("Peregrine: cmd=13 too small\n")); return; }
-        HANDLE picPid = 0;
-        RtlCopyMemory(&picPid, Data + 1, sizeof(picPid));
-        PicRemove(picPid);
-        KdPrint(("Peregrine: PIC removed PID=%lu\n", (ULONG)(ULONG_PTR)picPid));
         break;
     }
 

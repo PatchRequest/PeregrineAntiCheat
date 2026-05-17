@@ -100,7 +100,6 @@
     <ClCompile Include="ApcInjection.c" />
     <ClCompile Include="AppState.c" />
     <ClCompile Include="MiniFilter.c" />
-    <ClCompile Include="PicCallback.c" />
     <ClCompile Include="Coms.c" />
     <ClCompile Include="DriverScan.c" />
     <ClCompile Include="main.c" />
@@ -118,7 +117,6 @@
     <ClInclude Include="ApcInjection.h" />
     <ClInclude Include="AppState.h" />
     <ClInclude Include="MiniFilter.h" />
-    <ClInclude Include="PicCallback.h" />
     <ClInclude Include="DriverScan.h" />
     <ClInclude Include="NotifyRoutine.h" />
     <ClInclude Include="obCallback.h" />

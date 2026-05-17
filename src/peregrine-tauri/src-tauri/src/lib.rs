@@ -109,12 +109,6 @@ fn clear_injection_targets() -> Result<String, String> {
 }
 
 #[tauri::command]
-fn pic_set(pid: u32) -> Result<String, String> {
-    DriverHandle::open()?.pic_set(pid)?;
-    Ok(format!("PIC set on PID {}", pid))
-}
-
-#[tauri::command]
 fn start_etw_ti(app: tauri::AppHandle) -> Result<String, String> {
     let my_pid = std::process::id();
     DriverHandle::open()?.set_ppl(my_pid)?;
@@ -196,7 +190,7 @@ fn start_driver_polling(app: AppHandle) {
                         match ev {
                             "process_create" | "process_exit" |
                             "thread_create" | "thread_exit" |
-                            "ob_callback" | "image_load" => {}
+                            "image_load" => {}
                             _ => {
                                 eprintln!("[DBG] DRV event: {}", ev);
                                 let _ = app.emit("driver-event", &obj);
@@ -229,7 +223,6 @@ pub fn run() {
             system_check,
             add_injection_target,
             clear_injection_targets,
-            pic_set,
             start_etw_ti,
             check_modules,
             check_iat,

@@ -226,17 +226,6 @@ impl DriverHandle {
         self.send_command(&[11, if enabled { 1 } else { 0 }])
     }
 
-    pub fn pic_set(&self, pid: u32) -> Result<(), String> {
-        let mut buf = vec![12u8];
-        buf.extend_from_slice(&(pid as u64).to_le_bytes());
-        self.send_command(&buf)
-    }
-
-    pub fn pic_remove(&self, pid: u32) -> Result<(), String> {
-        let mut buf = vec![13u8];
-        buf.extend_from_slice(&(pid as u64).to_le_bytes());
-        self.send_command(&buf)
-    }
 }
 
 impl Drop for DriverHandle {
