@@ -86,27 +86,17 @@ The driver performs autonomous DLL injection via kernel APC queuing:
 - Supports both x64 native and x86 WoW64 processes (`PsWrapApcWow64Thread`)
 - Injected DLL sends a "hello" IPC message back to confirm successful load
 
-10. **IAT Hook Detection**
-    - Walks each module's Import Address Table in the target process
-    - Flags IAT entries pointing outside all known loaded modules
-    - Detects hooks redirecting to shellcode or manually mapped code
+9. **Manual-Map / Shellcode Detection**
+   - Walks process virtual address space with `VirtualQueryEx`
+   - Flags committed, executable memory regions not backed by any loaded module
+   - Detects manually mapped DLLs, shellcode, and injected executable code
 
-11. **EAT Hook Detection**
-    - Walks each module's Export Address Table
-    - Validates exported function RVAs stay within module bounds
-    - Correctly skips legitimate PE forwarder entries
-
-12. **Manual-Map / Shellcode Detection**
-    - Walks process virtual address space with `VirtualQueryEx`
-    - Flags committed, executable memory regions not backed by any loaded module
-    - Detects manually mapped DLLs, shellcode, and injected executable code
-
-13. **Overlay Window Detection**
+10. **Overlay Window Detection**
     - Enumerates all top-level windows via `EnumWindows`
     - Flags large/fullscreen windows with overlay traits (layered, transparent, topmost)
     - Detects ESP/wallhack overlays commonly used in game cheats
 
-14. **System Integrity Checks**
+11. **System Integrity Checks**
     - **Test-Sign Detection**: Queries CodeIntegrityOptions to detect test-signing mode
     - **HVCI Detection**: Checks if Hypervisor Code Integrity is enabled or disabled
     - **CPU Vendor / Hypervisor Detection**: CPUID-based check for VM/hypervisor presence
@@ -168,14 +158,10 @@ src/
     ├── HookDetection.py         # IAT/EAT hook detection
     ├── threadWork.py            # Thread analysis
     ├── ProcessBlacklist.py      # Process blacklist scanning
-<<<<<<< HEAD
     ├── HookDetection.py         # IAT and EAT hook detection
     ├── ManualMapDetection.py    # Manual-map and shellcode detection
     ├── OverlayDetection.py      # Overlay window detection
     └── self_tamper.py           # Self-integrity checks
-=======
-    └── ManualMapDetection.py    # Manual-map detection
->>>>>>> 23bba78 (add kernel APC DLL injection and Rust/Tauri GUI rewrite)
 ```
 
 ## Building
@@ -228,26 +214,18 @@ C:\Peregrine\peregrine-tauri.exe
 On connect, the app auto-detects DLLs in `C:\Peregrine\` and configures the driver.
 
 ### GUI Controls
-<<<<<<< HEAD
-- **Add/Remove PIDs**: Protect specific processes by PID
-- **Set PPL**: Elevate processes to Protected Process Light status
-- **Check Modules**: Scan a process for module tampering
-- **Check Threads**: Analyze thread execution locations
-- **Scan Blacklist**: Scan all running processes for known cheat tools
-- **Scan Drivers**: Enumerate loaded kernel drivers and check blacklist
-- **Scan ObCallbacks**: Enumerate registered object callbacks
-- **Check IAT**: Scan for Import Address Table hooks
-- **Check EAT**: Scan for Export Address Table hooks
-- **Scan Memory**: Detect manually mapped code and shellcode in a process
-- **Scan Overlays**: Detect suspicious overlay windows (ESP/wallhack)
-- **System Check**: Test-signing, HVCI, and hypervisor detection
-=======
 - **PID Management**: Add/Remove/Clear protected PIDs
 - **Set PPL**: Elevate processes to Protected Process Light
 - **Inject**: Add target process names for kernel APC injection
-- **Modules/IAT/EAT/Threads**: Per-process detection scans
-- **Blacklist**: Scan all processes for known cheat tools
-- **Drivers/ObCB/SysChk**: Kernel-level scans via IOCTL
+- **Check Modules**: Scan a process for module tampering
+- **Check IAT/EAT**: Scan for Import/Export Address Table hooks
+- **Check Threads**: Analyze thread execution locations
+- **Scan Blacklist**: Scan all running processes for known cheat tools
+- **Scan Memory**: Detect manually mapped code and shellcode
+- **Scan Overlays**: Detect suspicious overlay windows
+- **Scan Drivers**: Enumerate loaded kernel drivers and check blacklist
+- **Scan ObCallbacks**: Enumerate registered object callbacks
+- **System Check**: Test-signing, HVCI, and hypervisor detection
 
 ### IOCTL Protocol
 
@@ -264,7 +242,6 @@ On connect, the app auto-detects DLLs in `C:\Peregrine\` and configures the driv
 | 9 | Set x86 DLL injection path |
 | 10 | Add injection target process name |
 | 11 | Enable/disable auto-injection |
->>>>>>> 23bba78 (add kernel APC DLL injection and Rust/Tauri GUI rewrite)
 
 ## Disclaimer
 
