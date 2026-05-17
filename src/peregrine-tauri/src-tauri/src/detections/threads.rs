@@ -10,7 +10,9 @@ use windows::Win32::System::Threading::{OpenThread, THREAD_GET_CONTEXT, THREAD_Q
 pub struct ThreadInfo {
     pub tid: u32,
     pub rip: u64,
-    pub module: Option<String>,
+    pub start_address: u64,
+    pub rip_module: Option<String>,
+    pub start_module: Option<String>,
     pub suspicious: bool,
 }
 
@@ -78,7 +80,16 @@ const CONTEXT_FULL: u32 = CONTEXT_AMD64 | 0x07;
 extern "system" {
     fn GetThreadContext(hThread: windows::Win32::Foundation::HANDLE, lpContext: *mut CONTEXT64)
         -> i32;
+    fn NtQueryInformationThread(
+        ThreadHandle: windows::Win32::Foundation::HANDLE,
+        ThreadInformationClass: u32,
+        ThreadInformation: *mut u64,
+        ThreadInformationLength: u32,
+        ReturnLength: *mut u32,
+    ) -> i32;
 }
+
+const THREAD_QUERY_SET_WIN32_START_ADDRESS: u32 = 9;
 
 pub fn check_all_threads(pid: u32) -> Result<Vec<ThreadInfo>, String> {
     let proc = ProcessHandle::open(pid).ok_or("OpenProcess failed")?;
@@ -113,17 +124,40 @@ pub fn check_all_threads(pid: u32) -> Result<Vec<ThreadInfo>, String> {
                     let ok = unsafe { GetThreadContext(th, &mut ctx) };
                     if ok != 0 {
                         let rip = ctx.Rip;
-                        let module = modules
+
+                        let mut start_addr: u64 = 0;
+                        unsafe {
+                            NtQueryInformationThread(
+                                th,
+                                THREAD_QUERY_SET_WIN32_START_ADDRESS,
+                                &mut start_addr,
+                                8,
+                                std::ptr::null_mut(),
+                            );
+                        }
+
+                        let rip_mod = modules
                             .iter()
-                            .find(|m| {
-                                rip >= m.base as u64 && rip < (m.base + m.size) as u64
-                            })
+                            .find(|m| rip >= m.base as u64 && rip < (m.base + m.size) as u64)
                             .map(|m| m.name().to_string());
-                        let suspicious = module.is_none();
+
+                        let start_mod = if start_addr != 0 {
+                            modules
+                                .iter()
+                                .find(|m| start_addr >= m.base as u64 && start_addr < (m.base + m.size) as u64)
+                                .map(|m| m.name().to_string())
+                        } else {
+                            None
+                        };
+
+                        let suspicious = rip_mod.is_none() || (start_addr != 0 && start_mod.is_none());
+
                         results.push(ThreadInfo {
                             tid,
                             rip,
-                            module,
+                            start_address: start_addr,
+                            rip_module: rip_mod,
+                            start_module: start_mod,
                             suspicious,
                         });
                     }

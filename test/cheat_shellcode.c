@@ -7,12 +7,14 @@
    CreateRemoteThread hook, Thread RIP scan (suspicious - outside modules),
    ETW-TI (ALLOCVM_REMOTE, PROTECTVM_REMOTE, WRITEVM_REMOTE) */
 
-/* Minimal x64 shellcode: just returns 0 (ExitThread(0) equivalent).
-   In a real cheat this would be an aimbot/ESP payload. */
+/* x64 shellcode: infinite sleep loop (simulates a persistent cheat thread).
+   Thread RIP will always be inside this shellcode = outside any known module. */
 static const unsigned char shellcode[] = {
-    0x48, 0x31, 0xC9,       /* xor rcx, rcx     */
-    0x48, 0x31, 0xC0,       /* xor rax, rax     */
-    0xC3                    /* ret              */
+    0x48, 0x83, 0xEC, 0x28,                /* sub rsp, 0x28         */
+    0xB9, 0xE8, 0x03, 0x00, 0x00,          /* mov ecx, 1000         */
+    0xFF, 0x15, 0x02, 0x00, 0x00, 0x00,    /* call [rip+2]          */
+    0xEB, 0xF3,                             /* jmp back to mov ecx   */
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00  /* Sleep addr (patched) */
 };
 
 int main(int argc, char* argv[])
@@ -47,10 +49,18 @@ int main(int argc, char* argv[])
     }
     printf("[SHELLCODE] Allocated RW page at 0x%p\n", remoteMem);
 
-    /* Step 2: Write shellcode */
+    /* Step 2: Write shellcode with patched Sleep address */
+    unsigned char sc[sizeof(shellcode)];
+    memcpy(sc, shellcode, sizeof(sc));
+
+    /* Patch Sleep() address at offset 17 (the qword after jmp) */
+    FARPROC pSleep = GetProcAddress(GetModuleHandleA("kernel32.dll"), "Sleep");
+    *(ULONGLONG*)(sc + 17) = (ULONGLONG)pSleep;
+
     SIZE_T written = 0;
-    WriteProcessMemory(hProc, remoteMem, shellcode, sizeof(shellcode), &written);
-    printf("[SHELLCODE] Wrote %zu bytes of shellcode\n", written);
+    WriteProcessMemory(hProc, remoteMem, sc, sizeof(sc), &written);
+    printf("[SHELLCODE] Wrote %zu bytes of shellcode (Sleep=0x%llX)\n",
+        written, (unsigned long long)pSleep);
 
     /* Step 3: Change to RWX (triggers VirtualProtectEx hook) */
     DWORD oldProtect = 0;
@@ -69,11 +79,8 @@ int main(int argc, char* argv[])
     }
     printf("[SHELLCODE] Remote thread created at 0x%p\n", remoteMem);
 
-    WaitForSingleObject(hThread, 5000);
-    printf("[SHELLCODE] Thread completed\n");
-
-    /* Leave memory allocated so thread scan can find it */
-    printf("[SHELLCODE] Shellcode memory left at 0x%p for detection.\n", remoteMem);
+    printf("[SHELLCODE] Remote thread running at 0x%p (sleeping loop)\n", remoteMem);
+    printf("[SHELLCODE] Run 'Check Threads' in Peregrine to detect suspicious RIP.\n");
     printf("[SHELLCODE] Press Enter to cleanup and exit.\n");
     getchar();
 

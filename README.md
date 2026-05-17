@@ -261,6 +261,54 @@ On connect, the app auto-detects DLLs in `C:\Peregrine\` and configures the driv
 | 10 | Add injection target process name |
 | 11 | Enable/disable auto-injection |
 
+## Test Suite & Example Detections
+
+The `test/` directory contains purpose-built cheat tools that showcase every detection layer. All binaries are deployed to `C:\Peregrine\testing\`.
+
+### 1. Memory Read/Write — `cheat.exe`
+```
+game.exe                          # note PID + health address
+cheat.exe <PID> <address>         # reads/writes health every 5s
+```
+**Detected by:**
+- DLL Hooks: `[External ReadProcessMemory]` + `[External WriteProcessMemory]`
+- ETW-TI: `[ETW-TI] WRITEVM_REMOTE | PID ... → ... | 0x... size=0x4`
+- ObCallback: `[Handle Access] PID=... → PID=... [VM_OPERATION|VM_READ|VM_WRITE]`
+
+### 2. DLL Injection — `cheat_inject.exe`
+```
+cheat_inject.exe <PID> C:\Peregrine\testing\payload.dll
+```
+**Detected by:**
+- ObCallback: `[Handle Access] ... [CREATE_THREAD|VM_OPERATION|VM_READ|VM_WRITE]`
+- DLL Hooks: `[External VirtualAllocEx]`, `[External WriteProcessMemory]`, `[External CreateRemoteThread]`
+- ETW-TI: `ALLOCVM_REMOTE` + `WRITEVM_REMOTE`
+
+### 3. Shellcode Injection — `cheat_shellcode.exe`
+```
+cheat_shellcode.exe <PID>         # allocates RWX, writes shellcode, creates remote thread
+```
+**Detected by:**
+- ObCallback: `[Handle Access] ... [CREATE_THREAD|VM_OPERATION|VM_READ|VM_WRITE]`
+- ETW-TI: `ALLOCVM_REMOTE` + `PROTECTVM_REMOTE` + `WRITEVM_REMOTE`
+- Thread Scan: `[SUSPICIOUS THREAD ...] Start=0x... (UNKNOWN)` — start address outside all modules
+
+### 4. Code Patching — `cheat_patch.exe`
+```
+cheat_patch.exe <PID>             # NOPs 4 bytes in kernel32.dll .text section
+```
+**Detected by:**
+- Module Integrity: `[tamper] KERNEL32.DLL matched=false` — .text hash mismatch
+- ETW-TI: `PROTECTVM_REMOTE` + `WRITEVM_REMOTE`
+- Auto-restores after 30 seconds
+
+### 5. Blacklist — `CheatEngine.exe`
+```
+CheatEngine.exe                   # just existing is enough
+```
+**Detected by:**
+- Blacklist Scan: `[Blacklist] PID ... CheatEngine.exe (matched: CheatEngine)`
+
 ## Disclaimer
 
 This project is **strictly for educational purposes**. It demonstrates security concepts and Windows internals for learning and research. Use only in controlled environments with proper authorization.

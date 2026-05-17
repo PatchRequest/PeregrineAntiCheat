@@ -202,7 +202,10 @@
       for (const t of res) {
         if (t.suspicious) {
           sus++;
-          addLog(`[SUSPICIOUS THREAD ${t.tid}] RIP=0x${t.rip.toString(16).toUpperCase()} NOT in any known module!`, "suspicious");
+          const ripMod = t.rip_module ?? "UNKNOWN";
+          const startMod = t.start_module ?? "UNKNOWN";
+          const startHex = t.start_address ? `0x${t.start_address.toString(16).toUpperCase()}` : "?";
+          addLog(`[SUSPICIOUS THREAD ${t.tid}] RIP=0x${t.rip.toString(16).toUpperCase()} (${ripMod}) Start=${startHex} (${startMod})`, "suspicious");
         }
       }
       addLog(`[Thread Scan] ${res.length} threads, ${sus} suspicious`, "info");
