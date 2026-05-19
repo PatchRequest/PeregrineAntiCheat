@@ -2,6 +2,7 @@ mod driver_comm;
 mod ipc;
 mod detections;
 mod etw_ti;
+mod hwid;
 
 use driver_comm::DriverHandle;
 use std::sync::atomic::AtomicBool;
@@ -150,6 +151,14 @@ fn scan_blacklist() -> Vec<detections::blacklist::BlacklistMatch> {
     detections::blacklist::scan_processes(None)
 }
 
+#[tauri::command]
+fn collect_hwid() -> Result<Vec<hwid::HwidEntry>, String> {
+    if let Ok(h) = DriverHandle::open() {
+        let _ = h.collect_hwid();
+    }
+    Ok(hwid::collect_userland_hwids())
+}
+
 fn start_ipc_polling(app: AppHandle) {
     let stop = Arc::new(AtomicBool::new(false));
     let rx = ipc::start_ipc_server(stop);
@@ -229,6 +238,7 @@ pub fn run() {
             check_eat,
             check_threads,
             scan_blacklist,
+            collect_hwid,
         ])
         .setup(|app| {
             let handle = app.handle().clone();

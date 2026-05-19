@@ -18,7 +18,7 @@
   const MAX_LOGS = 2000;
 
   const tagColors: Record<string, string> = {
-    ok: "#4ec94e", tamper: "#ff4444", suspicious: "#ff3333",
+    ok: "#4ec94e", tamper: "#ff4444", suspicious: "#ff3333", hwid: "#10b981",
     remote_thr: "#ff6644", handle: "#e8a838", imgload: "#6ab0f3",
     thr_ok: "#4ec94e", blacklist: "#e67e22", drv_bl: "#ff4444",
     drv_scan: "#6ab0f3", obcb: "#e8a838", syschk: "#a78bfa",
@@ -248,6 +248,20 @@
     addLog(`[ETW-TI] ${t} | PID ${d.caller_pid} → ${d.target_pid} | 0x${(d.base_address ?? 0).toString(16).toUpperCase()} size=0x${(d.region_size ?? 0).toString(16)} ${prot}`, tag);
   }
 
+  async function collectHwid() {
+    if (!requireDriver()) return;
+    addLog("[HWID] Starting hybrid collection...", "info");
+    try {
+      const userland: any[] = await invoke("collect_hwid");
+      for (const e of userland) {
+        addLog(`[HWID] [${e.source}] ${e.name}: ${e.value}`, "hwid");
+      }
+      addLog(`[HWID] Userland: ${userland.length} identifiers collected`, "hwid");
+    } catch (e: any) {
+      addLog(`[HWID] failed: ${e}`, "err");
+    }
+  }
+
   async function driverCmd(name: string) {
     if (!requireDriver()) return;
     try {
@@ -364,6 +378,14 @@
         addLog("[System Check] All checks complete", "ok");
         break;
 
+      case "hwid_data":
+        addLog(`[HWID] [${d.source}] ${d.name}: ${d.value}${d.detail ? ` (${d.detail})` : ""}`, "hwid");
+        break;
+
+      case "hwid_kernel_complete":
+        addLog("[HWID] Kernel collection complete", "hwid");
+        break;
+
       default:
         addLog(`[${event || "unknown"}] ${JSON.stringify(d)}`, "info");
     }
@@ -463,6 +485,7 @@
     <button class="btn warn" onclick={() => driverCmd("scan_ob_callbacks")}>ObCB</button>
     <button class="btn purple" onclick={() => driverCmd("system_check")}>SysChk</button>
     <button class="btn" style="background:#e74c3c;color:white" onclick={startEtwTi}>ETW-TI</button>
+    <button class="btn" style="background:#10b981;color:white" onclick={collectHwid}>HWID</button>
   </nav>
 
   <div class="log" bind:this={logEl}>

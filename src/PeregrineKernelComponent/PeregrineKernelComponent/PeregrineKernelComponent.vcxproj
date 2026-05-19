@@ -106,6 +106,7 @@
     <ClCompile Include="NotifyRoutine.c" />
     <ClCompile Include="obCallback.c" />
     <ClCompile Include="ObCallbackScan.c" />
+    <ClCompile Include="Hwid.c" />
     <ClCompile Include="Protection.c" />
     <ClCompile Include="SystemCheck.c" />
   </ItemGroup>
@@ -121,6 +122,7 @@
     <ClInclude Include="NotifyRoutine.h" />
     <ClInclude Include="obCallback.h" />
     <ClInclude Include="ObCallbackScan.h" />
+    <ClInclude Include="Hwid.h" />
     <ClInclude Include="Protection.h" />
     <ClInclude Include="SystemCheck.h" />
   </ItemGroup>

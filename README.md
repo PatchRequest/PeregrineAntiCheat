@@ -29,6 +29,7 @@ An educational anti-cheat system demonstrating Windows kernel programming, proce
 │  │  • PPL elevation (EPROCESS patch)                   │    │
 │  │  • Minifilter (file access monitoring)              │    │
 │  │  • Driver/ObCallback scanning                       │    │
+│  │  • HWID collection (disk serial, boot GUID)         │    │
 │  └─────────┬───────────────────────────────────────────┘    │
 │            │ APC Injection                                  │
 │            ▼                                                │
@@ -47,9 +48,9 @@ An educational anti-cheat system demonstrating Windows kernel programming, proce
 
 | Component | Language | Role |
 |-----------|----------|------|
-| **Kernel Driver** | C (Minifilter) | Ring-0: ObCallbacks, APC injection, PPL, notify routines, file access monitoring, driver scanning |
+| **Kernel Driver** | C (Minifilter) | Ring-0: ObCallbacks, APC injection, PPL, notify routines, file access monitoring, driver scanning, HWID collection |
 | **Injection DLL** | C++ (MinHook) | Injected into targets: hooks WinAPI calls, reports via named pipe IPC |
-| **Tauri GUI** | Rust + Svelte | Userland: IOCTL commands, IPC receiver, detection scans, ETW-TI consumer, dark-themed UI |
+| **Tauri GUI** | Rust + Svelte | Userland: IOCTL commands, IPC receiver, detection scans, ETW-TI consumer, HWID fingerprinting, dark-themed UI |
 
 **Communication flows:**
 - **GUI ↔ Driver**: IOCTL commands (add PIDs, configure injection, trigger scans) + event polling
@@ -74,6 +75,7 @@ An educational anti-cheat system demonstrating Windows kernel programming, proce
 | 11 | **System Integrity** | Test-signing, HVCI, CPU vendor/hypervisor detection |
 | 12 | **ETW Threat Intelligence** | PPL-protected consumer for ALLOCVM/PROTECTVM/MAPVIEW/QUEUEAPC/SETTHREADCONTEXT/READVM/WRITEVM remote events |
 | 13 | **File Access Monitoring** | Minifilter reports write/delete/rename on protected AC files |
+| 14 | **HWID Collection** | Hybrid kernel+userland hardware fingerprinting (disk serials, boot GUID, MAC, SMBIOS UUID, volume serials, registry IDs) |
 
 ## Kernel APC DLL Injection
 

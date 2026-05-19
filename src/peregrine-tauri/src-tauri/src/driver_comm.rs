@@ -226,6 +226,10 @@ impl DriverHandle {
         self.send_command(&[11, if enabled { 1 } else { 0 }])
     }
 
+    pub fn collect_hwid(&self) -> Result<(), String> {
+        self.send_command(&[12])
+    }
+
 }
 
 impl Drop for DriverHandle {

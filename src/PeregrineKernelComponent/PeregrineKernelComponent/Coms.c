@@ -4,6 +4,7 @@
 #include "ObCallbackScan.h"
 #include "SystemCheck.h"
 #include "ApcInjection.h"
+#include "Hwid.h"
 
 static PDEVICE_OBJECT g_ComsDevice = NULL;
 static KSPIN_LOCK g_ComsLock;
@@ -122,6 +123,12 @@ static VOID ComsHandleUserCommand(_In_reads_bytes_(DataSize) const UCHAR* Data,
         BOOLEAN enable = Data[1] != 0;
         InjSetEnabled(enable);
         KdPrint(("Peregrine: injection %s\n", enable ? "enabled" : "disabled"));
+        break;
+    }
+
+    case 12: { // collect hardware identifiers
+        KdPrint(("Peregrine: user requested HWID collection\n"));
+        HwidCollectAll();
         break;
     }
 
