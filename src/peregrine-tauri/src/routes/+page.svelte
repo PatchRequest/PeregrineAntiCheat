@@ -256,13 +256,13 @@
       const res: any[] = await invoke("scan_signatures", { pid });
       if (res.length) {
         for (const m of res)
-          addLog(`[SigScan] MATCH "${m.pattern_name}" at ${m.address} (${m.region_protection} ${m.region_type})`, "sig");
-        addLog(`[SigScan] ${res.length} match(es) found`, "sig");
+          addLog(`[YARA] ${m.rule_name} at ${m.address} (${m.region_protection} ${m.region_type}, ${m.match_length}B)`, "sig");
+        addLog(`[YARA] ${res.length} match(es) found`, "sig");
       } else {
-        addLog(`[SigScan] PID ${pid}: No signature matches`, "ok");
+        addLog(`[YARA] PID ${pid}: No matches`, "ok");
       }
     } catch (e: any) {
-      addLog(`[SigScan] failed: ${e}`, "err");
+      addLog(`[YARA] failed: ${e}`, "err");
     }
   }
 
@@ -524,7 +524,7 @@
     <button class="btn" onclick={checkEat}>EAT</button>
     <button class="btn" onclick={checkThreads}>Threads</button>
     <button class="btn" style="background:#f472b6;color:white" onclick={scanVad}>VAD</button>
-    <button class="btn" style="background:#fbbf24;color:black" onclick={scanSignatures}>SigScan</button>
+    <button class="btn" style="background:#fbbf24;color:black" onclick={scanSignatures}>YARA</button>
     <button class="btn warn" onclick={scanBlacklist}>Blacklist</button>
     <div class="spacer"></div>
     <button class="btn warn" onclick={() => driverCmd("scan_drivers")}>Drivers</button>
