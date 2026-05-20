@@ -12,6 +12,7 @@ cl /nologo /O2 cheat_shellcode.c /Fe:cheat_shellcode.exe
 cl /nologo /O2 cheat_patch.c /Fe:cheat_patch.exe /link psapi.lib
 cl /nologo /O2 CheatEngine.c /Fe:CheatEngine.exe
 cl /nologo /O2 cheat_manualmap.c /Fe:cheat_manualmap.exe
+cl /nologo /O2 cheat_yara.c /Fe:cheat_yara.exe
 cl /nologo /O2 /LD payload.c /Fe:payload.dll
 
 echo.
