@@ -18,7 +18,7 @@
   const MAX_LOGS = 2000;
 
   const tagColors: Record<string, string> = {
-    ok: "#4ec94e", tamper: "#ff4444", suspicious: "#ff3333", hwid: "#10b981",
+    ok: "#4ec94e", tamper: "#ff4444", suspicious: "#ff3333", hwid: "#10b981", vad: "#f472b6",
     remote_thr: "#ff6644", handle: "#e8a838", imgload: "#6ab0f3",
     thr_ok: "#4ec94e", blacklist: "#e67e22", drv_bl: "#ff4444",
     drv_scan: "#6ab0f3", obcb: "#e8a838", syschk: "#a78bfa",
@@ -248,6 +248,18 @@
     addLog(`[ETW-TI] ${t} | PID ${d.caller_pid} → ${d.target_pid} | 0x${(d.base_address ?? 0).toString(16).toUpperCase()} size=0x${(d.region_size ?? 0).toString(16)} ${prot}`, tag);
   }
 
+  async function scanVad() {
+    const pid = requirePid();
+    if (pid === null) return;
+    if (!requireDriver()) return;
+    addLog(`[VAD Scan] Scanning PID ${pid} for executable private memory...`, "info");
+    try {
+      await invoke("scan_vad", { pid });
+    } catch (e: any) {
+      addLog(`[VAD Scan] failed: ${e}`, "err");
+    }
+  }
+
   async function collectHwid() {
     if (!requireDriver()) return;
     addLog("[HWID] Starting hybrid collection...", "info");
@@ -378,6 +390,20 @@
         addLog("[System Check] All checks complete", "ok");
         break;
 
+      case "vad_suspicious": {
+        const pe = d.has_pe_header ? " [PE HEADER]" : "";
+        const rwx = d.rwx ? " [RWX]" : "";
+        addLog(`[VAD] SUSPICIOUS PID=${d.pid} ${d.base} size=${d.size} ${d.protection} ${d.type}${pe}${rwx}`, "vad");
+        break;
+      }
+
+      case "vad_scan_complete":
+        if (d.suspicious_count > 0)
+          addLog(`[VAD Scan] PID=${d.pid}: ${d.suspicious_count} suspicious region(s) found in ${d.regions_scanned} regions`, "vad");
+        else
+          addLog(`[VAD Scan] PID=${d.pid}: Clean — ${d.regions_scanned} regions scanned`, "ok");
+        break;
+
       case "hwid_data":
         addLog(`[HWID] [${d.source}] ${d.name}: ${d.value}${d.detail ? ` (${d.detail})` : ""}`, "hwid");
         break;
@@ -479,6 +505,7 @@
     <button class="btn" onclick={checkIat}>IAT</button>
     <button class="btn" onclick={checkEat}>EAT</button>
     <button class="btn" onclick={checkThreads}>Threads</button>
+    <button class="btn" style="background:#f472b6;color:white" onclick={scanVad}>VAD</button>
     <button class="btn warn" onclick={scanBlacklist}>Blacklist</button>
     <div class="spacer"></div>
     <button class="btn warn" onclick={() => driverCmd("scan_drivers")}>Drivers</button>

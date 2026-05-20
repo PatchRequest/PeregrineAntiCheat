@@ -30,6 +30,7 @@ An educational anti-cheat system demonstrating Windows kernel programming, proce
 │  │  • Minifilter (file access monitoring)              │    │
 │  │  • Driver/ObCallback scanning                       │    │
 │  │  • HWID collection (disk serial, boot GUID)         │    │
+│  │  • VAD scan (executable private memory detection)   │    │
 │  └─────────┬───────────────────────────────────────────┘    │
 │            │ APC Injection                                  │
 │            ▼                                                │
@@ -76,6 +77,7 @@ An educational anti-cheat system demonstrating Windows kernel programming, proce
 | 12 | **ETW Threat Intelligence** | PPL-protected consumer for ALLOCVM/PROTECTVM/MAPVIEW/QUEUEAPC/SETTHREADCONTEXT/READVM/WRITEVM remote events |
 | 13 | **File Access Monitoring** | Minifilter reports write/delete/rename on protected AC files |
 | 14 | **HWID Collection** | Hybrid kernel+userland hardware fingerprinting (disk serials, boot GUID, MAC, SMBIOS UUID, volume serials, registry IDs) |
+| 15 | **VAD Scan (Manual-Map Detection)** | Kernel-mode virtual address space walk via ZwQueryVirtualMemory — flags executable private memory with no image backing |
 
 ## Kernel APC DLL Injection
 
@@ -116,6 +118,8 @@ Purpose-built cheats in `test/` that showcase every detection layer:
 | `cheat_inject.exe <PID> payload.dll` | CreateRemoteThread + LoadLibrary | ObCallback, DLL Hooks, ETW-TI (`ALLOCVM_REMOTE`) |
 | `cheat_shellcode.exe <PID>` | VirtualAllocEx RWX + remote thread | ObCallback, ETW-TI (`PROTECTVM_REMOTE`), Thread Scan (start addr outside modules) |
 | `cheat_patch.exe <PID>` | NOP bytes in kernel32 .text | Module Integrity (`[tamper]`), ETW-TI (`WRITEVM_REMOTE`) |
+| `cheat_manualmap.exe <PID>` | VirtualAllocEx + fake PE + remote thread | VAD Scan (executable private memory, PE header detected) |
+| `cheat_manualmap.exe <PID> --no-header` | Same but erases PE header | VAD Scan (executable private memory, no PE header) |
 | `CheatEngine.exe` | Just existing | Blacklist Scan |
 
 Start `game.exe` first — it prints its PID and a health variable address for the cheats to target.

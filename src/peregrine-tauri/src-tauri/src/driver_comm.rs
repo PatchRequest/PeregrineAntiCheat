@@ -230,6 +230,17 @@ impl DriverHandle {
         self.send_command(&[12])
     }
 
+    pub fn scan_vad(&self, pid: u32) -> Result<(), String> {
+        let handle_size = std::mem::size_of::<usize>();
+        let mut buf = vec![13u8];
+        if handle_size == 8 {
+            buf.extend_from_slice(&(pid as u64).to_le_bytes());
+        } else {
+            buf.extend_from_slice(&pid.to_le_bytes());
+        }
+        self.send_command(&buf)
+    }
+
 }
 
 impl Drop for DriverHandle {

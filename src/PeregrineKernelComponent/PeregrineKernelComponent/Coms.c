@@ -5,6 +5,7 @@
 #include "SystemCheck.h"
 #include "ApcInjection.h"
 #include "Hwid.h"
+#include "VadScan.h"
 
 static PDEVICE_OBJECT g_ComsDevice = NULL;
 static KSPIN_LOCK g_ComsLock;
@@ -129,6 +130,17 @@ static VOID ComsHandleUserCommand(_In_reads_bytes_(DataSize) const UCHAR* Data,
     case 12: { // collect hardware identifiers
         KdPrint(("Peregrine: user requested HWID collection\n"));
         HwidCollectAll();
+        break;
+    }
+
+    case 13: { // VAD scan for executable private memory
+        if (DataSize < 1 + sizeof(HANDLE)) {
+            KdPrint(("Peregrine: cmd=13 too small (%lu)\n", DataSize));
+            return;
+        }
+        RtlCopyMemory(&pid, Data + 1, sizeof(pid));
+        KdPrint(("Peregrine: user requested VAD scan for PID %lu\n", (ULONG)(ULONG_PTR)pid));
+        VadScanProcess(pid);
         break;
     }
 

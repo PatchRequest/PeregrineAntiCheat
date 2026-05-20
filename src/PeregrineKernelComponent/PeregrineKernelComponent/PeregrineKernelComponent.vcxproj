@@ -109,6 +109,7 @@
     <ClCompile Include="Hwid.c" />
     <ClCompile Include="Protection.c" />
     <ClCompile Include="SystemCheck.c" />
+    <ClCompile Include="VadScan.c" />
   </ItemGroup>
   <ItemGroup>
     <None Include="Coms.h" />
@@ -125,6 +126,7 @@
     <ClInclude Include="Hwid.h" />
     <ClInclude Include="Protection.h" />
     <ClInclude Include="SystemCheck.h" />
+    <ClInclude Include="VadScan.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

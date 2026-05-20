@@ -152,6 +152,11 @@ fn scan_blacklist() -> Vec<detections::blacklist::BlacklistMatch> {
 }
 
 #[tauri::command]
+fn scan_vad(pid: u32) -> Result<(), String> {
+    DriverHandle::open()?.scan_vad(pid)
+}
+
+#[tauri::command]
 fn collect_hwid() -> Result<Vec<hwid::HwidEntry>, String> {
     if let Ok(h) = DriverHandle::open() {
         let _ = h.collect_hwid();
@@ -238,6 +243,7 @@ pub fn run() {
             check_eat,
             check_threads,
             scan_blacklist,
+            scan_vad,
             collect_hwid,
         ])
         .setup(|app| {

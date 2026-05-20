@@ -11,6 +11,7 @@ cl /nologo /O2 cheat_inject.c /Fe:cheat_inject.exe
 cl /nologo /O2 cheat_shellcode.c /Fe:cheat_shellcode.exe
 cl /nologo /O2 cheat_patch.c /Fe:cheat_patch.exe /link psapi.lib
 cl /nologo /O2 CheatEngine.c /Fe:CheatEngine.exe
+cl /nologo /O2 cheat_manualmap.c /Fe:cheat_manualmap.exe
 cl /nologo /O2 /LD payload.c /Fe:payload.dll
 
 echo.
@@ -35,5 +36,10 @@ echo 4. Code patching (Module Integrity / tamper detection):
 echo    game.exe                        ^<-- note PID
 echo    cheat_patch.exe ^<PID^>          ^<-- then click Check Modules
 echo.
-echo 5. Blacklist detection:
+echo 5. Manual-map simulation (VAD scan detection):
+echo    game.exe                        ^<-- note PID
+echo    cheat_manualmap.exe ^<PID^>      ^<-- then click VAD in Peregrine
+echo    cheat_manualmap.exe ^<PID^> --no-header  ^<-- advanced: erases PE header
+echo.
+echo 6. Blacklist detection:
 echo    CheatEngine.exe                 ^<-- then click Blacklist in Peregrine
