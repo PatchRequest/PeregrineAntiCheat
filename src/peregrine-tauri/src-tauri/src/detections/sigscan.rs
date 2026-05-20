@@ -132,6 +132,8 @@ fn type_str(t: u32) -> &'static str {
 // Public scan function
 // ============================================================
 
+const MAX_MATCHES_PER_PATTERN: usize = 50;
+
 pub fn scan_process(pid: u32) -> Result<(Vec<SigMatch>, usize), String> {
     let patterns = load_signatures()?;
     let proc = ProcessHandle::open(pid).ok_or("OpenProcess failed")?;
@@ -141,6 +143,7 @@ pub fn scan_process(pid: u32) -> Result<(Vec<SigMatch>, usize), String> {
     let overlap = if max_pat > 1 { max_pat - 1 } else { 0 };
 
     let mut results = Vec::new();
+    let mut hit_count: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut addr: usize = 0;
     let mut bytes_scanned: usize = 0;
 
@@ -165,7 +168,10 @@ pub fn scan_process(pid: u32) -> Result<(Vec<SigMatch>, usize), String> {
 
                     for i in 0..scan_end {
                         for pat in &patterns {
+                            let count = hit_count.get(&pat.name).copied().unwrap_or(0);
+                            if count >= MAX_MATCHES_PER_PATTERN { continue; }
                             if matches_at(&data, i, &pat.bytes) {
+                                *hit_count.entry(pat.name.clone()).or_insert(0) += 1;
                                 results.push(SigMatch {
                                     pattern_name: pat.name.clone(),
                                     address: format!("0x{:X}", base + read_off + i),
@@ -184,6 +190,18 @@ pub fn scan_process(pid: u32) -> Result<(Vec<SigMatch>, usize), String> {
         let next = base.wrapping_add(size);
         if next <= addr { break; }
         addr = next;
+    }
+
+    // Append truncation notices
+    for (name, count) in &hit_count {
+        if *count >= MAX_MATCHES_PER_PATTERN {
+            results.push(SigMatch {
+                pattern_name: format!("{} (truncated, {}+ matches)", name, count),
+                address: "—".into(),
+                region_protection: "—".into(),
+                region_type: "—".into(),
+            });
+        }
     }
 
     Ok((results, bytes_scanned))
