@@ -78,7 +78,7 @@ An educational anti-cheat system demonstrating Windows kernel programming, proce
 | 13 | **File Access Monitoring** | Minifilter reports write/delete/rename on protected AC files |
 | 14 | **HWID Collection** | Hybrid kernel+userland hardware fingerprinting (disk serials, boot GUID, MAC, SMBIOS UUID, volume serials, registry IDs) |
 | 15 | **VAD Scan (Manual-Map Detection)** | Kernel-mode virtual address space walk via ZwQueryVirtualMemory — flags executable private memory with no image backing |
-| 16 | **Memory Signature Scanning** | Configurable byte-pattern scanner with wildcard support (`??`), walks entire process address space, patterns loaded from `signatures.conf` |
+| 16 | **YARA Memory Scanning** | Full YARA rule engine (yara-x) scanning process address space — hex patterns, strings, wildcards, conditions, loaded from `rules.yar` |
 
 ## Kernel APC DLL Injection
 
@@ -121,6 +121,7 @@ Purpose-built cheats in `test/` that showcase every detection layer:
 | `cheat_patch.exe <PID>` | NOP bytes in kernel32 .text | Module Integrity (`[tamper]`), ETW-TI (`WRITEVM_REMOTE`) |
 | `cheat_manualmap.exe <PID>` | VirtualAllocEx + fake PE + remote thread | VAD Scan (executable private memory, PE header detected) |
 | `cheat_manualmap.exe <PID> --no-header` | Same but erases PE header | VAD Scan (executable private memory, no PE header) |
+| `cheat_yara.exe <PID>` | Injects marker strings + cheat config blob | YARA Scan (`PeregrineTestCheat` rule) |
 | `CheatEngine.exe` | Just existing | Blacklist Scan |
 
 Start `game.exe` first — it prints its PID and a health variable address for the cheats to target.
