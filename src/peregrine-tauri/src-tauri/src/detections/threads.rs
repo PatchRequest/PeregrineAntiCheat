@@ -14,6 +14,12 @@ pub struct ThreadInfo {
     pub rip_module: Option<String>,
     pub start_module: Option<String>,
     pub suspicious: bool,
+    pub dr0: u64,
+    pub dr1: u64,
+    pub dr2: u64,
+    pub dr3: u64,
+    pub dr6: u64,
+    pub dr7: u64,
 }
 
 #[repr(C)]
@@ -75,7 +81,8 @@ struct CONTEXT64 {
 }
 
 const CONTEXT_AMD64: u32 = 0x00100000;
-const CONTEXT_FULL: u32 = CONTEXT_AMD64 | 0x07;
+const CONTEXT_DEBUG_REGISTERS: u32 = CONTEXT_AMD64 | 0x10;
+const CONTEXT_FULL: u32 = CONTEXT_AMD64 | 0x07 | 0x10;
 
 extern "system" {
     fn GetThreadContext(hThread: windows::Win32::Foundation::HANDLE, lpContext: *mut CONTEXT64)
@@ -159,6 +166,12 @@ pub fn check_all_threads(pid: u32) -> Result<Vec<ThreadInfo>, String> {
                             rip_module: rip_mod,
                             start_module: start_mod,
                             suspicious,
+                            dr0: ctx.Dr0,
+                            dr1: ctx.Dr1,
+                            dr2: ctx.Dr2,
+                            dr3: ctx.Dr3,
+                            dr6: ctx.Dr6,
+                            dr7: ctx.Dr7,
                         });
                     }
                     let _ = unsafe { CloseHandle(th) };

@@ -91,11 +91,12 @@ typedef struct {
     volatile ULONGLONG window_start;
 } RateLimit;
 
-#define NUM_HOOKS 8
+#define NUM_HOOKS 9
 
 static RateLimit g_limits[NUM_HOOKS] = {
     { "OpenProcess",          50, 0, 0 },
     { "CreateRemoteThread",   50, 0, 0 },
+    { "NtSetContextThread",   50, 0, 0 },
     { "VirtualAllocEx",       20, 0, 0 },
     { "VirtualProtectEx",     20, 0, 0 },
     { "ReadProcessMemory",     2, 0, 0 },

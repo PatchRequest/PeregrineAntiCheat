@@ -3,6 +3,7 @@
 #include "MinHook.h"
 #include "ipc.h"
 #include "callstack.h"
+#include "hwbp.h"
 #include <stdio.h>
 #include <stdarg.h>
 // user32 loaded dynamically only when needed (DebugEntry)
@@ -45,6 +46,7 @@ typedef LPVOID(WINAPI* VirtualAllocEx_t)(HANDLE, LPVOID, SIZE_T, DWORD, DWORD);
 typedef BOOL(WINAPI* VirtualProtectEx_t)(HANDLE, LPVOID, SIZE_T, DWORD, PDWORD);
 typedef HANDLE(WINAPI* CreateRemoteThread_t)(HANDLE, LPSECURITY_ATTRIBUTES, SIZE_T, LPTHREAD_START_ROUTINE, LPVOID, DWORD, LPDWORD);
 typedef HANDLE(WINAPI* OpenProcess_t)(DWORD, BOOL, DWORD);
+typedef LONG(NTAPI* NtSetContextThread_t)(HANDLE, PCONTEXT);
 
 static ReadProcessMemory_t      oReadProcessMemory = nullptr;
 static WriteProcessMemory_t     oWriteProcessMemory = nullptr;
@@ -54,6 +56,7 @@ static VirtualAllocEx_t         oVirtualAllocEx = nullptr;
 static VirtualProtectEx_t       oVirtualProtectEx = nullptr;
 static CreateRemoteThread_t     oCreateRemoteThread = nullptr;
 static OpenProcess_t            oOpenProcess = nullptr;
+static NtSetContextThread_t     oNtSetContextThread = nullptr;
 
 // ============================================================
 // Hook implementations
@@ -148,6 +151,21 @@ static HANDLE WINAPI HookOpenProcess(DWORD dwAccess, BOOL bInherit, DWORD dwPID)
     return result;
 }
 
+#define CONTEXT_DBG_REGS_FLAG 0x00100010
+
+static LONG NTAPI HookNtSetContextThread(HANDLE hThread, PCONTEXT ctx) {
+    if (!g_hwbp_arming && ctx && (ctx->ContextFlags & CONTEXT_DBG_REGS_FLAG) == CONTEXT_DBG_REGS_FLAG) {
+        if (ctx->Dr0 == 0 && ctx->Dr1 == 0 && ctx->Dr2 == 0 && ctx->Dr3 == 0 && ctx->Dr7 == 0) {
+            callstack_check("NtSetContextThread");
+            DWORD tid = GetThreadId(hThread);
+            ipc_log_event("DebugRegisterClearing",
+                "\"callerPID\":%lu,\"threadId\":%lu",
+                PID, (unsigned long)tid);
+        }
+    }
+    return oNtSetContextThread(hThread, ctx);
+}
+
 // ============================================================
 // Hook setup helpers
 // ============================================================
@@ -203,7 +221,11 @@ static DWORD WINAPI InitThread(LPVOID) {
     InstallHook(kb, k32, "CreateRemoteThread", (void**)&oCreateRemoteThread, (void*)HookCreateRemoteThread);
     InstallHook(kb, k32, "OpenProcess",        (void**)&oOpenProcess,        (void*)HookOpenProcess);
 
+    // Debug register protection
+    InstallHook(ntdll, NULL, "NtSetContextThread", (void**)&oNtSetContextThread, (void*)HookNtSetContextThread);
+
     callstack_init();
+    hwbp_init();
     DebugLog("[PeregrineDLL] Initialization complete\n");
 
     char exeName[MAX_PATH] = {0};

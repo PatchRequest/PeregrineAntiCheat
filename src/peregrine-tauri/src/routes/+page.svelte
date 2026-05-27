@@ -199,6 +199,7 @@
     try {
       const res: any[] = await invoke("check_threads", { pid });
       let sus = 0;
+      let drActive = 0;
       for (const t of res) {
         if (t.suspicious) {
           sus++;
@@ -207,8 +208,13 @@
           const startHex = t.start_address ? `0x${t.start_address.toString(16).toUpperCase()}` : "?";
           addLog(`[SUSPICIOUS THREAD ${t.tid}] RIP=0x${t.rip.toString(16).toUpperCase()} (${ripMod}) Start=${startHex} (${startMod})`, "suspicious");
         }
+        if (t.dr0 || t.dr1 || t.dr2 || t.dr3) drActive++;
+        if (t.dr7 && !t.dr0 && !t.dr1 && !t.dr2 && !t.dr3) {
+          addLog(`[DR TAMPER TID ${t.tid}] DR7=0x${t.dr7.toString(16).toUpperCase()} but DR0-3 cleared`, "suspicious");
+        }
       }
-      addLog(`[Thread Scan] ${res.length} threads, ${sus} suspicious`, "info");
+      const drNote = drActive > 0 ? `, ${drActive} with HW breakpoints` : "";
+      addLog(`[Thread Scan] ${res.length} threads, ${sus} suspicious${drNote}`, "info");
     } catch (e: any) { addLog(`thread scan failed: ${e}`, "err"); }
   }
 
@@ -244,11 +250,24 @@
     const target = d.target_pid ?? 0;
     if (!protectedPids.includes(target)) return;
 
-    const t = d.event_type ?? "?";
-    const prot = d.protection ? `0x${d.protection.toString(16)}` : "";
+    const caller = d.caller_pid ?? 0;
+    if (caller === target) return;
 
-    const tag = t.includes("REMOTE") ? "suspicious" : "info";
-    addLog(`[ETW-TI] ${t} | PID ${d.caller_pid} → ${target} | 0x${(d.base_address ?? 0).toString(16).toUpperCase()} size=0x${(d.region_size ?? 0).toString(16)} ${prot}`, tag);
+    const t = d.event_type ?? "?";
+    const callerLabel = d.caller_name ? `${d.caller_name}(${caller})` : `PID ${caller}`;
+    const targetLabel = d.target_name ? `${d.target_name}(${target})` : `PID ${target}`;
+    const tid = d.caller_tid ? ` TID ${d.caller_tid}` : "";
+
+    const isSuspendResume = t === "SUSPEND_THREAD" || t === "RESUME_THREAD";
+    const tag = t.includes("REMOTE") || isSuspendResume ? "suspicious" : "info";
+
+    if (isSuspendResume) {
+      const threadId = d.base_address ?? 0;
+      addLog(`[ETW-TI] ${t} | ${callerLabel}${tid} → ${targetLabel} thread ${threadId}`, tag);
+    } else {
+      const prot = d.protection ? ` prot=0x${d.protection.toString(16)}` : "";
+      addLog(`[ETW-TI] ${t} | ${callerLabel}${tid} → ${targetLabel} | 0x${(d.base_address ?? 0).toString(16).toUpperCase()} size=0x${(d.region_size ?? 0).toString(16)}${prot}`, tag);
+    }
   }
 
   async function scanSignatures() {
@@ -480,6 +499,25 @@
     }
     if (event === "CallstackAnomaly") {
       addLog(`[Callstack Anomaly] hook=${d.hook} | suspicious addr=${d.address} frame=${d.frameIndex} region=${d.regionBase} size=${d.regionSize} protect=${d.protect}`, "suspicious");
+      return;
+    }
+    if (event === "HwbpInit") {
+      if (d.status === "ok")
+        addLog(`[HW Breakpoint] Initialized — watching VEH list at ${d.vehListAddr}, ${d.threadsArmed} threads armed`, "ok");
+      else
+        addLog(`[HW Breakpoint] Init FAILED: ${d.reason ?? "unknown"}`, "err");
+      return;
+    }
+    if (event === "VehTableTamper") {
+      addLog(`[VEH TAMPER] VEH handler list modified! PID=${d.callerPID} TID=${d.threadId} DR6=${d.dr6}`, "tamper");
+      return;
+    }
+    if (event === "DebugRegisterTamper") {
+      addLog(`[DR TAMPER] Debug registers cleared on TID ${d.threadId} — re-armed by watchdog`, "suspicious");
+      return;
+    }
+    if (event === "DebugRegisterClearing") {
+      addLog(`[DR CLEARING] NtSetContextThread zeroing DR regs in PID ${d.callerPID} TID ${d.threadId}`, "suspicious");
       return;
     }
 

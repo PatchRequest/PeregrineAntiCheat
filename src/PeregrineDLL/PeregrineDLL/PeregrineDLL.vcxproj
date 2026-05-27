@@ -149,12 +149,16 @@
   <ItemGroup>
     <ClInclude Include="framework.h" />
     <ClInclude Include="callstack.h" />
+    <ClInclude Include="hwbp.h" />
     <ClInclude Include="ipc.h" />
     <ClInclude Include="pch.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="callstack.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="hwbp.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="ipc.c" />

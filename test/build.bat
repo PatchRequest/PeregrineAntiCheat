@@ -14,6 +14,8 @@ cl /nologo /O2 CheatEngine.c /Fe:CheatEngine.exe
 cl /nologo /O2 cheat_manualmap.c /Fe:cheat_manualmap.exe
 cl /nologo /O2 cheat_yara.c /Fe:cheat_yara.exe
 cl /nologo /O2 cheat_callstack.c /Fe:cheat_callstack.exe
+cl /nologo /O2 cheat_etwti.c /Fe:cheat_etwti.exe
+cl /nologo /O2 cheat_hwbp.c /Fe:cheat_hwbp.exe
 cl /nologo /O2 /LD payload.c /Fe:payload.dll
 
 echo.
@@ -49,3 +51,13 @@ echo.
 echo 7. Call-stack evasion (DLL hook call-stack validation):
 echo    game.exe                        ^<-- note PID
 echo    cheat_callstack.exe ^<PID^>      ^<-- inject DLL into this process, then Enter
+echo.
+echo 8. ETW-TI smoketest (all Threat Intelligence event types):
+echo    game.exe                        ^<-- note PID, add to Peregrine, click ETW-TI
+echo    cheat_etwti.exe ^<PID^>          ^<-- triggers all 8 ETW-TI event types
+echo.
+echo 9. HW breakpoint / FakeVEH / DR clearing (VEH tamper + debug register detection):
+echo    game.exe                        ^<-- note PID, add to Peregrine, inject DLL, click ETW-TI
+echo    cheat_hwbp.exe ^<PID^> --read    ^<-- read-only: dump DR registers
+echo    cheat_hwbp.exe ^<PID^> --veh     ^<-- FakeVEH injection only (triggers VehTableTamper)
+echo    cheat_hwbp.exe ^<PID^>           ^<-- full test: FakeVEH + DR clear + re-arm verify

@@ -11,7 +11,7 @@ int main(void)
 
     while (1) {
         printf("[GAME] health = %d  (addr 0x%p)\n", health, (void*)&health);
-        Sleep(3000);
+        Sleep(100);
     }
 
     return 0;
