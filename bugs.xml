@@ -1,0 +1,681 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Peregrine Anti-Cheat — Bug Worklist (items 1–10 from system review)
+
+  How to use this file:
+  - Work items in order when possible; some later bugs depend on earlier ones.
+  - Status values: todo | in_progress | done | blocked
+  - After each fix: rebuild on the DEV machine, deploy artifacts to the TEST VM,
+    run verification steps ONLY on the VM (see <test_environment>).
+  - Prefer robust fixes over temporary workarounds. No hacks.
+
+  Component map:
+    kernel  = src/PeregrineKernelComponent/
+    dll     = src/PeregrineDLL/
+    rust    = src/peregrine-tauri/src-tauri/src/
+    ui      = src/peregrine-tauri/src/routes/+page.svelte
+
+  Environments:
+    DEV  = machine that holds the git repo / source. Edit and build here.
+           Do NOT load the driver, inject DLLs, or run cheat tests here.
+    VM   = dedicated Windows test VM. Copy .sys / DLLs / exe / rules / test
+           binaries over, install/load driver, run verification there.
+-->
+<bugs source="system-review" created="2026-07-22" count="10">
+
+  <!-- ============================================================ -->
+  <bug id="1" priority="critical" status="todo" component="kernel,ui">
+    <title>APC inject does not protect the PID in the driver</title>
+    <severity>
+      On successful APC DLL injection the UI only updates local `protectedPids` state.
+      It never calls `add_pid` / `StateAddPid`. The kernel therefore still treats the
+      target process as unprotected: ObCallback handle monitoring and protected-PID
+      thread/image notify paths never run for that process.
+    </severity>
+    <locations>
+      <file path="src/PeregrineKernelComponent/PeregrineKernelComponent/ApcInjection.c"
+            symbol="InjOnImageLoad / DoInjectInContext" />
+      <file path="src/PeregrineKernelComponent/PeregrineKernelComponent/AppState.c"
+            symbol="StateAddPid" />
+      <file path="src/peregrine-tauri/src/routes/+page.svelte"
+            symbol="handleDriverEvent case apc_inject" />
+    </locations>
+    <instructions>
+      <step n="1">
+        Preferred fix (kernel-side, no UI roundtrip): after a successful `DoInjectInContext`
+        in `InjOnImageLoad` (when status is STATUS_SUCCESS), call `StateAddPid(ProcessId)`.
+        Include `AppState.h` if not already visible from that translation unit.
+      </step>
+      <step n="2">
+        Also call `StateAddPid` when injection is configured and the process is matched,
+        if you want ObCallback protection even when injection fails — optional, decide
+        consciously (protect-on-match vs protect-on-inject-success only).
+      </step>
+      <step n="3">
+        UI hardening: in `+page.svelte` case `"apc_inject"` with `status === "success"`,
+        call `await invoke("add_pid", { pid: d.pid })` in addition to updating
+        `protectedPids`. Kernel-side alone is sufficient for ObCallback; UI still needs
+        the list for display/filtering consistency.
+      </step>
+      <step n="4">
+        On process exit, ensure `StateRemovePid` (or existing cleanup) drops the PID so
+        the protected list cannot grow unbounded. Wire from `InjOnProcessExit` or process
+        notify if not already present.
+      </step>
+      <step n="5">
+        Do not only update frontend state — kernel `StateIsPidProtected` is the source of
+        truth for ObCallback and notify filtering.
+      </step>
+    </instructions>
+    <verification>
+      1. Start driver + GUI, set injection target to `game.exe`, start `game.exe`.
+      2. Confirm `apc_inject` success in the log.
+      3. Without manually clicking "Add PID", run `cheat.exe` against the game PID.
+      4. Expect `ob_callback` / handle-access events. Before the fix these are missing.
+      5. Confirm UI "Protected" list includes the game PID.
+    </verification>
+    <acceptance>
+      After APC inject success, `StateIsPidProtected(pid)` is true in kernel without a
+      separate userland `add_pid` command. ObCallback fires for external OpenProcess with
+      dangerous rights on that PID.
+    </acceptance>
+  </bug>
+
+  <!-- ============================================================ -->
+  <bug id="2" priority="high" status="todo" component="kernel,rust,ui">
+    <title>process_create / process_exit never emitted (dead API surface)</title>
+    <severity>
+      `CreateProcessNotifyRoutineEx` only drives injection via `InjOnProcessCreate` /
+      `InjOnProcessExit`. It never builds or queues JSON events. Userland still defines
+      `DriverEvent::ProcessCreate` / `ProcessExit` and the UI has empty case arms —
+      dead end-to-end.
+    </severity>
+    <locations>
+      <file path="src/PeregrineKernelComponent/PeregrineKernelComponent/NotifyRoutine.c"
+            symbol="CreateProcessNotifyRoutineEx" />
+      <file path="src/peregrine-tauri/src-tauri/src/driver_comm.rs"
+            symbol="DriverEvent::ProcessCreate / ProcessExit" />
+      <file path="src/peregrine-tauri/src/routes/+page.svelte"
+            symbol="handleDriverEvent process_create / process_exit" />
+    </locations>
+    <instructions>
+      <step n="1">
+        In `CreateProcessNotifyRoutineEx`, after injection handling, emit JSON via
+        `ComsSendToUser` / `SendJsonString`:
+        - Create: `{ "event": "process_create", "pid": N, "ppid": N, "image": "..." }`
+        - Exit:   `{ "event": "process_exit", "pid": N }`
+        Obtain image name from `CreateInfo->ImageFileName` (ANSI conversion already used
+        elsewhere). Parent PID: `CreateInfo->ParentProcessId` when available.
+      </step>
+      <step n="2">
+        Escape image paths for JSON (see bug 9) — raw `\` in paths will break parsing.
+      </step>
+      <step n="3">
+        Align field names with `driver_comm.rs` serde structs (`pid`, `ppid`, `image`).
+        If you rename fields, update Rust and Svelte together.
+      </step>
+      <step n="4">
+        Decide noise policy: emit for all processes vs only injection targets vs only
+        protected PIDs. For process_create, "all" or "targets" is usually useful; for
+        process_exit, at least protected + pending injection PIDs.
+      </step>
+      <step n="5">
+        After emission works, fix bug 3 so userland does not drop these events if you
+        want them in the UI. Or keep them for internal correlation only — document choice.
+      </step>
+    </instructions>
+    <verification>
+      1. Attach debugger or log kernel→user events while launching any process.
+      2. Confirm `process_create` JSON appears in the driver message queue / poll path.
+      3. Kill the process; confirm `process_exit`.
+      4. Parse successfully with `serde_json` / existing `recv_event` path.
+    </verification>
+    <acceptance>
+      Kernel emits valid `process_create` and `process_exit` events. Userland can parse
+      them. No silent loss solely because the kernel never sent them.
+    </acceptance>
+  </bug>
+
+  <!-- ============================================================ -->
+  <bug id="3" priority="high" status="todo" component="rust,ui">
+    <title>Kernel emits useful events; userland drops them</title>
+    <severity>
+      In `start_driver_polling` (`lib.rs`), events `process_create`, `process_exit`,
+      `thread_create`, `thread_exit`, and `image_load` are matched and discarded.
+      The UI still has handlers for `image_load` and empty cases for process/thread —
+      so real-time shellcode (thread start address) and image-load telemetry never reach
+      the frontend. Kernel work collecting start addresses is wasted.
+    </severity>
+    <locations>
+      <file path="src/peregrine-tauri/src-tauri/src/lib.rs"
+            symbol="start_driver_polling" />
+      <file path="src/peregrine-tauri/src/routes/+page.svelte"
+            symbol="handleDriverEvent" />
+      <file path="src/PeregrineKernelComponent/PeregrineKernelComponent/NotifyRoutine.c"
+            symbol="CreateThreadNotifyRoutine / LoadImageNotifyRoutine" />
+    </locations>
+    <instructions>
+      <step n="1">
+        Remove the blanket drop of `thread_create` and `image_load` from the poll match
+        in `lib.rs`. Always emit those via `app.emit("driver-event", &amp;obj)`.
+      </step>
+      <step n="2">
+        For `process_create` / `process_exit`: emit once bug 2 is fixed. Until then
+        keeping them dropped is harmless but document it.
+      </step>
+      <step n="3">
+        `thread_exit` is high-volume noise. Options:
+        (a) drop only `thread_exit` in Rust;
+        (b) drop in kernel for non-interesting exits;
+        (c) emit but filter in UI.
+        Prefer (a) or (b) — do not flood the log.
+      </step>
+      <step n="4">
+        Implement UI handling for `thread_create`:
+        - If `start_address` is present, resolve or flag "outside known modules" when
+          possible (even a simple log with pid/tid/start_address is enough initially).
+        - Rate-limit image_load in UI (e.g. only non-system paths or first N per second)
+          to avoid log spam.
+      </step>
+      <step n="5">
+        Ensure JSON from kernel for thread events uses escaped fields if any path is added
+        later (start_address is hex string today — fine).
+      </step>
+    </instructions>
+    <verification>
+      1. Protect a PID (or fix bug 1 so inject auto-protects).
+      2. Start a new thread in that process (e.g. `cheat_shellcode` remote thread).
+      3. Confirm `thread_create` with `start_address` appears in the GUI log.
+      4. Load a DLL into the process; confirm `image_load` appears (possibly filtered).
+      5. Confirm log does not become unusable from thread_exit spam.
+    </verification>
+    <acceptance>
+      `thread_create` (with start address when available) and `image_load` reach the UI.
+      High-noise events are intentionally filtered, not accidentally all dropped.
+    </acceptance>
+  </bug>
+
+  <!-- ============================================================ -->
+  <bug id="4" priority="high" status="todo" component="rust,ui">
+    <title>Overlay detection is a stub (README claims it works)</title>
+    <severity>
+      `detections/overlay.rs` returns an empty `Vec` with a TODO. No Tauri command
+      exposes it. README Detection #10 documents working overlay detection — false.
+    </severity>
+    <locations>
+      <file path="src/peregrine-tauri/src-tauri/src/detections/overlay.rs" />
+      <file path="src/peregrine-tauri/src-tauri/src/detections/mod.rs" />
+      <file path="src/peregrine-tauri/src-tauri/src/lib.rs" symbol="invoke_handler" />
+      <file path="src/peregrine-tauri/src/routes/+page.svelte" />
+      <file path="README.md" note="Detection table row Overlay Detection" />
+    </locations>
+    <instructions>
+      <step n="1">
+        Implement `detect_overlays()` properly using Win32:
+        - `EnumWindows` callback
+        - For each top-level visible window: `GetWindowLong(GWL_EXSTYLE)` for
+          `WS_EX_LAYERED` / `WS_EX_TRANSPARENT` / `WS_EX_TOPMOST`
+        - `GetWindowRect` + screen metrics: flag near-fullscreen overlays
+        - `GetWindowThreadProcessId`, class name (`GetClassNameW`), title (`GetWindowTextW`)
+        - Skip own process PID and obvious OS shells if needed
+      </step>
+      <step n="2">
+        Fill `OverlayWindow { hwnd, class_name, title, pid }` for each hit.
+        Prefer `windows` crate APIs already used elsewhere in the project.
+      </step>
+      <step n="3">
+        Add Tauri command e.g. `scan_overlays() -&gt; Vec&lt;OverlayWindow&gt;` in `lib.rs`
+        and register it in `generate_handler![]`.
+      </step>
+      <step n="4">
+        Add a UI button that invokes the command and logs each overlay with a clear tag
+        (e.g. `overlay`).
+      </step>
+      <step n="5">
+        If you intentionally leave it unimplemented, remove README claim and the dead
+        module surface — do not leave false documentation. Prefer full implementation.
+      </step>
+    </instructions>
+    <verification>
+      1. Create a layered topmost fullscreen window (or use a known overlay tool).
+      2. Run scan from GUI; expect that window listed with correct PID/class.
+      3. Normal desktop apps should not all be flagged (tune heuristics).
+    </verification>
+    <acceptance>
+      Overlay scan returns real windows matching layered/transparent/topmost+fullscreen
+      heuristics. Exposed via Tauri + UI. README matches behavior.
+    </acceptance>
+  </bug>
+
+  <!-- ============================================================ -->
+  <bug id="5" priority="high" status="todo" component="rust">
+    <title>Thread scan: GetThreadContext without SuspendThread</title>
+    <severity>
+      `check_all_threads` calls `GetThreadContext` on running threads without suspending
+      them. Windows does not guarantee a valid context for a running thread; RIP-based
+      shellcode detection is unreliable. HWBP code in the DLL correctly suspends first.
+    </severity>
+    <locations>
+      <file path="src/peregrine-tauri/src-tauri/src/detections/threads.rs"
+            symbol="check_all_threads" />
+      <file path="src/PeregrineDLL/PeregrineDLL/hwbp.c"
+            note="Reference pattern: SuspendThread → Get/SetThreadContext → ResumeThread" />
+    </locations>
+    <instructions>
+      <step n="1">
+        Open threads with `THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION`.
+      </step>
+      <step n="2">
+        For each target thread (skip the scanning thread if same process):
+        `SuspendThread` → `GetThreadContext` → read RIP/DRx → `ResumeThread` in a
+        deferred/cleanup path so resume always runs (even on early continue).
+      </step>
+      <step n="3">
+        Handle suspend failures (access denied, already exiting): skip thread, do not
+        panic; still try `NtQueryInformationThread` for start address without context.
+      </step>
+      <step n="4">
+        Keep start-address checks independent of context success — start address does not
+        need suspend.
+      </step>
+      <step n="5">
+        Optional later: WoW64 / x86 CONTEXT — current struct is x64-only; document or
+        fix if scanning 32-bit targets matters.
+      </step>
+    </instructions>
+    <verification>
+      1. Run `game.exe`, then `cheat_shellcode.exe` against it (remote thread outside modules).
+      2. Run thread scan; `suspicious` should be true for the shellcode thread with a
+         meaningful RIP when the thread is still alive.
+      3. Confirm no hung game after scan (all suspended threads resumed).
+    </verification>
+    <acceptance>
+      Context is only read after successful suspend. Threads always resumed. Suspicious
+      detection based on RIP/start address is reliable for live remote shellcode threads.
+    </acceptance>
+  </bug>
+
+  <!-- ============================================================ -->
+  <bug id="6" priority="medium" status="todo" component="rust,kernel">
+    <title>clear_injection_targets does not clear targets</title>
+    <severity>
+      Tauri `clear_injection_targets` only calls `set_injection_enabled(false)`. Kernel
+      `InjClearTargets()` exists but is never invoked via IOCTL. Target name list remains;
+      re-enabling injection reinjects old names. API name promises clear, behavior is disable.
+    </severity>
+    <locations>
+      <file path="src/peregrine-tauri/src-tauri/src/lib.rs"
+            symbol="clear_injection_targets" />
+      <file path="src/peregrine-tauri/src-tauri/src/driver_comm.rs" />
+      <file path="src/PeregrineKernelComponent/PeregrineKernelComponent/ApcInjection.c"
+            symbol="InjClearTargets" />
+      <file path="src/PeregrineKernelComponent/PeregrineKernelComponent/Coms.c"
+            symbol="ComsHandleUserCommand" />
+    </locations>
+    <instructions>
+      <step n="1">
+        Add a new IOCTL command byte (e.g. case 14) in `Coms.c` that calls
+        `InjClearTargets()` and optionally `InjSetEnabled(FALSE)`. Document the opcode
+        next to existing cases 1–13.
+      </step>
+      <step n="2">
+        Add `DriverHandle::clear_injection_targets()` in `driver_comm.rs` that sends
+        that command byte.
+      </step>
+      <step n="3">
+        Change Tauri `clear_injection_targets` to call the new command (clear list +
+        disable), not only `set_injection_enabled(false)`.
+      </step>
+      <step n="4">
+        Keep a separate "disable without clear" only if the UI needs it; otherwise one
+        clear API is enough. Update UI button label if wording is wrong.
+      </step>
+      <step n="5">
+        UI already zeros `injectionTargets` array — keep that in sync with kernel.
+      </step>
+    </instructions>
+    <verification>
+      1. Add target `game.exe`, clear targets, re-enable injection (if separate), start game.
+      2. Expect no APC inject. Before fix, inject may still fire if only disabled then re-enabled.
+      3. After clear, add a different target name; only that name should inject.
+    </verification>
+    <acceptance>
+      Clear removes all target names in kernel state and disables injection.
+      Subsequent enables require re-adding targets.
+    </acceptance>
+  </bug>
+
+  <!-- ============================================================ -->
+  <bug id="7" priority="high" status="todo" component="kernel">
+    <title>APC injection leaves permanent RWX private memory in the target</title>
+    <severity>
+      `DoInjectInContext` allocates shellcode + UNICODE_STRING with
+      `PAGE_EXECUTE_READWRITE`, queues a user APC, and never frees or reprotects the
+      region. A VAD scan of the protected process flags Peregrine's own page (self noise).
+      RWX private memory is also a poor security posture for AC code.
+    </severity>
+    <locations>
+      <file path="src/PeregrineKernelComponent/PeregrineKernelComponent/ApcInjection.c"
+            symbol="DoInjectInContext" />
+      <file path="src/PeregrineKernelComponent/PeregrineKernelComponent/VadScan.c"
+            note="Will report this region as vad_suspicious" />
+    </locations>
+    <instructions>
+      <step n="1">
+        Preferred layout: allocate two regions or one region with staged protection:
+        - Write shellcode + path as RW
+        - After writing, `ZwProtectVirtualMemory` shellcode portion to PAGE_EXECUTE_READ
+          and path/ustr to PAGE_READWRITE or PAGE_READONLY
+        Avoid long-lived PAGE_EXECUTE_READWRITE.
+      </step>
+      <step n="2">
+        Freeing is harder: free only after LdrLoadDll has completed. Options:
+        (A) Extended shellcode that VirtualFree's its own allocation after LdrLoadDll
+            (needs resolved VirtualFree / NtFreeVirtualMemory address).
+        (B) Kernel work item / delayed free after image load of PeregrineDLL is observed
+            in `LoadImageNotifyRoutine`.
+        (C) Leave allocation but RX-only and small; document as known residual and
+            whitelist that base in VAD scan if you can identify it — least ideal.
+        Prefer (A) or (B) for a robust design.
+      </step>
+      <step n="3">
+        If implementing (B): on `image_load` of the AC DLL path in that PID, free the
+        pending inject allocation recorded in a small per-PID map at inject time.
+      </step>
+      <step n="4">
+        Ensure failure paths free the allocation if APC queue fails.
+      </step>
+      <step n="5">
+        After fix, VAD scan of a freshly injected clean `game.exe` should not report
+        Peregrine shellcode as suspicious (or only briefly before free).
+      </step>
+    </instructions>
+    <verification>
+      1. Inject into `game.exe`, wait until DLL hello arrives.
+      2. Run kernel VAD scan on game PID.
+      3. Expect no PE-less RWX private region from Peregrine (or region gone / RX only).
+      4. Confirm hooks still work (IPC hello + OpenProcess from cheat still reported).
+    </verification>
+    <acceptance>
+      No permanent RWX private page left by APC inject. Injection and hooks still succeed.
+      Clean process VAD scan is not polluted by AC self-artifacts.
+    </acceptance>
+  </bug>
+
+  <!-- ============================================================ -->
+  <bug id="8" priority="medium" status="todo" component="kernel">
+    <title>Minifilter self-defense file names do not match real artifacts</title>
+    <severity>
+      `IsProtectedFile` matches `peregrine64.dll` / `peregrine32.dll` but build/install
+      produces `PeregrineDLL_x64.dll` / `PeregrineDLL_x86.dll`. Those files are not
+      covered. Minifilter only reports write/delete/rename; it does not deny. README
+      implies file-access monitoring of AC files.
+    </severity>
+    <locations>
+      <file path="src/PeregrineKernelComponent/PeregrineKernelComponent/MiniFilter.c"
+            symbol="IsProtectedFile / PreCreate / PreSetInfo" />
+      <file path="src/Userland/" note="Actual DLL filenames" />
+      <file path="build_dll.bat / install.bat" />
+    </locations>
+    <instructions>
+      <step n="1">
+        Update `IsProtectedFile` suffixes to match real names (case-insensitive ends-with):
+        - `peregrinekernelcomponent.sys` (already)
+        - `peregrinedll_x64.dll`, `peregrinedll_x86.dll`
+        - `peregrine-tauri.exe`
+        - Keep legacy `peregrine64.dll` / `peregrine32.dll` if still used as alternate
+          search names in `connect_driver`.
+      </step>
+      <step n="2">
+        Optionally protect `rules.yar` and install directory config if desired.
+      </step>
+      <step n="3">
+        Decide report-only vs deny:
+        - Report-only: keep current Pre* return `FLT_PREOP_SUCCESS_NO_CALLBACK` after log.
+        - Deny: for non-protected callers, set `Data-&gt;IoStatus.Status = STATUS_ACCESS_DENIED`
+          and return `FLT_PREOP_COMPLETE` for write/delete/rename of protected files.
+        For educational AC, deny is more useful; document that protected PIDs still pass
+        via `IsOurProcess()`.
+      </step>
+      <step n="4">
+        Ensure `connect_driver` / install paths still place files under a path containing
+        `\peregrine\` so `ContainsI(..., L"\\peregrine\\")` continues to match.
+      </step>
+    </instructions>
+    <verification>
+      1. From an unprotected process, attempt to open `C:\Peregrine\PeregrineDLL_x64.dll`
+         for write/delete.
+      2. Expect `file_access` event (and ACCESS_DENIED if deny mode implemented).
+      3. Confirm AC process can still update its own files if that is intended.
+    </verification>
+    <acceptance>
+      Real installed AC filenames are covered by `IsProtectedFile`. Events fire for
+      tampering attempts. Behavior matches README (report and/or block as chosen).
+    </acceptance>
+  </bug>
+
+  <!-- ============================================================ -->
+  <bug id="9" priority="high" status="todo" component="kernel,rust">
+    <title>JSON from kernel is not valid for many paths (brittle escape hack)</title>
+    <severity>
+      Kernel builds JSON with raw strings (paths with `\`, possible `"`). Userland does
+      `s.replace('\\', "\\\\")` before `serde_json::from_str`. That is fragile: quotes
+      still break, double-escaping risks, and unrelated fields can be corrupted. Events
+      with paths (`image_load`, `file_access`, `process_create`, driver scan) can fail
+      to parse silently.
+    </severity>
+    <locations>
+      <file path="src/peregrine-tauri/src-tauri/src/lib.rs"
+            symbol="start_driver_polling fixed = s.replace" />
+      <file path="src/peregrine-tauri/src-tauri/src/driver_comm.rs"
+            symbol="parse_driver_event" />
+      <file path="src/PeregrineKernelComponent/PeregrineKernelComponent/NotifyRoutine.c" />
+      <file path="src/PeregrineKernelComponent/PeregrineKernelComponent/MiniFilter.c" />
+      <file path="src/PeregrineKernelComponent/PeregrineKernelComponent/DriverScan.c" />
+    </locations>
+    <instructions>
+      <step n="1">
+        Add a shared kernel helper, e.g. `JsonEscapeAndAppend(dest, destSize, src)` that
+        escapes `\`, `"`, and control chars per JSON string rules. Use it for every
+        untrusted/string field inserted into event JSON.
+      </step>
+      <step n="2">
+        Alternatively emit paths as JSON strings built only through the helper, or use
+        hex-encoded paths for simplicity (less readable but always safe).
+      </step>
+      <step n="3">
+        Apply to at least: image paths, file_access paths, process image, driver paths,
+        any user-controlled name fields.
+      </step>
+      <step n="4">
+        Remove the userland global backslash replace hack once kernel emits valid JSON.
+        Parse with `serde_json::from_str` directly; log parse failures with raw payload
+        for debugging.
+      </step>
+      <step n="5">
+        DLL IPC (`ipc_log_event`) has the same class of issue if image names ever contain
+        quotes — escape there too for consistency.
+      </step>
+    </instructions>
+    <verification>
+      1. Trigger `image_load` / `file_access` with a normal Windows path containing `\`.
+      2. Confirm events parse and appear in the UI without the replace hack.
+      3. Unit-test or manual test: path with a double-quote character if creatable;
+         must not break the parser or must be escaped.
+    </verification>
+    <acceptance>
+      All kernel→user JSON messages are strictly valid JSON without userland massaging.
+      Path-bearing events reliably reach the frontend.
+    </acceptance>
+  </bug>
+
+  <!-- ============================================================ -->
+  <bug id="10" priority="high" status="todo" component="rust,kernel">
+    <title>Named pipe is world-writable; driver device lacks client ACL</title>
+    <severity>
+      IPC pipe SDDL is `D:(A;;GA;;;WD)` (Everyone full access). Any process can connect
+      and forge hook/callstack events into the GUI. The Peregrine device is created with
+      `IoCreateDevice` without a restrictive security descriptor; any user who can open
+      `\\.\Peregrine` can send IOCTLs including set-PPL, add PIDs, configure injection.
+    </severity>
+    <locations>
+      <file path="src/peregrine-tauri/src-tauri/src/ipc.rs"
+            symbol="start_ipc_server SDDL" />
+      <file path="src/PeregrineDLL/PeregrineDLL/ipc.c"
+            symbol="GetPipe" />
+      <file path="src/PeregrineKernelComponent/PeregrineKernelComponent/Coms.c"
+            symbol="ComsInitialize IoCreateDevice" />
+    </locations>
+    <instructions>
+      <step n="1">
+        Pipe ACL (minimum viable):
+        - Allow full access to Local System and Administrators.
+        - Allow the AC user / interactive logon session that runs the GUI.
+        - Deny Everyone (`WD`) generic all.
+        Example direction (tune to your deploy model):
+        `D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LA)` or add the specific user SID at runtime.
+      </step>
+      <step n="2">
+        Better: create the pipe with a security descriptor that grants
+        `FILE_GENERIC_WRITE` only to processes you trust. For educational AC, Admin+SYSTEM
+        is often enough if GUI and targets run elevated.
+      </step>
+      <step n="3">
+        Optional authenticity: DLL sends a shared secret or HMAC established at inject
+        time (IOCTL-configured nonce written into target). GUI rejects events without
+        valid token. Only add if you can do it cleanly — do not half-implement crypto.
+      </step>
+      <step n="4">
+        Driver device: use `IoCreateDeviceSecure` (or set DACL after create) so only
+        Administrators (or a dedicated SID) can open the device. Verify
+        `FILE_DEVICE_SECURE_OPEN` remains set.
+      </step>
+      <step n="5">
+        Document that the GUI must run elevated to open the device and pipe under the
+        new ACLs. Update README usage if needed.
+      </step>
+      <step n="6">
+        Confirm injected DLL can still open the pipe under the new ACL when running
+        inside a medium-IL game — this may require granting write to a broader group or
+        injecting a capability. If medium-IL games cannot open an Admin-only pipe,
+        use a custom ACE for "same session" or a constrained SD that allows authenticated
+        users write-only while Admin owns the server. Design this carefully; do not leave
+        Everyone-GA as the solution.
+      </step>
+    </instructions>
+    <verification>
+      1. Non-admin low-privilege process attempts to open `\\.\pipe\peregrine_ipc` for
+         write and `\\.\Peregrine` for IOCTL — should fail (or lack dangerous rights).
+      2. Elevated GUI still receives real DLL events after inject into `game.exe`.
+      3. Forged events from an unprivileged process no longer appear in the log.
+    </verification>
+    <acceptance>
+      Untrusted processes cannot forge IPC telemetry or issue driver commands.
+      Legitimate GUI + injected DLL communication still works under the chosen security
+      model (document IL/elevation requirements).
+    </acceptance>
+  </bug>
+
+  <!-- ============================================================ -->
+  <workflow>
+    <recommended_order>
+      1 → 3 → 2 → 9 → 5 → 7 → 6 → 8 → 4 → 10
+    </recommended_order>
+    <rationale>
+      Fix auto-protect (1) first so other detections can be tested on a real protected
+      game. Then un-drop events (3) and emit process events (2). JSON validity (9) unlocks
+      reliable path-bearing telemetry. Thread scan (5) and APC RWX (7) are independent
+      quality fixes. Clear targets (6) and minifilter names (8) are smaller. Overlay (4)
+      is feature completion. ACL (10) last so functional testing stays easy during earlier
+      work, then lock down.
+    </rationale>
+
+    <!--
+      Split host: source lives on DEV; all driver/runtime verification is on a
+      dedicated Windows VM. Never treat a successful build on DEV as a verified fix.
+    -->
+    <test_environment>
+      <dev_machine>
+        <role>Source control, editing, compilation only.</role>
+        <do>
+          <item>Implement fixes in the repo.</item>
+          <item>Build kernel (.sys), DLL (x64/x86), Tauri GUI, and test/ binaries.</item>
+          <item>Produce a deploy package (folder or archive) with the exact files the VM needs.</item>
+          <item>Static review: compile clean, no unused IOCTL paths, README notes if needed.</item>
+        </do>
+        <do_not>
+          <item>Do not load PeregrineKernelComponent.sys on the DEV machine.</item>
+          <item>Do not run install.bat / sc create / test signing workflow for real tests on DEV.</item>
+          <item>Do not mark a bug status=done based only on a successful build.</item>
+        </do_not>
+      </dev_machine>
+
+      <test_vm>
+        <role>Only place where driver load, injection, ETW-TI/PPL, and cheat tests run.</role>
+        <prerequisites>
+          <item>Windows 10/11 x64 with test signing enabled (bcdedit /set testsigning on) if using unsigned .sys.</item>
+          <item>Admin shell for sc.exe, driver start, and elevated GUI.</item>
+          <item>Stable deploy path, typically C:\Peregrine\ (matches connect_driver search paths).</item>
+          <item>Snapshot the VM before risky kernel changes so a bad .sys is recoverable.</item>
+        </prerequisites>
+        <deploy>
+          <item>Copy from DEV build outputs to VM C:\Peregrine\ (overwrite previous bits):
+            - PeregrineKernelComponent.sys
+            - PeregrineDLL_x64.dll, PeregrineDLL_x86.dll
+            - peregrine-tauri.exe (and any sidecar resources)
+            - rules.yar
+            - test\ game.exe, cheat*.exe, payload.dll as needed
+          </item>
+          <item>If the service already exists: sc stop Peregrine, replace .sys, sc start Peregrine.
+                If first install: follow README / install.bat (service + minifilter instance registry).</item>
+          <item>Confirm DLL paths the GUI will set point at the VM copy under C:\Peregrine\,
+                not a leftover DEV path (connect_driver also searches C:\Peregrine).</item>
+          <item>Copy a matching set of binaries per change set — never mix an old .sys with a new GUI
+                that expects new IOCTL opcodes (or vice versa).</item>
+        </deploy>
+        <verify_on_vm_only>
+          <item>Every &lt;verification&gt; block in this file runs on the VM after deploy.</item>
+          <item>Use VM Event Viewer / DbgView for KdPrint if diagnosing kernel failures.</item>
+          <item>Record pass/fail notes (optional) when flipping status to done.</item>
+        </verify_on_vm_only>
+      </test_vm>
+
+      <deploy_checklist>
+        <item>Rebuild changed components on DEV.</item>
+        <item>Package: sys + both DLLs + GUI + rules.yar + needed test tools.</item>
+        <item>Transfer to VM (shared folder, scp, USB, etc.).</item>
+        <item>Stop driver if loaded; replace files; start driver; launch elevated GUI.</item>
+        <item>Run that bug's verification steps on the VM.</item>
+        <item>Only then set status=done in bugs.xml (on DEV, when you next edit the repo).</item>
+      </deploy_checklist>
+
+      <notes>
+        <item>Kernel bugs (1, 2, 6–10 partly) always need a VM driver reload cycle.</item>
+        <item>Pure userland bugs (3, 4, 5, parts of 9) still need the VM if they depend on
+              live processes, hooks, or driver events — do not rely on DEV-only dry runs.</item>
+        <item>Hardcoded DEV paths (e.g. E:\Peregrine\...) in connect_driver / sigscan are DEV
+              conveniences; on the VM prefer C:\Peregrine\ and ensure artifacts live there.</item>
+        <item>If a fix cannot be verified on the VM yet, leave status=todo or blocked with a
+              short note — do not mark done.</item>
+      </notes>
+    </test_environment>
+
+    <build>
+      <item>DEV — Kernel: rebuild PeregrineKernelComponent.sys (VS2022 + WDK).</item>
+      <item>DEV — DLL: build_dll.bat for x64/x86.</item>
+      <item>DEV — GUI: cd src/peregrine-tauri &amp;&amp; npx tauri build (or cargo build for backend checks).</item>
+      <item>DEV — Tests: rebuild test/ tools if cheats changed.</item>
+      <item>VM  — Deploy package to C:\Peregrine\, sc stop/start Peregrine, run verification.</item>
+      <item>VM  — Tests: game.exe + cheat_*.exe only on the test VM.</item>
+    </build>
+    <rules>
+      <rule>No hacks or temporary duct-tape that will break later.</rule>
+      <rule>Prefer fixing design (kernel source of truth) over UI-only patches.</rule>
+      <rule>Update README when behavior changes (especially overlay and file defense).</rule>
+      <rule>Mark status=done only after verification steps pass on the TEST VM, not after a DEV build alone.</rule>
+      <rule>Never load the experimental .sys on the machine that holds the source tree; use the dedicated VM.</rule>
+      <rule>Always deploy a consistent artifact set (sys + DLL + GUI) so IOCTL/IPC versions match.</rule>
+    </rules>
+  </workflow>
+
+</bugs>
