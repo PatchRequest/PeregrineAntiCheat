@@ -286,28 +286,91 @@
     }
   }
 
+  async function stopEtwTi() {
+    if (!etwRunning) { addLog("[ETW-TI] not running", "info"); return; }
+    try {
+      const msg: string = await invoke("stop_etw_ti");
+      etwRunning = false;
+      addLog(`[ETW-TI] ${msg}`, "info");
+    } catch (e: any) {
+      addLog(`[ETW-TI] stop failed: ${e}`, "err");
+    }
+  }
+
   function handleEtwTiEvent(d: any) {
     if (!d) return;
-    const target = d.target_pid ?? 0;
-    if (!protectedPids.includes(target)) return;
+    const target = Number(d.target_pid ?? 0);
+    const caller = Number(d.caller_pid ?? 0);
+    const t = (d.event_type as string) ?? "?";
+    const scope = (d.scope as string) ?? "";
+    const sev = (d.severity as string) ?? "info";
+    const executable = d.executable === true;
 
-    const caller = d.caller_pid ?? 0;
-    if (caller === target) return;
+    // Game-centric filter:
+    //  EXTERNAL: target is protected game (any remote caller)
+    //  INTERNAL: caller==target==protected AND interesting (exec alloc/protect/map, write, APC/ctx)
+    const targetProtected = protectedPids.includes(target);
+    const callerProtected = protectedPids.includes(caller);
+    if (!targetProtected && !callerProtected) return;
 
-    const t = d.event_type ?? "?";
+    const isLocal = scope === "local" || caller === target;
+    if (isLocal) {
+      // Everything "game → game" from ETW-TI is almost always our own Game DLL:
+      // MinHook (ALLOC 0x1000 RWX trampoline, PROTECT size≈5 RX↔RWX) + HWBP arming.
+      // Real external cheats are REMOTE (cheat → game). Internal signals come from
+      // Callstack/HWBP IPC, not local TI spam. Drop all local TI for AC log.
+      return;
+    }
+    // External only: require target game
+    if (!targetProtected) return;
+
+    // Process-create / CSRSS / shells touching the new process — not cheat signal.
+    const cname = ((d.caller_name as string) || "").toLowerCase();
+    const systemNoise = [
+      "csrss.exe", "smss.exe", "lsass.exe", "services.exe", "svchost.exe",
+      "powershell.exe", "pwsh.exe", "cmd.exe", "conhost.exe", "explorer.exe",
+      "runtimebroker.exe", "dllhost.exe",
+    ];
+    if (systemNoise.some((n) => cname === n || cname.endsWith("\\" + n))) {
+      // Keep only high-signal remote types from non-system (never from these).
+      return;
+    }
+
     const callerLabel = d.caller_name ? `${d.caller_name}(${caller})` : `PID ${caller}`;
     const targetLabel = d.target_name ? `${d.target_name}(${target})` : `PID ${target}`;
     const tid = d.caller_tid ? ` TID ${d.caller_tid}` : "";
 
-    const isSuspendResume = t === "SUSPEND_THREAD" || t === "RESUME_THREAD";
-    const tag = t.includes("REMOTE") || isSuspendResume ? "suspicious" : "info";
+    const tag =
+      sev === "critical" ? "suspicious" :
+      sev === "high" ? "suspicious" :
+      sev === "medium" ? "handle" :
+      "info";
+
+    const sevMark = sev === "critical" ? "!! " : sev === "high" ? "! " : "";
+    const execMark = executable ? " [X]" : "";
+    const isSuspendResume = t.includes("SUSPEND") || t.includes("RESUME");
 
     if (isSuspendResume) {
-      const threadId = d.base_address ?? 0;
-      addLog(`[ETW-TI] ${t} | ${callerLabel}${tid} → ${targetLabel} thread ${threadId}`, tag);
+      const threadId = d.target_tid ?? d.base_address ?? 0;
+      addLog(
+        `[ETW-TI] ${sevMark}${t}${execMark} | ${callerLabel}${tid} → ${targetLabel} thread ${threadId}`,
+        tag,
+      );
     } else {
-      const prot = d.protection ? ` prot=0x${d.protection.toString(16)}` : "";
-      addLog(`[ETW-TI] ${t} | ${callerLabel}${tid} → ${targetLabel} | 0x${(d.base_address ?? 0).toString(16).toUpperCase()} size=0x${(d.region_size ?? 0).toString(16)}${prot}`, tag);
+      const prot = d.protection ? ` prot=0x${Number(d.protection).toString(16)}` : "";
+      const last = d.last_protection != null
+        ? ` was=0x${Number(d.last_protection).toString(16)}`
+        : "";
+      const size = d.region_size
+        ? ` size=0x${Number(d.region_size).toString(16)}`
+        : "";
+      const addr = d.base_address
+        ? ` 0x${Number(d.base_address).toString(16).toUpperCase()}`
+        : "";
+      addLog(
+        `[ETW-TI] ${sevMark}${t}${execMark} | ${callerLabel}${tid} → ${targetLabel} |${addr}${size}${prot}${last}`,
+        tag,
+      );
     }
   }
 
@@ -689,7 +752,9 @@
     <button class="btn warn" onclick={() => driverCmd("scan_drivers")}>Drivers</button>
     <button class="btn warn" onclick={() => driverCmd("scan_ob_callbacks")}>ObCB</button>
     <button class="btn purple" onclick={() => driverCmd("system_check")}>SysChk</button>
-    <button class="btn" style="background:#e74c3c;color:white" onclick={startEtwTi}>ETW-TI</button>
+    <button class="btn" style="background:{etwRunning ? '#27ae60' : '#e74c3c'};color:white" onclick={etwRunning ? stopEtwTi : startEtwTi}>
+      {etwRunning ? "ETW stop" : "ETW-TI"}
+    </button>
     <button class="btn" style="background:#10b981;color:white" onclick={collectHwid}>HWID</button>
     <button class="btn" style="background:#f9e2af;color:black" onclick={scanOverlays}>Overlay</button>
   </nav>

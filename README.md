@@ -54,7 +54,36 @@ An educational anti-cheat system demonstrating Windows kernel programming, proce
 - **GUI ↔ Driver**: IOCTL commands (PIDs, Game/Sensor inject config, scans) + event polling
 - **DLL → GUI**: Named pipe `\\.\pipe\peregrine_ipc` (`hello` with `role`, hooks, HWBP on Game)
 - **Driver → target**: APC at `kernel32` load; **Game** success auto-protects PID; **Sensor** does not
-- **GUI → ETW**: PPL-protected trace session for Threat Intelligence events
+- **GUI → ETW**: PPL-protected real-time session for Threat Intelligence (start/stop in UI)
+
+## ETW-TI consumer
+
+Provider: `Microsoft-Windows-Threat-Intelligence` (`{f4e1897c-bb5d-5668-f1d8-040f4d8dd344}`).
+
+| Requirement | Detail |
+|-------------|--------|
+| Elevation | GUI elevated |
+| PPL | Kernel `set_ppl` on GUI PID before `EnableTraceEx2` |
+| Scope | Only events tied to **protected game PIDs** (external target, or internal interesting) |
+
+**Parsing (correct path):** fields via **TDH** (`TdhGetProperty` / `TdhGetPropertySize`) by name (`CallingProcessId`, `TargetProcessId`, `BaseAddress`, `RegionSize`/`ViewSize`/`BytesCopied`, `ProtectionMask`, `LastProtectionMask`, …). No hardcoded `UserData` offsets (Version / FILL_VAD / build-safe). Classify with Keyword + Task; caller falls back to `EventHeader.ProcessId`. Keyword enable mask is `u64::MAX`.
+
+**UI policy (game-centric, VM-verified):**
+
+- **Log only EXTERNAL** ops where `target_pid ∈ protectedPids` (cheat → game)
+- **Drop all local** (`caller == target`) — Game DLL MinHook/HWBP is game→game noise (ALLOC 0x1000 RWX, PROTECT size≈5 RX↔RWX)
+- **Drop system callers** (csrss, powershell, explorer, svchost, …) — process-create chatter
+- Severity: `!!` critical / `!` high / `[X]` executable; READVM rate-limited ~1/2s
+
+**Ops:** Toggle **ETW-TI** / **ETW stop** (re-start after stop works). Start ETW **before** running cheats.
+
+**VM smoke:** Game inject + ETW-TI → `test\cheat_etwti.exe <game_pid>`  
+Expect clean lines only, e.g.:
+```
+!! WRITEVM_REMOTE   cheat_etwti → game | addr size=0x13
+!! PROTECTVM_REMOTE [X] cheat_etwti → game | addr size=0x1000 prot=0x40 was=0x4
+!  SUSPEND_THREAD / RESUME_THREAD cheat_etwti → game
+```
 
 ## Detection Capabilities
 
@@ -72,7 +101,7 @@ An educational anti-cheat system demonstrating Windows kernel programming, proce
 | 9 | **Manual-Map / VAD** | Kernel `ZwQueryVirtualMemory` walk — executable private regions |
 | 10 | **Overlay Detection** | `EnumWindows` for layered / transparent / topmost+near-fullscreen windows |
 | 11 | **System Integrity** | Test-signing, HVCI, CPU vendor/hypervisor detection |
-| 12 | **ETW Threat Intelligence** | PPL consumer for remote ALLOCVM/PROTECTVM/MAPVIEW/QUEUEAPC/SETTHREADCONTEXT/READVM/WRITEVM |
+| 12 | **ETW Threat Intelligence** | PPL + **TDH** property parse; UI shows **external→game** only (WRITE/PROTECT/SUSPEND…); drops game→game MinHook noise and system callers |
 | 13 | **File Self-Defense** | Minifilter reports **and denies** write/delete/rename on AC artifacts under `\peregrine\` |
 | 14 | **HWID Collection** | Hybrid kernel+userland fingerprinting |
 | 15 | **YARA Memory Scanning** | yara-x over process address space (`rules.yar`) |
@@ -177,6 +206,7 @@ Purpose-built tools in `test/`:
 | `cheat_manualmap.exe <PID>` | Private exec ± PE header | VAD |
 | `cheat_yara.exe <PID>` | Marker strings / blob | YARA |
 | `cheat_callstack.exe <PID>` | OpenProcess from private RWX | Callstack anomaly |
+| `cheat_etwti.exe <PID>` | Alloc/WPM/RPM/ProtectEx + Suspend/Resume remote | **ETW-TI** (start ETW before running) |
 | `CheatEngine.exe` | Exists | Blacklist |
 
 Start `game.exe` first — it prints PID and a health address.

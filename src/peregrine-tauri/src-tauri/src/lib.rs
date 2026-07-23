@@ -134,11 +134,13 @@ fn clear_injection_targets() -> Result<String, String> {
 
 #[tauri::command]
 fn start_etw_ti(app: tauri::AppHandle) -> Result<String, String> {
+    if etw_ti::is_running() {
+        return Ok("ETW-TI already running".into());
+    }
     let my_pid = std::process::id();
     DriverHandle::open()?.set_ppl(my_pid)?;
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let rx = etw_ti::start_etw_session(stop).map_err(|e| format!("ETW-TI: {e}"))?;
+    let rx = etw_ti::start_etw_session().map_err(|e| format!("ETW-TI: {e}"))?;
 
     std::thread::spawn(move || {
         while let Ok(ev) = rx.recv() {
@@ -147,6 +149,12 @@ fn start_etw_ti(app: tauri::AppHandle) -> Result<String, String> {
     });
 
     Ok(format!("ETW-TI started (PID {} set to PPL)", my_pid))
+}
+
+#[tauri::command]
+fn stop_etw_ti() -> Result<String, String> {
+    etw_ti::stop_etw_session().map_err(|e| format!("ETW-TI: {e}"))?;
+    Ok("ETW-TI stopped".into())
 }
 
 #[tauri::command]
@@ -281,6 +289,7 @@ pub fn run() {
             add_sensor_injection_target,
             clear_injection_targets,
             start_etw_ti,
+            stop_etw_ti,
             check_modules,
             check_iat,
             check_eat,
