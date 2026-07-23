@@ -155,9 +155,21 @@
     try {
       const res: any[] = await invoke("check_modules", { pid });
       for (const r of res) {
+        const selfHooks = r.self_hooks === true;
         const tag = r.matched === true ? "ok" : r.matched === false ? "tamper" : "info";
-        const label = r.matched === true ? "ok" : r.matched === false ? "tamper" : "?";
-        addLog(`[${label}] ${r.path} matched=${r.matched} ${r.mem_sha256?.slice(0,8) ?? ""} ${r.error ?? ""}`, tag);
+        const label =
+          r.matched === true
+            ? selfHooks
+              ? "ok self-hooks"
+              : "ok"
+            : r.matched === false
+              ? "tamper"
+              : "?";
+        const note = selfHooks ? " (MinHook excluded)" : "";
+        addLog(
+          `[${label}] ${r.path} matched=${r.matched}${note} ${r.mem_sha256?.slice(0, 8) ?? ""} ${r.error ?? ""}`,
+          tag,
+        );
       }
       addLog(`[Module Check] Done. ${res.length} modules checked`, "info");
     } catch (e: any) { addLog(`module check failed: ${e}`, "err"); }

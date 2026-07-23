@@ -12,9 +12,50 @@ pub struct ModuleCheck {
     pub section_size: Option<usize>,
     pub mem_sha256: Option<String>,
     pub disk_sha256: Option<String>,
+    /// Full .text match after reloc zeroing (and optional self-hook mask).
     pub matched: Option<bool>,
+    /// true = only differed at PeregrineDLL MinHook sites (not real tamper).
+    pub self_hooks: Option<bool>,
     pub error: Option<String>,
 }
+
+/// Exports that PeregrineDLL hooks via MinHook (dllmain.cpp InstallHook list).
+/// Module basename is compared case-insensitively.
+const SELF_HOOKED_EXPORTS: &[(&str, &[&str])] = &[
+    (
+        "ntdll.dll",
+        &[
+            "NtReadVirtualMemory",
+            "NtWriteVirtualMemory",
+            "NtSetContextThread",
+        ],
+    ),
+    (
+        "kernelbase.dll",
+        &[
+            "ReadProcessMemory",
+            "WriteProcessMemory",
+            "VirtualAllocEx",
+            "VirtualProtectEx",
+            "CreateRemoteThread",
+            "OpenProcess",
+        ],
+    ),
+    (
+        "kernel32.dll",
+        &[
+            "ReadProcessMemory",
+            "WriteProcessMemory",
+            "VirtualAllocEx",
+            "VirtualProtectEx",
+            "CreateRemoteThread",
+            "OpenProcess",
+        ],
+    ),
+];
+
+/// Bytes of prologue MinHook may overwrite (x64 absolute jump is ≤14).
+const HOOK_MASK_BYTES: usize = 16;
 
 struct TextInfo {
     text_rva: u32,
@@ -164,10 +205,157 @@ fn zero_relocs(data: &mut [u8], offsets: &[(usize, usize)]) {
     }
 }
 
+fn zero_range(data: &mut [u8], off: usize, len: usize) {
+    for k in 0..len {
+        if off + k < data.len() {
+            data[off + k] = 0;
+        }
+    }
+}
+
 fn sha256_hex(data: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(data);
     format!("{:x}", h.finalize())
+}
+
+fn module_basename(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path)
+        .to_ascii_lowercase()
+}
+
+fn self_hook_names_for(path: &str) -> Option<&'static [&'static str]> {
+    let base = module_basename(path);
+    SELF_HOOKED_EXPORTS
+        .iter()
+        .find(|(name, _)| base.eq_ignore_ascii_case(name))
+        .map(|(_, exports)| *exports)
+}
+
+/// Resolve named export RVAs from an on-disk PE image.
+fn export_rvas(file: &[u8], names: &[&str]) -> Vec<u32> {
+    if names.is_empty() || file.len() < 0x40 {
+        return Vec::new();
+    }
+    let magic = u16::from_le_bytes([file[0], file[1]]);
+    if magic != IMAGE_DOS_SIGNATURE {
+        return Vec::new();
+    }
+    let lfanew = u32::from_le_bytes(file[0x3C..0x40].try_into().unwrap_or([0; 4])) as usize;
+    if lfanew + 24 > file.len() {
+        return Vec::new();
+    }
+    let sig = u32::from_le_bytes(file[lfanew..lfanew + 4].try_into().unwrap_or([0; 4]));
+    if sig != IMAGE_NT_SIGNATURE {
+        return Vec::new();
+    }
+    let machine = u16::from_le_bytes(file[lfanew + 4..lfanew + 6].try_into().unwrap_or([0; 2]));
+    let is64 = machine == IMAGE_FILE_MACHINE_AMD64;
+    let num_sec = u16::from_le_bytes(file[lfanew + 6..lfanew + 8].try_into().unwrap_or([0; 2]));
+    let opt_hdr_size =
+        u16::from_le_bytes(file[lfanew + 20..lfanew + 22].try_into().unwrap_or([0; 2])) as usize;
+    let opt_off = lfanew + 24;
+    let sec_off = opt_off + opt_hdr_size;
+
+    let dd0 = if is64 { opt_off + 112 } else { opt_off + 96 };
+    if dd0 + 8 > file.len() {
+        return Vec::new();
+    }
+    let exp_rva = u32::from_le_bytes(file[dd0..dd0 + 4].try_into().unwrap_or([0; 4]));
+    if exp_rva == 0 {
+        return Vec::new();
+    }
+    let Some(exp_raw) = rva_to_raw(file, sec_off, num_sec, exp_rva) else {
+        return Vec::new();
+    };
+    if exp_raw + 40 > file.len() {
+        return Vec::new();
+    }
+    let n_names =
+        u32::from_le_bytes(file[exp_raw + 24..exp_raw + 28].try_into().unwrap_or([0; 4])) as usize;
+    let fn_rva = u32::from_le_bytes(file[exp_raw + 28..exp_raw + 32].try_into().unwrap_or([0; 4]));
+    let name_rva =
+        u32::from_le_bytes(file[exp_raw + 32..exp_raw + 36].try_into().unwrap_or([0; 4]));
+    let ord_rva =
+        u32::from_le_bytes(file[exp_raw + 36..exp_raw + 40].try_into().unwrap_or([0; 4]));
+
+    let Some(names_raw) = rva_to_raw(file, sec_off, num_sec, name_rva) else {
+        return Vec::new();
+    };
+    let Some(ords_raw) = rva_to_raw(file, sec_off, num_sec, ord_rva) else {
+        return Vec::new();
+    };
+    let Some(funcs_raw) = rva_to_raw(file, sec_off, num_sec, fn_rva) else {
+        return Vec::new();
+    };
+
+    let want: Vec<&str> = names.to_vec();
+    let mut found = Vec::new();
+
+    for i in 0..n_names {
+        let no = names_raw + i * 4;
+        if no + 4 > file.len() {
+            break;
+        }
+        let nrva = u32::from_le_bytes(file[no..no + 4].try_into().unwrap_or([0; 4]));
+        let Some(nraw) = rva_to_raw(file, sec_off, num_sec, nrva) else {
+            continue;
+        };
+        let end = file[nraw..]
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(0)
+            .min(128);
+        let ename = std::str::from_utf8(&file[nraw..nraw + end]).unwrap_or("");
+        if !want.iter().any(|w| *w == ename) {
+            continue;
+        }
+        let oo = ords_raw + i * 2;
+        if oo + 2 > file.len() {
+            continue;
+        }
+        let ord = u16::from_le_bytes(file[oo..oo + 2].try_into().unwrap_or([0; 2])) as usize;
+        let fo = funcs_raw + ord * 4;
+        if fo + 4 > file.len() {
+            continue;
+        }
+        let rva = u32::from_le_bytes(file[fo..fo + 4].try_into().unwrap_or([0; 4]));
+        if rva != 0 {
+            found.push(rva);
+        }
+    }
+    found
+}
+
+/// Zero known MinHook prologues so self-hooks do not count as tamper.
+fn mask_self_hooks(
+    disk_data: &mut [u8],
+    mem_data: &mut [u8],
+    file: &[u8],
+    text_rva: u32,
+    path: &str,
+) -> usize {
+    let Some(names) = self_hook_names_for(path) else {
+        return 0;
+    };
+    let rvas = export_rvas(file, names);
+    let mut masked = 0usize;
+    for rva in rvas {
+        if rva < text_rva {
+            continue;
+        }
+        let off = (rva - text_rva) as usize;
+        if off >= disk_data.len() {
+            continue;
+        }
+        zero_range(disk_data, off, HOOK_MASK_BYTES);
+        zero_range(mem_data, off, HOOK_MASK_BYTES);
+        masked += 1;
+    }
+    masked
 }
 
 fn wow64_fixup(disk_path: &str, base: usize) -> String {
@@ -202,6 +390,7 @@ pub fn check_process_modules(pid: u32) -> Result<Vec<ModuleCheck>, String> {
             mem_sha256: None,
             disk_sha256: None,
             matched: None,
+            self_hooks: None,
             error: None,
         };
 
@@ -258,9 +447,38 @@ pub fn check_process_modules(pid: u32) -> Result<Vec<ModuleCheck>, String> {
 
         let dh = sha256_hex(&disk_data);
         let mh = sha256_hex(&mem_data);
-        entry.matched = Some(dh == mh);
-        entry.disk_sha256 = Some(dh);
-        entry.mem_sha256 = Some(mh);
+
+        if dh == mh {
+            entry.matched = Some(true);
+            entry.self_hooks = Some(false);
+            entry.disk_sha256 = Some(dh);
+            entry.mem_sha256 = Some(mh);
+        } else {
+            // PeregrineDLL MinHook patches ntdll/KernelBase prologues — exclude those
+            // sites so we only flag real third-party .text tampering.
+            let mut disk2 = disk_data.clone();
+            let mut mem2 = mem_data.clone();
+            let n = mask_self_hooks(
+                &mut disk2,
+                &mut mem2,
+                &file_bytes,
+                ti.text_rva,
+                &disk_path,
+            );
+            let dh2 = sha256_hex(&disk2);
+            let mh2 = sha256_hex(&mem2);
+            if n > 0 && dh2 == mh2 {
+                entry.matched = Some(true);
+                entry.self_hooks = Some(true);
+                entry.disk_sha256 = Some(dh2);
+                entry.mem_sha256 = Some(mh2);
+            } else {
+                entry.matched = Some(false);
+                entry.self_hooks = Some(false);
+                entry.disk_sha256 = Some(dh);
+                entry.mem_sha256 = Some(mh);
+            }
+        }
         entry.section = Some(".text".into());
         entry.section_size = Some(read_sz);
 

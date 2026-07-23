@@ -64,7 +64,7 @@ An educational anti-cheat system demonstrating Windows kernel programming, proce
 
 | # | Detection | Technique |
 |---|-----------|-----------|
-| 1 | **Module Integrity** | `.text` section SHA-256: disk vs memory, relocation-aware |
+| 1 | **Module Integrity** | `.text` section SHA-256: disk vs memory, relocation-aware; known PeregrineDLL MinHook sites excluded (logged as `ok self-hooks`) |
 | 2 | **IAT/EAT Hook Detection** | PE import/export table scanning for entries outside known modules |
 | 3 | **External Memory Access** | DLL hooks on RPM/WPM/NtRead/NtWrite/VirtualAllocEx/VirtualProtectEx/CreateRemoteThread/OpenProcess |
 | 3b | **Call Stack Validation** | `RtlCaptureStackBackTrace` on hooked APIs — flags callers in `MEM_PRIVATE` executable memory |
@@ -99,6 +99,8 @@ OpenEDR-style user-mode APC (no private shellcode):
 Approach adapted from [OpenEDR](https://github.com/ComodoSecurity/openedr) injectengine (`apcinjector` / `apcqueue`). No RX inject staging (path buffer is RW only).
 
 **VAD after inject:** A VAD scan on an injected game may still report a small private `EXECUTE_READWRITE` region. That is expected **MinHook trampoline** noise from `PeregrineDLL` (hooks need a short writable-exec stub), not the old inject shellcode page. The inject path itself no longer allocates executable staging.
+
+**Module integrity after inject:** `ntdll` / `KernelBase` (and optionally `kernel32`) often fail a naive disk-vs-memory `.text` hash because PeregrineDLL patches API prologues. The checker masks those known export sites (same list as `dllmain.cpp` hooks) and re-hashes; only residual diffs are reported as **tamper**. UI shows `[ok self-hooks] … (MinHook excluded)` when the only diffs were self-hooks.
 
 **IOCTL notes:** command `14` clears injection targets and disables injection (not just disable).
 
