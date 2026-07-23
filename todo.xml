@@ -1,236 +1,299 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Peregrine — Injection migration worklist
+  Peregrine — Game-centric detection worklist
 
-  Goal: Replace Peregrine kernel APC shellcode (LdrLoadDll) with the OpenEDR-style
-  approach: user-mode APC whose NormalRoutine is kernel32!LoadLibraryExW and
-  NormalContext is a wide path string (RW only, no private RX shellcode).
+  Product rule (non-negotiable):
+    Only surface events that are meaningfully about the protected game process.
+    No random system noise. No "any remote process" spam.
 
-  Reference (OpenEDR / ComodoSecurity/openedr):
-    edrav2/iprj/edrdrv/src/dllinj.cpp
-    edrav2/iprj/edrdrv/src/kernelinjectlib/injectengine/apcinjector.cpp
-    edrav2/iprj/edrdrv/src/kernelinjectlib/injectengine/apcqueue.cpp
-    edrav2/iprj/edrdrv/src/kernelinjectlib/injectengine/injector.cpp
-    edrav2/iprj/edrdrv/src/kernelinjectlib/kernelinjectlib.hpp
+  Relevant event classes:
+    EXTERNAL — action targets the game (target_pid ∈ protected game set)
+    INTERNAL — anomaly inside the game process (caller/process == game)
+               e.g. unbacked callstack, HWBP tamper, VAD private-exec, YARA, .text tamper
 
-  Policy:
-    - Directly copying / adapting OpenEDR injection mechanics is OK (educational project;
-      credit OpenEDR in comments / README where substantial code is ported).
-    - Keep Peregrine product semantics: inject only named targets, StateAddPid on success,
-      x64 + WoW64 paths, IOCTL config, VM-only verification.
-    - No hacks. Prefer a clean design over partial shellcode leftovers.
-    - Status: todo | in_progress | done | blocked
+  Irrelevant (drop / never log as AC hit):
+    - External ops to non-game PIDs
+    - Self-access on non-game processes
+    - Process-wide telemetry that is not game-scoped
+    - Hooks firing without a game target (unless inject/hello for configured targets)
+
+  Source of truth for "the game":
+    Kernel: StateIsPidProtected (set by add_pid and auto StateAddPid on inject success)
+    UI: protectedPids (must stay in sync)
+    DLL: today has NO protected set — only "not self" (must fix)
 
   Environments:
     DEV  = edit/build only
-    VM   = deploy .sys/DLL/GUI, load driver, run game + cheats — only place to mark done
+    VM   = deploy + verify only place to mark done
+    Status: todo | in_progress | done | blocked
 -->
 <todo>
-  <feature name="openedr-style-apc-injection" priority="high">
-    <title>Kernel DLL injection: migrate to OpenEDR LoadLibraryExW APC (no shellcode)</title>
+
+  <feature name="game-centric-event-policy" priority="critical">
+    <title>Game-only event policy (filter noise end-to-end)</title>
     <description>
-      OpenEDR queues a user-mode APC with:
-        NormalRoutine = kernel32!LoadLibraryExW
-        NormalContext = LPWSTR dll path in target (PAGE_READWRITE only)
-        SystemArgument1 = NULL (hFile)
-        SystemArgument2 = LOAD_IGNORE_CODE_AUTHZ_LEVEL | LOAD_LIBRARY_SEARCH_SYSTEM32
-      (or equivalent flags; verify on target Windows builds)
+      Enforce a single policy everywhere telemetry is produced or displayed:
 
-      Peregrine currently:
-        allocates shellcode + UNICODE_STRING + path
-        protects shellcode RX
-        NormalRoutine = shellcode calling ntdll!LdrLoadDll
-        leaves staging until process exit (VAD self-noise)
+        SHOW if:
+          (1) EXTERNAL: target_pid is a protected game PID
+              OR
+          (2) INTERNAL: event occurs in a protected game PID
+              (callstack anomaly, HWBP, image load noise rules, thread start outside modules, etc.)
 
-      Target end state:
-        same OpenEDR APC shape; no executable staging; free path buffer ASAP
-        (process exit minimum; better: after DLL mapped if safe)
-        retain target allowlist + auto StateAddPid + x86/x64 DLL paths
+        DROP otherwise.
+
+      Kernel ObCallback and ETW UI already approximate (1).
+      DLL IPC and UI handleIpcEvent currently use "not self" only — that is noise.
     </description>
 
-    <task id="1" status="done">
-      <title>Port / implement OpenEDR APC queue helpers</title>
+    <task id="1" status="todo">
+      <title>Document policy in README (short "Detection scope" section)</title>
       <description>
-        Adapt OpenEDR apcqueue (KeInitializeApc / KeInsertQueueApc / KernelRoutine frees KAPC,
-        RundownRoutine) into Peregrine style (C, existing pool tags, no C++ required unless we
-        choose to keep C).
-
-        Requirements:
-        - UserMode APC, OriginalApcEnvironment
-        - NormalRoutine = resolved LoadLibraryExW address (not shellcode)
-        - NormalContext = pointer to wide path in target process
-        - insert(SystemArgument1=NULL, SystemArgument2=flags)
-        - WoW64: PsWrapApcWow64Thread on context + routine before KeInitializeApc / insert
-          (mirror OpenEDR apcinjector doInject Wow64 branch)
-
-        License/credit: header comment pointing at OpenEDR injectengine sources is fine.
-      </description>
-      <files>
-        <file>src/PeregrineKernelComponent/PeregrineKernelComponent/ApcInjection.c</file>
-        <file>src/PeregrineKernelComponent/PeregrineKernelComponent/ApcInjection.h</file>
-        <!-- optional split if file grows: ApcQueue.c/h -->
-      </files>
-    </task>
-
-    <task id="2" status="done">
-      <title>Resolve LoadLibraryExW per target process (kernel32 map)</title>
-      <description>
-        OpenEDR tracks per-PID bases of ntdll/kernel32/user32 on LoadImageNotify, then
-        getProcAddress(kernel32, "LoadLibraryExW").
-
-        Minimum viable for Peregrine:
-        - On image load of kernel32.dll (native System32 vs SysWOW64), parse exports of
-          that image base in the attached/current process context and resolve LoadLibraryExW.
-        - Prefer per-PID resolution at inject time (ASLR-safe) over a single global cache,
-          or cache per pending PID once kernel32 is seen.
-
-        Can port OpenEDR petools getProcAddress logic, or reuse/extend Peregrine ParseExports
-        currently used for LdrLoadDll.
-
-        Trigger remains: kernel32 load + PID on pending injection list (keep AC target model).
+        State explicitly: Peregrine only cares about protected game PIDs (and AC self-defense).
+        External = against game; Internal = inside game. Other processes ignored for AC logs.
       </description>
     </task>
 
-    <task id="3" status="done">
-      <title>Replace DoInjectInContext: path-only alloc + LoadLibraryExW APC</title>
+    <task id="2" status="todo">
+      <title>UI: filter all IPC external events on protectedPids</title>
       <description>
-        Remove:
-        - g_ShellcodeX64 / g_ShellcodeX86 and patch offsets
-        - UNICODE_STRING build for LdrLoadDll
-        - ZwProtectVirtualMemory to PAGE_EXECUTE_READ for inject stub
+        File: src/peregrine-tauri/src/routes/+page.svelte — handleIpcEvent
 
-        New DoInject (or rewrite of DoInjectInContext):
-        1. Choose x64 vs x86 DLL path from g_Inj (existing)
-        2. ZwAllocateVirtualMemory(PAGE_READWRITE) sized for path + null only
-        3. Copy wide path into allocation
-        4. Resolve LoadLibraryExW (task 2)
-        5. Queue APC: NormalRoutine=LoadLibraryExW, Context=path, flags in SystemArg2
-        6. Optional: KeTestAlertThread(UserMode) — keep if still needed for reliable delivery
-        7. Track allocation for free (task 5)
-        8. On success: StateAddPid(ProcessId) (keep)
+        Today:
+          targetProtected / callerProtected are computed but unused for RPM/WPM/OpenProcess/etc.
+          Only !isSelf is checked → any remote target is logged.
 
-        DLL path note: OpenEDR often injects by filename under System32 search flags.
-        Peregrine uses full paths under C:\Peregrine\ — verify LoadLibraryExW flags:
-        - Prefer full path + flags that do not break loading from outside System32
-        - LOAD_LIBRARY_SEARCH_SYSTEM32 alone may be wrong for C:\Peregrine\*.dll
-        - Use full absolute path; set flags carefully (possibly 0, or
-          LOAD_WITH_ALTERED_SEARCH_PATH / documented safe flags for absolute paths).
-        Document chosen flags in code comments after VM verification.
+        Required:
+          - For external ops (OpenProcess, RPM/WPM, Virtual*Ex, CreateRemoteThread, …):
+              log only if targetPID is in protectedPids (coerce number; handle string PIDs)
+          - Optional: also allow if callerPID is game AND event is internal-class (usually N/A for those APIs)
+          - CallstackAnomaly / HWBP / VehTableTamper / DebugRegister*:
+              log only if callerPID (process hosting the DLL) is in protectedPids
+              (internal signals only make sense in the game after inject)
+          - hello: keep for inject targets (or only if pid becomes/is protected shortly after)
+          - Never log external ops to non-protected PIDs
+
+        Type note: IPC may send numbers; protectedPids is number[]. Use Number(target) consistently.
+      </description>
+      <acceptance>
+        With game protected and cheat against game: external IPC lines appear.
+        With DLL somehow observing open of notepad PID: no AC log line.
+      </acceptance>
+    </task>
+
+    <task id="3" status="todo">
+      <title>UI: audit driver-event and ETW paths for game scope</title>
+      <description>
+        Confirm / fix:
+        - ETW: already drops if target not in protectedPids — keep; ensure caller==target drop stays
+        - ob_callback: kernel already filters; UI may still show only dangerous — OK
+        - thread_create / image_load: only emitted for protected PIDs in kernel — OK
+        - file_access: AC self-defense, not game — keep as separate "AC defense" tag (allowed noise class)
+        - system_check / driver_scan / hwid: machine-level, not per-game — keep as ops/admin, not cheat hits
+          (optional: separate log filter tabs later; not required now)
+
+        Do not start logging process_create system-wide.
       </description>
     </task>
 
-    <task id="4" status="done">
-      <title>Wire notify path; remove dead LdrLoadDll ntdll export dependency for inject</title>
+    <task id="4" status="todo">
+      <title>DLL: optional protected-PID awareness (preferred over UI-only filter)</title>
       <description>
-        InjOnImageLoad:
-        - Keep pending match + kernel32 trigger
-        - Call new inject path instead of shellcode DoInjectInContext
-        - ntdll base caching only needed if still used elsewhere; if only for LdrLoadDll,
-          drop or narrow it
+        Goal: do not even send noisy IPC JSON for non-game targets (less pipe spam, less forge surface).
 
-        InjOnProcessCreate / InjOnProcessExit:
-        - Keep target matching, pending list, StateRemovePid, free staging
+        Design (pick one robust approach — no hacks):
+        A) Kernel IOCTL / shared section: list of protected PIDs readable by injected DLL
+        B) After hello, GUI writes protected set to DLL via named pipe command (DLL needs read path)
+        C) DLL only injected into game: then "internal" is always game; external from game is rare —
+           still filter target==self for internal-only tools; for external from another injected
+           process you still need A/B
 
-        InjOnThreadCreate:
-        - Still stub unless we later port OpenEDR first-thread / retry logic (optional follow-up)
+        Recommended for AC:
+        - Primary inject = game only → internal events always game-scoped
+        - External detection relies on ObCallback + ETW (already game-scoped) more than on
+          cheat-process injection
+        - If we inject into cheats later, require protected-PID list in DLL before logging external
 
-        Process filter (optional, recommended):
-        - Skip PP/PPL processes like OpenEDR isAllowDllInjection — if inject would fail or
-          is undesirable.
+        Minimum for this task if inject-only-into-game:
+        - Document that external-against-game is ObCallback/ETW primary
+        - DLL internal events (callstack/HWBP) always imply current process is game after inject
+        - UI still filters IPC external with protectedPids (task 2) as safety net
+
+        If implementing A/B: log external only when targetPID ∈ protected set inside dllmain hooks.
       </description>
     </task>
 
-    <task id="5" status="done">
-      <title>Memory free: path buffer only, sooner if safe</title>
+    <task id="5" status="todo">
+      <title>RPM/WPM hooks: do not log every remote; require game target</title>
       <description>
-        OpenEDR frees user path memory on process terminate (and has freelist on thread exit).
+        dllmain.cpp currently logs all NtR/NtW/RPM/WPM with targetPID without checking game set.
+        After task 2/4: either UI drops non-game, or DLL never sends.
 
-        Peregrine:
-        - Reuse/simplify PendingFree* for path-only allocations (no RX region)
-        - Minimum: free on process exit (InjOnProcessExit) — already have pattern
-        - Better: free after our DLL image maps — only if LoadLibraryExW has finished and
-          no longer needs the path buffer. OpenEDR intentionally delays free; if unsure,
-          free on exit only (still huge win vs RX shellcode page).
+        Also consider: self RPM inside game is usually not interesting — drop isSelf for AC log
+        (keep callstack_check if useful for internal shellcode calling RPM on self — rare).
 
-        Do not free while Ldr/LoadLibrary still holds a pointer to the path.
+        Double-report KernelBase+Nt*: if both fire for same op to game, dedupe or only hook ntdll
+        for R/W to cut noise (game-related still, just once).
+      </description>
+    </task>
+  </feature>
+
+  <feature name="ntdll-coverage-game-scoped" priority="high" depends-on="game-centric-event-policy">
+    <title>Expand ntdll hooks only for game-relevant external ops</title>
+    <description>
+      We already hook NtRead/WriteVirtualMemory + NtSetContextThread and KernelBase Open/Alloc/CRT.
+      Gap: NtOpenProcess / NtAllocateVirtualMemory / NtProtectVirtualMemory / NtCreateThreadEx
+      bypass KernelBase hooks.
+
+      Only add hooks that can be filtered to (target == game) or (internal in game).
+      Do not add broad "log every Nt*" noise.
+    </description>
+
+    <task id="10" status="todo">
+      <title>Add game-filterable ntdll hooks</title>
+      <description>
+        In PeregrineDLL dllmain (MinHook on ntdll):
+        - NtOpenProcess — log only if ClientId.UniqueProcess is protected game (needs PID set or UI filter)
+        - NtAllocateVirtualMemory — if ProcessHandle resolves to game PID and not self (or self+RX suspicious later)
+        - NtProtectVirtualMemory — same
+        - NtCreateThreadEx — same (remote into game)
+
+        Optional later (still game-scoped):
+        - NtOpenThread — only if thread's process is game
+        - NtQueueApcThread(Ex) — target thread in game
+        - NtMapViewOfSection — section mapped into game
+
+        Keep KernelBase hooks or drop duplicates once ntdll path is solid (prefer one layer for R/W already ntdll).
       </description>
     </task>
 
-    <task id="6" status="done">
-      <title>IOCTL / config surface stays compatible</title>
+    <task id="11" status="todo">
+      <title>Callstack_check only for game-scoped hook fires</title>
       <description>
-        Keep existing commands:
-        - set x64/x86 DLL path (8/9)
-        - add injection target (10)
-        - enable/disable (11)
-        - clear targets (14)
+        Rate limits (2/min on RPM) already drop signal. After game filter, fewer fires —
+        raise limits slightly for game-targeted ops only so real cheats still produce CallstackAnomaly.
+        Do not raise global limits for unfiltered traffic (there should be no unfiltered traffic).
+      </description>
+    </task>
+  </feature>
 
-        No userland API break required if paths remain full paths to PeregrineDLL_*.dll.
-        Update any comments in Coms.c / driver_comm.rs that mention shellcode or LdrLoadDll.
+  <feature name="test-suite-game-scope" priority="high" depends-on="game-centric-event-policy">
+    <title>Extend test/ tools so VM verification proves game-only filtering</title>
+    <description>
+      Existing cheats (cheat.exe, cheat_inject, shellcode, …) already take game PID — good for
+      positive tests (expect events when targeting game).
+
+      Missing: negative tests (ops against non-game must produce NO AC hit) and a short matrix
+      in README or test/README.
+    </description>
+
+    <task id="20" status="todo">
+      <title>Positive matrix (document + run on VM)</title>
+      <description>
+        With injection target = game.exe, connect GUI, let inject + auto-protect:
+
+        | Test | Expect |
+        |------|--------|
+        | cheat.exe &lt;game_pid&gt; &lt;addr&gt; | ObCallback and/or ETW and/or IPC external → game |
+        | cheat_inject / shellcode / manualmap / patch / yara / callstack / hwbp | existing detections, all game-scoped |
+        | Module check / VAD / threads on game PID | findings only for that PID |
+
+        Record which sensor fired (ObCallback vs IPC vs ETW) so we know primary path.
       </description>
     </task>
 
-    <task id="7" status="done">
-      <title>README + code comments: document OpenEDR-style injection</title>
+    <task id="21" status="todo">
+      <title>Negative test: external ops against non-game PID</title>
       <description>
-        Update README "Kernel APC DLL Injection" section:
-        - LoadLibraryExW APC, RW path only, no shellcode
-        - credit OpenEDR approach / sources
-        - note VM deploy / target allowlist / StateAddPid still apply
+        New tool e.g. test/cheat_noise.c (or flag on cheat.exe):
+        - OpenProcess + RPM against a benign PID (e.g. current process of another helper,
+          or notepad started for the test) — NOT the game
+        - Optionally also VirtualAllocEx remote on non-game
 
-        In ApcInjection.c header: short design note + reference URLs/paths to OpenEDR files.
+        Expect after filter work:
+        - NO [External …] IPC lines for that activity in AC log
+        - NO ETW-TI lines (target not protected)
+        - NO ob_callback for that target
+
+        Optional: start notepad, run noise cheat, confirm log stays clean while game remains protected.
       </description>
     </task>
 
-    <task id="8" status="done">
-      <title>VM verification matrix</title>
+    <task id="22" status="todo">
+      <title>Negative test: activity inside non-game process with no inject</title>
       <description>
-        DEV implementation complete (tasks 1–7). VM pass 2026-07-23:
-        game.exe → apc_inject ok, KernelBase/kernel32 order, PeregrineDLL_x64 image load,
-        IPC hello + HWBP init, process stays alive. (Full cheat matrix optional follow-up.)
-        Deploy matching sys + DLLs + GUI to C:\Peregrine\ on test VM only.
-
-        Cases:
-        1. x64 game.exe as injection target → apc_inject success, DLL hello over pipe
-        2. ObCallback / protect works without manual add_pid (StateAddPid still on success)
-        3. VAD scan on injected game: no private RX shellcode region from Peregrine
-        4. External cheat (cheat.exe) still detected via hooks/ETW/ObCallback as before
-        5. If x86 target exists: WoW64 path + PeregrineDLL_x86.dll
-        6. clear targets (IOCTL 14) → no inject on next launch
-        7. Wrong/missing DLL path → clean failure event, no BSOD
-        8. Process exit → no leak of pending free / protected PID list grows unbounded
-
-        Only after VM pass: mark feature tasks done.
+        Run a process that allocates RWX / calls OpenProcess on itself without being game or inject target.
+        Expect: no Peregrine AC cheat hits (no hello, no callstack from our DLL).
       </description>
     </task>
 
-    <task id="9" status="todo" optional="true">
-      <title>Optional follow-ups (not required for migration done)</title>
+    <task id="23" status="todo">
+      <title>Positive: internal-only in game still visible</title>
       <description>
-        - Port OpenEDR-style per-process image map (ntdll/kernel32/user32) more fully
-        - Authenticode check of inject DLL before queue (OpenEDR enableDllVerification)
-        - Second injector backend (IAT) — only if needed later
-        - First-thread / delayed inject retry if kernel32 path races
-        - Multi-DLL list like OpenEDR (Peregrine currently one path per arch)
+        After inject into game:
+        - cheat_callstack / cheat_hwbp targeting game must still show CallstackAnomaly / HWBP events
+        - These are INTERNAL (process == game); must not be dropped by "external target" filter
+        - UI rule: callerPID ∈ protectedPids for internal event types
+      </description>
+    </task>
+
+    <task id="24" status="todo">
+      <title>test/README.md or README Test Suite section: game-scope matrix</title>
+      <description>
+        Document positive/negative cases and how to run on VM.
+        Explicit pass criteria: zero AC log spam when noise cheat runs against non-game.
+      </description>
+    </task>
+
+    <task id="25" status="todo">
+      <title>build.bat: include new noise test binary</title>
+      <description>
+        Wire cheat_noise.exe (or equivalent) into test/build.bat.
+      </description>
+    </task>
+  </feature>
+
+  <feature name="optional-followups" priority="low">
+    <title>Later — only if still game-scoped</title>
+    <task id="30" status="todo" optional="true">
+      <title>Thread ObCallbacks report-only for handles to game threads</title>
+      <description>
+        Same filter: only when thread belongs to protected process. No system-wide thread noise.
+      </description>
+    </task>
+    <task id="31" status="todo" optional="true">
+      <title>Continuous scans only against protected PIDs</title>
+      <description>
+        Timer: integrity/VAD/threads/YARA for each pid in protected set — never full system walk for AC hits.
+      </description>
+    </task>
+    <task id="32" status="todo" optional="true">
+      <title>ObCallback strip (enforcement) after report path is clean</title>
+      <description>
+        Protect, not detection — only after game-scoped reporting is trusted.
       </description>
     </task>
   </feature>
 
   <workflow>
     <recommended_order>
-      1 → 2 → 3 → 4 → 5 → 6 → 7 → 8   (9 anytime later)
+      1 → 2 → 3 → 5 → 20 → 21 → 23 → 24 → 25 → 4 → 10 → 11 → 22 → 30…
     </recommended_order>
+    <rationale>
+      Filter first (UI + policy), then prove with negative/positive tests, then expand ntdll
+      hooks under the same filter. Do not add hooks before game-only filtering lands.
+    </rationale>
     <rules>
-      <rule>Copying OpenEDR injection mechanics is allowed; strip unused madCHook / IAT paths unless we explicitly want them.</rule>
-      <rule>Do not leave dual inject paths half-wired (shellcode + LoadLibraryExW) in production path — one primary path.</rule>
-      <rule>Full absolute DLL path under C:\Peregrine must keep working; re-verify LoadLibraryExW flags on VM.</rule>
-      <rule>Never load experimental .sys on the DEV machine that holds the repo; verify on the dedicated Windows VM.</rule>
-      <rule>No hacks: if LoadLibraryExW flags break non-System32 paths, fix flags/path design properly.</rule>
-      <rule>Mark done only after VM verification (task 8).</rule>
+      <rule>If an event cannot be attributed to a protected game PID (as target or host), it must not appear as a cheat/AC detection log line.</rule>
+      <rule>Machine-level ops (driver scan, system check, HWID, file self-defense) stay separate — never mixed into "cheat against game" semantics.</rule>
+      <rule>No hacks: prefer shared protected-PID source of truth over brittle string matching of process names in the DLL.</rule>
+      <rule>Expand tests whenever a new filter or hook is added; negative tests are mandatory for filter work.</rule>
+      <rule>Verify only on the dedicated Windows VM; mark done only after positive + negative cases pass.</rule>
     </rules>
     <build>
-      <item>DEV: rebuild PeregrineKernelComponent.sys</item>
-      <item>VM: sc stop, replace sys, sc start, elevated GUI, inject target = game.exe</item>
+      <item>DEV: rebuild DLL / GUI / test tools as needed</item>
+      <item>VM: deploy, inject game.exe, run positive cheats + noise against non-game, confirm log policy</item>
     </build>
   </workflow>
+
 </todo>
