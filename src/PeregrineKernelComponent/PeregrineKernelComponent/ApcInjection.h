@@ -1,6 +1,11 @@
 #pragma once
 #include <fltKernel.h>
 
+/*
+ * OpenEDR-style kernel APC DLL injection (LoadLibraryExW + RW path only).
+ * Implementation: ApcInjection.c — no shellcode / no LdrLoadDll stub.
+ */
+
 #define INJ_POOL_TAG    'jnIp'
 #define INJ_MAX_TARGETS 16
 #define INJ_MAX_PENDING 32

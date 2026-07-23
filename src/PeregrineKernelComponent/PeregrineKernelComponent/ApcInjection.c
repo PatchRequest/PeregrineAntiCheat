@@ -1,15 +1,40 @@
+/*
+ * Kernel APC DLL injection — OpenEDR-style LoadLibraryExW path
+ *
+ * Design (adapted from OpenEDR / ComodoSecurity/openedr injectengine):
+ *   edrav2/iprj/edrdrv/src/kernelinjectlib/injectengine/apcinjector.cpp
+ *   edrav2/iprj/edrdrv/src/kernelinjectlib/injectengine/apcqueue.cpp
+ *
+ * User-mode APC shape:
+ *   NormalRoutine  = KernelBase!LoadLibraryExW  (real code; see crash note below)
+ *   NormalContext  = LPWSTR full DLL path in target process (PAGE_READWRITE only)
+ *   SystemArgument1 = NULL  (hFile, reserved)
+ *   SystemArgument2 = dwFlags for LoadLibraryExW
+ *
+ * No private executable shellcode, no ntdll!LdrLoadDll stub, no ZwProtectVirtualMemory.
+ * Path buffer is freed on process exit (LoadLibraryExW may still hold the pointer
+ * during LoadImageNotify for our DLL — never free while load is in flight).
+ *
+ * Crash note (early kernel32 LoadImage + KeTestAlertThread):
+ *   kernel32!LoadLibraryExW is typically an IAT thunk (ff 25 …) whose slot is
+ *   unbound while kernel32 is still mapping. Forcing the APC with KeTestAlertThread
+ *   in LoadImageNotify jumps through a bad IAT → process death. OpenEDR does NOT
+ *   TestAlert; delivery happens at the loader's later NtTestAlert after static
+ *   imports are initialized. We also resolve the real export from KernelBase
+ *   (already initialized by the time kernel32 maps) instead of the kernel32 stub.
+ *
+ * LoadLibraryExW flags: 0. Peregrine uses absolute paths under C:\Peregrine\.
+ * OpenEDR often passes LOAD_IGNORE_CODE_AUTHZ_LEVEL | LOAD_LIBRARY_SEARCH_SYSTEM32
+ * for System32-relative names; SEARCH_SYSTEM32 would break non-System32 full paths.
+ *
+ * Product semantics kept: named targets, IOCTL path config, auto StateAddPid,
+ * x64 + WoW64 (PsWrapApcWow64Thread in KernelRoutine).
+ */
+
 #include "ApcInjection.h"
 #include "Coms.h"
 #include "AppState.h"
 #include <ntstrsafe.h>
-
-/* ZwProtectVirtualMemory is not always declared in KM headers */
-NTSYSAPI NTSTATUS NTAPI ZwProtectVirtualMemory(
-    _In_ HANDLE ProcessHandle,
-    _Inout_ PVOID* BaseAddress,
-    _Inout_ PSIZE_T RegionSize,
-    _In_ ULONG NewProtect,
-    _Out_ PULONG OldProtect);
 
 /* ------------------------------------------------------------------ */
 /*  Undocumented kernel API forward declarations                      */
@@ -50,53 +75,14 @@ NTKERNELAPI BOOLEAN KeInsertQueueApc(
     _Inout_ PRKAPC Apc, _In_opt_ PVOID SystemArgument1,
     _In_opt_ PVOID SystemArgument2, _In_ KPRIORITY Increment);
 
-NTKERNELAPI BOOLEAN  KeTestAlertThread(_In_ KPROCESSOR_MODE AlertMode);
 NTKERNELAPI NTSTATUS PsWrapApcWow64Thread(
     _Inout_ PVOID* ApcContext, _Inout_ PVOID* ApcRoutine);
 
-/* fltKernel.h provides KeStackAttachProcess, KeUnstackDetachProcess,
-   ZwAllocateVirtualMemory, PsLookupProcessByProcessId, etc. */
-
-/* ------------------------------------------------------------------ */
-/*  Shellcode: calls LdrLoadDll(NULL, NULL, &UnicodeString, &hMod)    */
-/*  NormalContext  = pointer to UNICODE_STRING in target process       */
-/*  LdrLoadDll address is patched into the shellcode at load time     */
-/* ------------------------------------------------------------------ */
-
-static const UCHAR g_ShellcodeX64[] = {
-    0x48, 0xB8,                                     /* mov rax, imm64       */
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* <LdrLoadDll addr>   */
-    0x48, 0x83, 0xEC, 0x28,                         /* sub rsp, 0x28        */
-    0x49, 0x89, 0xC8,                               /* mov r8,  rcx         */
-    0x4C, 0x8D, 0x4C, 0x24, 0x20,                   /* lea r9,  [rsp+0x20]  */
-    0x48, 0x31, 0xC9,                               /* xor rcx, rcx         */
-    0x48, 0x31, 0xD2,                               /* xor rdx, rdx         */
-    0xFF, 0xD0,                                     /* call rax             */
-    0x48, 0x83, 0xC4, 0x28,                         /* add rsp, 0x28        */
-    0xC3                                            /* ret                  */
-};
-#define SC64_SIZE  sizeof(g_ShellcodeX64)
-#define SC64_PATCH 2
-
-static const UCHAR g_ShellcodeX86[] = {
-    0xB8,                                           /* mov eax, imm32       */
-    0x00, 0x00, 0x00, 0x00,                         /* <LdrLoadDll addr>   */
-    0x8B, 0x4C, 0x24, 0x04,                         /* mov ecx, [esp+4]    */
-    0x6A, 0x00,                                     /* push 0   (hMod out) */
-    0x54,                                           /* push esp (&hMod)    */
-    0x51,                                           /* push ecx (UStr*)    */
-    0x6A, 0x00,                                     /* push 0   (Chars)    */
-    0x6A, 0x00,                                     /* push 0   (Path)     */
-    0xFF, 0xD0,                                     /* call eax            */
-    0x83, 0xC4, 0x04,                               /* add esp, 4          */
-    0xC3                                            /* ret                 */
-};
-#define SC86_SIZE  sizeof(g_ShellcodeX86)
-#define SC86_PATCH 1
-
-/* UNICODE_STRING sizes in the target process */
-#define USTR64_SIZE 16   /* Length(2)+Max(2)+pad(4)+Buffer(8) */
-#define USTR32_SIZE  8   /* Length(2)+Max(2)+Buffer(4)        */
+/*
+ * LoadLibraryExW dwFlags — absolute path under C:\Peregrine\.
+ * See file header for why this is not OpenEDR's SEARCH_SYSTEM32 combo.
+ */
+#define INJ_LOADLIBRARY_FLAGS  ((ULONG)0)
 
 /* ------------------------------------------------------------------ */
 /*  Global injection state                                            */
@@ -117,7 +103,7 @@ typedef struct _INJ_STATE {
     HANDLE Pending[INJ_MAX_PENDING];
     ULONG  PendingCount;
 
-    /* Allocations to free after LdrLoadDll / DLL image load */
+    /* Path-only user allocations to free on process exit */
     struct {
         HANDLE Pid;
         PVOID  Base;
@@ -141,7 +127,7 @@ static VOID PendingFreeAdd(HANDLE Pid, PVOID Base, SIZE_T Size)
     KeReleaseSpinLock(&g_Inj.Lock, irql);
 }
 
-/* Free inject staging memory once our DLL image is mapped (or on process exit). */
+/* Free inject path buffer on process exit. */
 static VOID PendingFreeRelease(_In_ HANDLE Pid, _In_ BOOLEAN AttachIfNeeded)
 {
     PVOID bases[INJ_MAX_PENDING];
@@ -191,12 +177,6 @@ static VOID PendingFreeRelease(_In_ HANDLE Pid, _In_ BOOLEAN AttachIfNeeded)
     }
 }
 
-/* Cached ntdll bases & LdrLoadDll addresses (set once per boot) */
-static volatile LONG_PTR g_NtdllBaseX64   = 0;
-static volatile LONG     g_NtdllBaseX86   = 0;
-static volatile LONG_PTR g_LdrLoadDllX64  = 0;
-static volatile LONG     g_LdrLoadDllX86  = 0;
-
 /* ------------------------------------------------------------------ */
 /*  Unicode helpers                                                   */
 /* ------------------------------------------------------------------ */
@@ -215,15 +195,6 @@ static BOOLEAN UStrEndsWith(_In_ PCUNICODE_STRING Str, _In_ PCWSTR Suffix)
         if (a != b) return FALSE;
     }
     return TRUE;
-}
-
-static BOOLEAN IsOurInjectedDllName(_In_ PUNICODE_STRING FullImageName)
-{
-    if (!FullImageName) return FALSE;
-    return UStrEndsWith(FullImageName, L"peregrinedll_x64.dll")
-        || UStrEndsWith(FullImageName, L"peregrinedll_x86.dll")
-        || UStrEndsWith(FullImageName, L"peregrine64.dll")
-        || UStrEndsWith(FullImageName, L"peregrine32.dll");
 }
 
 static BOOLEAN UStrContainsI(_In_ PCUNICODE_STRING Str, _In_ PCWSTR Sub)
@@ -303,9 +274,14 @@ static BOOLEAN MatchesAnyTarget(_In_ const CHAR* ImageName)
 /*  PE export-table parser (reads from user-space while attached)     */
 /* ------------------------------------------------------------------ */
 
-static ULONG_PTR ParseExports(_In_ PVOID ImageBase, _In_ BOOLEAN Is32)
+static ULONG_PTR ParseExport(
+    _In_ PVOID ImageBase,
+    _In_ BOOLEAN Is32,
+    _In_z_ const CHAR* ExportName)
 {
     ULONG_PTR result = 0;
+    if (!ImageBase || !ExportName) return 0;
+
     __try {
         PUCHAR base = (PUCHAR)ImageBase;
         if (*(PUSHORT)base != 0x5A4D) return 0;            /* MZ */
@@ -314,11 +290,14 @@ static ULONG_PTR ParseExports(_In_ PVOID ImageBase, _In_ BOOLEAN Is32)
         if (*(PULONG)(base + lfanew) != 0x00004550) return 0; /* PE\0\0 */
 
         PUCHAR opt = base + lfanew + 24;
-        ULONG  expRva;
-        if (Is32)
-            expRva = *(PULONG)(opt + 96);                   /* DataDir[0].VA */
-        else
-            expRva = *(PULONG)(opt + 112);
+        ULONG  expRva, expSize;
+        if (Is32) {
+            expRva  = *(PULONG)(opt + 96);                  /* DataDir[0] */
+            expSize = *(PULONG)(opt + 100);
+        } else {
+            expRva  = *(PULONG)(opt + 112);
+            expSize = *(PULONG)(opt + 116);
+        }
 
         if (expRva == 0) return 0;
 
@@ -333,8 +312,12 @@ static ULONG_PTR ParseExports(_In_ PVOID ImageBase, _In_ BOOLEAN Is32)
         PULONG  funcs    = (PULONG)(base + fnRva);
 
         for (ULONG i = 0; i < nNames; i++) {
-            if (strcmp((const CHAR*)(base + names[i]), "LdrLoadDll") == 0) {
-                result = (ULONG_PTR)base + funcs[ords[i]];
+            if (strcmp((const CHAR*)(base + names[i]), ExportName) == 0) {
+                ULONG rva = funcs[ords[i]];
+                /* Forwarded export (RVA inside export directory) — not callable. */
+                if (rva >= expRva && rva < expRva + expSize)
+                    return 0;
+                result = (ULONG_PTR)base + rva;
                 break;
             }
         }
@@ -345,7 +328,122 @@ static ULONG_PTR ParseExports(_In_ PVOID ImageBase, _In_ BOOLEAN Is32)
 }
 
 /* ------------------------------------------------------------------ */
-/*  APC callbacks                                                     */
+/*  PEB LDR walk — find a loaded module base in the current process   */
+/* ------------------------------------------------------------------ */
+
+static BOOLEAN UStrEqISuffix(_In_ PCUNICODE_STRING Name, _In_ PCWSTR Want)
+{
+    if (!Name || !Name->Buffer || !Want) return FALSE;
+    SIZE_T wLen = wcslen(Want);
+    SIZE_T nLen = Name->Length / sizeof(WCHAR);
+    if (nLen != wLen) return FALSE;
+    for (SIZE_T i = 0; i < wLen; i++) {
+        WCHAR a = Name->Buffer[i];
+        WCHAR b = Want[i];
+        if (a >= L'A' && a <= L'Z') a += 32;
+        if (b >= L'A' && b <= L'Z') b += 32;
+        if (a != b) return FALSE;
+    }
+    return TRUE;
+}
+
+/* x64 LDR_DATA_TABLE_ENTRY layout (stable for our fields). */
+#define LDR64_DLLBASE_OFF     0x30
+#define LDR64_BASENAME_OFF    0x58
+/* PEB.Ldr */
+#define PEB64_LDR_OFF         0x18
+#define LDR_INLOADORDER_OFF   0x10
+
+/* Wow64 PEB32 / LDR_DATA_TABLE_ENTRY32 */
+#define PEB32_LDR_OFF         0x0C
+#define LDR32_INLOADORDER_OFF 0x0C
+#define LDR32_DLLBASE_OFF     0x18
+#define LDR32_BASENAME_OFF    0x2C
+
+static PVOID FindModuleBaseByName(_In_ BOOLEAN IsWow64, _In_ PCWSTR BaseName)
+{
+    PVOID found = NULL;
+
+    __try {
+        if (!IsWow64) {
+            PPEB peb = PsGetProcessPeb(PsGetCurrentProcess());
+            if (!peb) return NULL;
+            PUCHAR pebB = (PUCHAR)peb;
+            PVOID ldr = *(PVOID*)(pebB + PEB64_LDR_OFF);
+            if (!ldr) return NULL;
+            PLIST_ENTRY head = (PLIST_ENTRY)((PUCHAR)ldr + LDR_INLOADORDER_OFF);
+            for (PLIST_ENTRY e = head->Flink; e != head; e = e->Flink) {
+                PUCHAR ent = (PUCHAR)e;
+                UNICODE_STRING name = *(PUNICODE_STRING)(ent + LDR64_BASENAME_OFF);
+                if (UStrEqISuffix(&name, BaseName)) {
+                    found = *(PVOID*)(ent + LDR64_DLLBASE_OFF);
+                    break;
+                }
+            }
+        } else {
+            /* PEB32 in Wow64 process */
+            PUCHAR peb32 = (PUCHAR)PsGetProcessWow64Process(PsGetCurrentProcess());
+            if (!peb32) return NULL;
+            ULONG ldr32 = *(PULONG)(peb32 + PEB32_LDR_OFF);
+            if (!ldr32) return NULL;
+            ULONG head = ldr32 + LDR32_INLOADORDER_OFF;
+            ULONG flink = *(PULONG)(ULONG_PTR)head;
+            ULONG start = flink;
+            ULONG guard = 0;
+            while (flink && flink != head && guard++ < 512) {
+                PUCHAR ent = (PUCHAR)(ULONG_PTR)flink;
+                USHORT len = *(PUSHORT)(ent + LDR32_BASENAME_OFF);
+                USHORT max = *(PUSHORT)(ent + LDR32_BASENAME_OFF + 2);
+                ULONG buf32 = *(PULONG)(ent + LDR32_BASENAME_OFF + 4);
+                UNREFERENCED_PARAMETER(max);
+                if (buf32 && len) {
+                    UNICODE_STRING name;
+                    name.Length = len;
+                    name.MaximumLength = len;
+                    name.Buffer = (PWCH)(ULONG_PTR)buf32;
+                    if (UStrEqISuffix(&name, BaseName)) {
+                        found = (PVOID)(ULONG_PTR)*(PULONG)(ent + LDR32_DLLBASE_OFF);
+                        break;
+                    }
+                }
+                flink = *(PULONG)(ULONG_PTR)flink; /* InLoadOrderLinks.Flink */
+                if (flink == start) break;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        found = NULL;
+    }
+    return found;
+}
+
+/*
+ * Prefer KernelBase!LoadLibraryExW (real body, initialized before kernel32).
+ * Fall back to kernel32 export only if KernelBase is missing (legacy).
+ */
+static ULONG_PTR ResolveLoadLibraryExW(
+    _In_ BOOLEAN IsWow64,
+    _In_opt_ PVOID Kernel32Base)
+{
+    PVOID kbase = FindModuleBaseByName(IsWow64, L"kernelbase.dll");
+    if (kbase) {
+        ULONG_PTR p = ParseExport(kbase, IsWow64, "LoadLibraryExW");
+        if (p) return p;
+    }
+
+    if (Kernel32Base) {
+        ULONG_PTR p = ParseExport(Kernel32Base, IsWow64, "LoadLibraryExW");
+        if (p) return p;
+    }
+
+    PVOID k32 = FindModuleBaseByName(IsWow64, L"kernel32.dll");
+    if (k32)
+        return ParseExport(k32, IsWow64, "LoadLibraryExW");
+
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  APC callbacks (OpenEDR apcqueue pattern, C / pool-tag style)      */
 /* ------------------------------------------------------------------ */
 
 static VOID NTAPI KernelRoutineCb(
@@ -353,18 +451,10 @@ static VOID NTAPI KernelRoutineCb(
     PVOID* NormalContext, PVOID* Sys1, PVOID* Sys2)
 {
     UNREFERENCED_PARAMETER(Sys1); UNREFERENCED_PARAMETER(Sys2);
+    /* WoW64: convert routine + context for the 32-bit APC dispatcher.
+       Mirrors OpenEDR wrapApcWow64Thread before delivery. */
     if (PsGetProcessWow64Process(PsGetCurrentProcess()) != NULL)
         PsWrapApcWow64Thread(NormalContext, (PVOID*)NormalRoutine);
-    ExFreePoolWithTag(Apc, INJ_POOL_TAG);
-}
-
-static VOID NTAPI AlertRoutineCb(
-    PRKAPC Apc, PKNORMAL_ROUTINE* NormalRoutine,
-    PVOID* NormalContext, PVOID* Sys1, PVOID* Sys2)
-{
-    UNREFERENCED_PARAMETER(NormalRoutine); UNREFERENCED_PARAMETER(NormalContext);
-    UNREFERENCED_PARAMETER(Sys1); UNREFERENCED_PARAMETER(Sys2);
-    KeTestAlertThread(UserMode);
     ExFreePoolWithTag(Apc, INJ_POOL_TAG);
 }
 
@@ -374,17 +464,21 @@ static VOID NTAPI RundownCb(PRKAPC Apc)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Core injection logic — runs in the target process context         */
-/*  (called from image load callback when kernel32.dll loads)         */
+/*  Core injection — runs in target process context (loader thread)   */
 /* ------------------------------------------------------------------ */
 
-static NTSTATUS DoInjectInContext(_In_ BOOLEAN IsWow64)
+static NTSTATUS DoInjectInContext(
+    _In_ BOOLEAN IsWow64,
+    _In_ PVOID Kernel32Base)
 {
     NTSTATUS status;
     PVOID    alloc = NULL;
     SIZE_T   allocSz = 0;
 
-    /* Pick DLL path */
+    if (!Kernel32Base)
+        return STATUS_INVALID_PARAMETER;
+
+    /* Pick DLL path for this architecture */
     KIRQL irql;
     WCHAR  dllPath[INJ_MAX_PATH];
     USHORT dllBytes;
@@ -400,88 +494,30 @@ static NTSTATUS DoInjectInContext(_In_ BOOLEAN IsWow64)
 
     if (dllBytes == 0) return STATUS_NOT_FOUND;
 
-    /* Resolve LdrLoadDll — we're already in the target address space,
-       ntdll is mapped and its exports are readable. */
-    ULONG_PTR ldrAddr;
-    if (IsWow64) {
-        ldrAddr = (ULONG_PTR)InterlockedCompareExchange(&g_LdrLoadDllX86, 0, 0);
-        if (ldrAddr == 0 && g_NtdllBaseX86 != 0) {
-            ldrAddr = ParseExports((PVOID)(ULONG_PTR)g_NtdllBaseX86, TRUE);
-            if (ldrAddr) InterlockedExchange(&g_LdrLoadDllX86, (LONG)ldrAddr);
-        }
-    } else {
-        ldrAddr = (ULONG_PTR)InterlockedCompareExchangePointer(
-            (PVOID*)&g_LdrLoadDllX64, NULL, NULL);
-        if (ldrAddr == 0 && g_NtdllBaseX64 != 0) {
-            ldrAddr = ParseExports((PVOID)g_NtdllBaseX64, FALSE);
-            if (ldrAddr) InterlockedExchangePointer(
-                (PVOID*)&g_LdrLoadDllX64, (PVOID)ldrAddr);
-        }
-    }
-    if (ldrAddr == 0) return STATUS_PROCEDURE_NOT_FOUND;
+    /* KernelBase real export — not the unbound kernel32 IAT stub. */
+    ULONG_PTR loadLib = ResolveLoadLibraryExW(IsWow64, Kernel32Base);
+    if (loadLib == 0)
+        return STATUS_PROCEDURE_NOT_FOUND;
 
-    /* Compute sizes */
-    const UCHAR* sc;
-    ULONG scSz, patch, ustrSz;
-    if (IsWow64) {
-        sc = g_ShellcodeX86; scSz = SC86_SIZE;
-        patch = SC86_PATCH; ustrSz = USTR32_SIZE;
-    } else {
-        sc = g_ShellcodeX64; scSz = SC64_SIZE;
-        patch = SC64_PATCH; ustrSz = USTR64_SIZE;
-    }
-
-    ULONG total = scSz + ustrSz + dllBytes + sizeof(WCHAR);
-    allocSz = total;
-
-    /* Allocate RW first — never leave long-lived PAGE_EXECUTE_READWRITE. */
+    /* Path + NUL only — PAGE_READWRITE, never executable. */
+    allocSz = (SIZE_T)dllBytes + sizeof(WCHAR);
     status = ZwAllocateVirtualMemory(ZwCurrentProcess(), &alloc, 0,
         &allocSz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!NT_SUCCESS(status)) return status;
 
-    PUCHAR dst = (PUCHAR)alloc;
-
-    /* Write shellcode with patched LdrLoadDll address */
-    RtlCopyMemory(dst, sc, scSz);
-    if (IsWow64)
-        *(PULONG)(dst + patch)     = (ULONG)ldrAddr;
-    else
-        *(PULONG_PTR)(dst + patch) = ldrAddr;
-
-    /* Build UNICODE_STRING after shellcode */
-    PUCHAR ustrA = dst + scSz;
-    PUCHAR pathA = ustrA + ustrSz;
-
-    RtlCopyMemory(pathA, dllPath, dllBytes);
-    *(PWCHAR)(pathA + dllBytes) = L'\0';
-
-    if (IsWow64) {
-        *(PUSHORT)(ustrA + 0) = dllBytes;
-        *(PUSHORT)(ustrA + 2) = dllBytes + (USHORT)sizeof(WCHAR);
-        *(PULONG) (ustrA + 4) = (ULONG)(ULONG_PTR)pathA;
-    } else {
-        *(PUSHORT)  (ustrA + 0) = dllBytes;
-        *(PUSHORT)  (ustrA + 2) = dllBytes + (USHORT)sizeof(WCHAR);
-        *(PULONG)   (ustrA + 4) = 0;
-        *(PULONG_PTR)(ustrA + 8) = (ULONG_PTR)pathA;
+    __try {
+        RtlCopyMemory(alloc, dllPath, dllBytes);
+        *(PWCHAR)((PUCHAR)alloc + dllBytes) = L'\0';
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        SIZE_T freeSz = 0;
+        ZwFreeVirtualMemory(ZwCurrentProcess(), &alloc, &freeSz, MEM_RELEASE);
+        return GetExceptionCode();
     }
 
-    /* Shellcode + path must stay readable; path does not need execute. */
-    {
-        PVOID protBase = alloc;
-        SIZE_T protSize = scSz;
-        ULONG oldProt = 0;
-        status = ZwProtectVirtualMemory(ZwCurrentProcess(), &protBase, &protSize,
-            PAGE_EXECUTE_READ, &oldProt);
-        if (!NT_SUCCESS(status)) {
-            SIZE_T freeSz = 0;
-            ZwFreeVirtualMemory(ZwCurrentProcess(), &alloc, &freeSz, MEM_RELEASE);
-            return status;
-        }
-        /* Rest of region (UNICODE_STRING + path) remains PAGE_READWRITE from alloc. */
-    }
-
-    /* Queue user-mode APC to current thread (the loader thread) */
+    /* Queue user-mode APC: NormalRoutine = LoadLibraryExW, Context = path.
+       Do NOT KeTestAlertThread here — that forces delivery while kernel32 is
+       still mid-map (IAT unbound). OpenEDR also only queues; the loader's
+       NtTestAlert after static init delivers the APC safely. */
     PRKTHREAD curThread = (PRKTHREAD)PsGetCurrentThread();
 
     PRKAPC execApc = (PRKAPC)ExAllocatePool2(
@@ -494,9 +530,10 @@ static NTSTATUS DoInjectInContext(_In_ BOOLEAN IsWow64)
 
     KeInitializeApc(execApc, curThread, OriginalApcEnvironment,
         (PKKERNEL_ROUTINE)KernelRoutineCb, (PKRUNDOWN_ROUTINE)RundownCb,
-        (PKNORMAL_ROUTINE)alloc, UserMode, ustrA);
+        (PKNORMAL_ROUTINE)loadLib, UserMode, alloc);
 
-    if (!KeInsertQueueApc(execApc, NULL, NULL, 0)) {
+    if (!KeInsertQueueApc(execApc, NULL,
+            (PVOID)(ULONG_PTR)INJ_LOADLIBRARY_FLAGS, 0)) {
         ExFreePoolWithTag(execApc, INJ_POOL_TAG);
         {
             SIZE_T freeSz = 0;
@@ -505,11 +542,6 @@ static NTSTATUS DoInjectInContext(_In_ BOOLEAN IsWow64)
         return STATUS_UNSUCCESSFUL;
     }
 
-    /* Force APC delivery on next kernel-to-user transition.
-       We're in the loader thread context so this is safe. */
-    KeTestAlertThread(UserMode);
-
-    /* Free staging memory after our DLL maps (see InjOnImageLoad). */
     PendingFreeAdd(PsGetCurrentProcessId(), alloc, allocSz);
 
     return STATUS_SUCCESS;
@@ -601,28 +633,8 @@ VOID InjOnImageLoad(HANDLE ProcessId, PUNICODE_STRING FullImageName,
     if (!FullImageName || !ImageInfo || !ImageInfo->ImageBase) return;
     if ((ULONG_PTR)ProcessId == 0) return;
 
-    /* Always capture ntdll bases (needed for LdrLoadDll resolution) */
-    if (UStrEndsWith(FullImageName, L"ntdll.dll")) {
-        if (UStrContainsI(FullImageName, L"syswow64")) {
-            if (g_NtdllBaseX86 == 0)
-                InterlockedExchange(&g_NtdllBaseX86,
-                    (LONG)(ULONG)(ULONG_PTR)ImageInfo->ImageBase);
-        } else {
-            if (g_NtdllBaseX64 == 0)
-                InterlockedExchangePointer(
-                    (PVOID*)&g_NtdllBaseX64, ImageInfo->ImageBase);
-        }
-        return;
-    }
-
-    /* Do NOT free the inject staging buffer when our DLL image maps.
-       LoadImageNotify runs inside LdrLoadDll while it still uses the
-       UNICODE_STRING / path in that allocation — freeing here kills the process.
-       Buffer is PAGE_EXECUTE_READ (not RWX); freed on process exit only. */
-
-    /* Trigger injection when kernel32.dll loads in a pending process.
-       At this point the loader is initialized and LdrLoadDll works.
-       The callback runs in the target process's loader thread context. */
+    /* Trigger when kernel32 maps in a pending target. KernelBase is already
+       initialized by then; APC is delivered later (no KeTestAlertThread). */
     if (!UStrEndsWith(FullImageName, L"kernel32.dll")) return;
 
     BOOLEAN isPending = PendingRemove(ProcessId);
@@ -630,7 +642,7 @@ VOID InjOnImageLoad(HANDLE ProcessId, PUNICODE_STRING FullImageName,
 
     BOOLEAN isWow64 = UStrContainsI(FullImageName, L"syswow64");
 
-    NTSTATUS st = DoInjectInContext(isWow64);
+    NTSTATUS st = DoInjectInContext(isWow64, ImageInfo->ImageBase);
 
     CHAR json[COMS_MAX_MESSAGE_SIZE];
     ULONG tid = (ULONG)(ULONG_PTR)PsGetCurrentThreadId();
@@ -648,7 +660,7 @@ VOID InjOnImageLoad(HANDLE ProcessId, PUNICODE_STRING FullImageName,
             (ULONG)(ULONG_PTR)ProcessId, tid, st);
     }
     ComsSendToUser(json, (ULONG)strlen(json));
-    KdPrint(("Peregrine: APC inject (kernel32 load) PID=%lu => 0x%08X\n",
+    KdPrint(("Peregrine: APC inject (LoadLibraryExW) PID=%lu => 0x%08X\n",
         (ULONG)(ULONG_PTR)ProcessId, st));
 }
 

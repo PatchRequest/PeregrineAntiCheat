@@ -84,11 +84,21 @@ An educational anti-cheat system demonstrating Windows kernel programming, proce
 
 ## Kernel APC DLL Injection
 
+OpenEDR-style user-mode APC (no private shellcode):
+
 1. GUI sets DLL paths (`PeregrineDLL_x64.dll` / `PeregrineDLL_x86.dll`) and target names via IOCTL  
-2. Driver matches on process create, injects when `kernel32.dll` loads  
-3. Staging memory is **RW → RX** (not long-lived RWX); freed on process exit  
-4. On inject **success**, kernel calls `StateAddPid` so ObCallback / thread / image notifies apply immediately  
-5. x64 + x86 WoW64 (`PsWrapApcWow64Thread`)
+2. Driver matches on process create; when `kernel32.dll` maps, queues a user APC with:
+   - `NormalRoutine` = `KernelBase!LoadLibraryExW` (real export — not the `kernel32` IAT thunk, which is unbound mid-map)
+   - `NormalContext` = full wide path in target VA (`PAGE_READWRITE` only)
+   - `SystemArgument1` = `NULL`, `SystemArgument2` = load flags (`0` for absolute paths under `C:\Peregrine\`)
+3. **No `KeTestAlertThread`** — APC is delivered by the loader’s later `NtTestAlert` after static imports are initialized (forcing delivery in `LoadImageNotify` crashes the process)
+4. Path buffer is freed on process exit (never freed mid-load)  
+5. On inject **success**, kernel calls `StateAddPid` so ObCallback / thread / image notifies apply immediately  
+6. x64 + x86 WoW64 (`PsWrapApcWow64Thread` in the APC kernel routine)
+
+Approach adapted from [OpenEDR](https://github.com/ComodoSecurity/openedr) injectengine (`apcinjector` / `apcqueue`). No RX inject staging (path buffer is RW only).
+
+**VAD after inject:** A VAD scan on an injected game may still report a small private `EXECUTE_READWRITE` region. That is expected **MinHook trampoline** noise from `PeregrineDLL` (hooks need a short writable-exec stub), not the old inject shellcode page. The inject path itself no longer allocates executable staging.
 
 **IOCTL notes:** command `14` clears injection targets and disables injection (not just disable).
 

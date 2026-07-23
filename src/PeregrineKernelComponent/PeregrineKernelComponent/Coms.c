@@ -151,7 +151,7 @@ static VOID ComsHandleUserCommand(_In_reads_bytes_(DataSize) const UCHAR* Data,
         break;
     }
 
-    case 8: { // set x64 DLL injection path (wide string)
+    case 8: { // set x64 DLL path for OpenEDR-style APC inject (full wide path)
         if (DataSize <= 1) { KdPrint(("Peregrine: cmd=8 empty\n")); return; }
         USHORT pathBytes = (USHORT)(DataSize - 1);
         InjSetDllPath(FALSE, (const WCHAR*)(Data + 1), pathBytes);
@@ -159,7 +159,7 @@ static VOID ComsHandleUserCommand(_In_reads_bytes_(DataSize) const UCHAR* Data,
         break;
     }
 
-    case 9: { // set x86 DLL injection path (wide string)
+    case 9: { // set x86 DLL path for OpenEDR-style APC inject (full wide path)
         if (DataSize <= 1) { KdPrint(("Peregrine: cmd=9 empty\n")); return; }
         USHORT pathBytes = (USHORT)(DataSize - 1);
         InjSetDllPath(TRUE, (const WCHAR*)(Data + 1), pathBytes);
@@ -167,7 +167,7 @@ static VOID ComsHandleUserCommand(_In_reads_bytes_(DataSize) const UCHAR* Data,
         break;
     }
 
-    case 10: { // add injection target process name (ANSI)
+    case 10: { // add APC injection target process name (ANSI basename, e.g. game.exe)
         if (DataSize <= 1) { KdPrint(("Peregrine: cmd=10 empty\n")); return; }
         ULONG nameLen = DataSize - 1;
         InjAddTarget((const CHAR*)(Data + 1), nameLen);
@@ -175,7 +175,7 @@ static VOID ComsHandleUserCommand(_In_reads_bytes_(DataSize) const UCHAR* Data,
         break;
     }
 
-    case 11: { // enable (1) or disable (0) auto-injection
+    case 11: { // enable (1) or disable (0) kernel APC auto-injection
         if (DataSize < 2) { KdPrint(("Peregrine: cmd=11 too small\n")); return; }
         BOOLEAN enable = Data[1] != 0;
         InjSetEnabled(enable);

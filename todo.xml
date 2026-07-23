@@ -48,7 +48,7 @@
         retain target allowlist + auto StateAddPid + x86/x64 DLL paths
     </description>
 
-    <task id="1" status="todo">
+    <task id="1" status="done">
       <title>Port / implement OpenEDR APC queue helpers</title>
       <description>
         Adapt OpenEDR apcqueue (KeInitializeApc / KeInsertQueueApc / KernelRoutine frees KAPC,
@@ -72,7 +72,7 @@
       </files>
     </task>
 
-    <task id="2" status="todo">
+    <task id="2" status="done">
       <title>Resolve LoadLibraryExW per target process (kernel32 map)</title>
       <description>
         OpenEDR tracks per-PID bases of ntdll/kernel32/user32 on LoadImageNotify, then
@@ -91,7 +91,7 @@
       </description>
     </task>
 
-    <task id="3" status="todo">
+    <task id="3" status="done">
       <title>Replace DoInjectInContext: path-only alloc + LoadLibraryExW APC</title>
       <description>
         Remove:
@@ -119,7 +119,7 @@
       </description>
     </task>
 
-    <task id="4" status="todo">
+    <task id="4" status="done">
       <title>Wire notify path; remove dead LdrLoadDll ntdll export dependency for inject</title>
       <description>
         InjOnImageLoad:
@@ -140,7 +140,7 @@
       </description>
     </task>
 
-    <task id="5" status="todo">
+    <task id="5" status="done">
       <title>Memory free: path buffer only, sooner if safe</title>
       <description>
         OpenEDR frees user path memory on process terminate (and has freelist on thread exit).
@@ -156,7 +156,7 @@
       </description>
     </task>
 
-    <task id="6" status="todo">
+    <task id="6" status="done">
       <title>IOCTL / config surface stays compatible</title>
       <description>
         Keep existing commands:
@@ -170,7 +170,7 @@
       </description>
     </task>
 
-    <task id="7" status="todo">
+    <task id="7" status="done">
       <title>README + code comments: document OpenEDR-style injection</title>
       <description>
         Update README "Kernel APC DLL Injection" section:
@@ -182,9 +182,12 @@
       </description>
     </task>
 
-    <task id="8" status="todo">
+    <task id="8" status="done">
       <title>VM verification matrix</title>
       <description>
+        DEV implementation complete (tasks 1–7). VM pass 2026-07-23:
+        game.exe → apc_inject ok, KernelBase/kernel32 order, PeregrineDLL_x64 image load,
+        IPC hello + HWBP init, process stays alive. (Full cheat matrix optional follow-up.)
         Deploy matching sys + DLLs + GUI to C:\Peregrine\ on test VM only.
 
         Cases:
