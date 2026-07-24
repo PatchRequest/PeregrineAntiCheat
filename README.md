@@ -231,6 +231,7 @@ Accompanying series on [patchi.fyi](https://patchi.fyi):
 - [ObCallbacks](https://patchi.fyi/blog/peregrine-obcallbacks/)
 - [Kernel APC Injection](https://patchi.fyi/blog/peregrine-kernel-apc-injection/)
 - [MinHook API Interception](https://patchi.fyi/blog/peregrine-minhook-api-interception/)
+- [Game vs Sensor Multi-DLL](https://patchi.fyi/blog/peregrine-multi-dll-game-sensor/)
 - [Relocation-Aware Hashing](https://patchi.fyi/blog/peregrine-relocation-aware-hashing/)
 - [IAT/EAT Scanning](https://patchi.fyi/blog/peregrine-iat-eat-scanning/)
 - [Shellcode Thread Analysis](https://patchi.fyi/blog/peregrine-shellcode-thread-analysis/)
