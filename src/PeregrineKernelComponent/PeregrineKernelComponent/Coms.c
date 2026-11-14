@@ -6,6 +6,7 @@
 #include "ApcInjection.h"
 #include "Hwid.h"
 #include "VadScan.h"
+#include "obCallback.h"
 #include <wdmsec.h>
 #include <ntstrsafe.h>
 
@@ -275,6 +276,9 @@ NTSTATUS ComsDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp) {
     case IOCTL_PEREGRINE_RECV_TO_USER: {
         const ULONG outLength = stack->Parameters.DeviceIoControl.OutputBufferLength;
         ULONG dropped = 0;
+
+        /* The poll is the driver's only periodic PASSIVE_LEVEL tick. */
+        ObFlushSuppressedReports();
 
         KIRQL oldIrql;
         KeAcquireSpinLock(&g_ComsLock, &oldIrql);

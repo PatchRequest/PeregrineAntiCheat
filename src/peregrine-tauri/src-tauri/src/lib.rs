@@ -73,6 +73,23 @@ fn backend_status(state: tauri::State<'_, SharedBackendStatus>) -> BackendStatus
     state.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// Starts the driver poll and the DLL pipe, once, after the page has registered
+/// its event listeners.
+///
+/// Both channels forward what they receive as Tauri events, and an event
+/// emitted before anybody listens is gone. The kernel queue in particular can
+/// hold a backlog from before this GUI started (including the overflow
+/// notice); draining it into the void would silently discard findings.
+#[tauri::command]
+fn ui_ready(app: AppHandle, state: tauri::State<'_, SharedBackendStatus>) {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    let status = state.inner().clone();
+    STARTED.call_once(move || {
+        start_driver_polling(app.clone(), status.clone());
+        start_ipc_polling(app, status);
+    });
+}
+
 /// (Re)establishes this GUI's standing with the driver. Driver state does not
 /// survive a driver restart, so the UI calls this on every offline→online edge.
 #[tauri::command]
@@ -290,6 +307,8 @@ fn start_ipc_polling(app: AppHandle, status: SharedBackendStatus) {
 const DRIVER_IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 /// Pause before retrying after the driver could not be reached.
 const DRIVER_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+/// How often the SCM is asked whether a stop of the driver is pending.
+const DRIVER_SCM_CHECK: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Drains kernel events and doubles as the driver heartbeat: every poll is a
 /// full IOCTL round-trip, so the first failed one flips the UI to
@@ -297,8 +316,24 @@ const DRIVER_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 fn start_driver_polling(app: AppHandle, status: SharedBackendStatus) {
     std::thread::spawn(move || {
         let mut poll_handle: Option<DriverHandle> = None;
+        let mut stop_pending = false;
+        let mut last_scm_check = std::time::Instant::now();
 
         loop {
+            // A requested stop stays pending behind our open handle and is
+            // invisible to the poll below; ask the SCM about it once a second.
+            if last_scm_check.elapsed() >= DRIVER_SCM_CHECK {
+                last_scm_check = std::time::Instant::now();
+                let pending = poll_handle.is_some() && driver_comm::driver_stop_pending();
+                if pending != stop_pending {
+                    stop_pending = pending;
+                    let _ = app.emit(
+                        "driver-event",
+                        serde_json::json!({ "event": "driver_stop_pending", "pending": pending }),
+                    );
+                }
+            }
+
             let handle = match poll_handle.as_ref() {
                 Some(h) => h,
                 None => match DriverHandle::open() {
@@ -357,6 +392,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             backend_status,
+            ui_ready,
             connect_driver,
             add_pid,
             remove_pid,
@@ -388,9 +424,7 @@ pub fn run() {
             }));
             app.manage(status.clone());
 
-            let handle = app.handle().clone();
-            start_driver_polling(handle.clone(), status.clone());
-            start_ipc_polling(handle, status);
+            // The channels are started by `ui_ready`, not here: see there.
             Ok(())
         })
         .run(tauri::generate_context!())

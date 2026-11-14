@@ -116,6 +116,28 @@ static int check_dr0_on_thread(DWORD tid, int* out_cleared)
 }
 
 /* ------------------------------------------------------------------ */
+/* Threads we have armed                                               */
+/* ------------------------------------------------------------------ */
+/*
+ * A thread that starts after init has empty debug registers because nobody
+ * armed it yet, not because somebody cleared them. Only a thread that was
+ * armed before and has lost DR0 since is tampering. The list is rebuilt from
+ * every watchdog pass, so exited threads (and reused TIDs) drop out.
+ * Touched by the init thread first and by the watchdog only afterwards.
+ */
+#define MAX_ARMED_THREADS 1024
+
+static DWORD g_armed[MAX_ARMED_THREADS];
+static int   g_armed_count = 0;
+
+static int was_armed(DWORD tid)
+{
+    for (int i = 0; i < g_armed_count; i++)
+        if (g_armed[i] == tid) return 1;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* Arm DR0 on every thread in this process                            */
 /* ------------------------------------------------------------------ */
 
@@ -130,8 +152,11 @@ static int arm_all_threads(void)
 
     if (Thread32First(snap, &te)) {
         do {
-            if (te.th32OwnerProcessID == g_my_pid) {
-                count += set_dr0_on_thread(te.th32ThreadID);
+            if (te.th32OwnerProcessID == g_my_pid &&
+                set_dr0_on_thread(te.th32ThreadID)) {
+                count++;
+                if (g_armed_count < MAX_ARMED_THREADS)
+                    g_armed[g_armed_count++] = te.th32ThreadID;
             }
         } while (Thread32Next(snap, &te));
     }
@@ -188,19 +213,31 @@ static DWORD WINAPI WatchdogThread(LPVOID param)
         THREADENTRY32 te;
         te.dwSize = sizeof(te);
 
+        static DWORD now_armed[MAX_ARMED_THREADS];
+        int now_count = 0;
+
         if (Thread32First(snap, &te)) {
             do {
                 if (te.th32OwnerProcessID != g_my_pid) continue;
 
                 int cleared = 0;
-                if (check_dr0_on_thread(te.th32ThreadID, &cleared) && cleared) {
+                if (!check_dr0_on_thread(te.th32ThreadID, &cleared)) continue;
+
+                /* check_dr0_on_thread re-arms; a first-time arm of a new
+                   thread is not a finding. */
+                if (cleared && was_armed(te.th32ThreadID)) {
                     ipc_log_event("DebugRegisterTamper",
                         "\"callerPID\":%lu,\"threadId\":%lu,\"action\":\"re-armed\"",
                         g_my_pid, (unsigned long)te.th32ThreadID);
                 }
+                if (now_count < MAX_ARMED_THREADS)
+                    now_armed[now_count++] = te.th32ThreadID;
             } while (Thread32Next(snap, &te));
         }
         CloseHandle(snap);
+
+        memcpy(g_armed, now_armed, (size_t)now_count * sizeof(DWORD));
+        g_armed_count = now_count;
     }
     return 0;
 }

@@ -90,6 +90,7 @@
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
     <Link>
+      <AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions>
       <AdditionalDependencies>%(AdditionalDependencies);fltMgr.lib;$(DDK_LIB_PATH)wdmsec.lib</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>

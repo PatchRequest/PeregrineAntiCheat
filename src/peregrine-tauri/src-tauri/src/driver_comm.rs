@@ -282,6 +282,40 @@ impl Drop for DriverHandle {
     }
 }
 
+/// Service name the driver is installed under (PeregrineKernelComponent.inf).
+const DRIVER_SERVICE: &str = "Peregrine";
+
+/// True while the SCM has a stop of the driver service pending.
+///
+/// A stop cannot complete while this GUI holds a device handle, so the driver
+/// keeps working and every poll keeps succeeding — the IOCTL heartbeat alone
+/// never notices that somebody asked for the driver to go away. `false` when
+/// the state cannot be read (service not installed under this name, ...).
+pub fn driver_stop_pending() -> bool {
+    use windows::Win32::System::Services::{
+        CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatus,
+        SC_MANAGER_CONNECT, SERVICE_QUERY_STATUS, SERVICE_STATUS, SERVICE_STOP_PENDING,
+    };
+
+    let name: Vec<u16> = DRIVER_SERVICE.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let Ok(scm) = OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) else {
+            return false;
+        };
+        let pending = match OpenServiceW(scm, PCWSTR(name.as_ptr()), SERVICE_QUERY_STATUS) {
+            Ok(service) => {
+                let mut st = SERVICE_STATUS::default();
+                let ok = QueryServiceStatus(service, &mut st).is_ok();
+                let _ = CloseServiceHandle(service);
+                ok && st.dwCurrentState == SERVICE_STOP_PENDING
+            }
+            Err(_) => false,
+        };
+        let _ = CloseServiceHandle(scm);
+        pending
+    }
+}
+
 /// Resolves an existing executable to its normalized NT path
 /// (`\Device\HarddiskVolume3\Games\game.exe`).
 ///

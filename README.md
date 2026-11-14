@@ -51,7 +51,7 @@ An educational anti-cheat system demonstrating Windows kernel programming, proce
 | **Tauri GUI** | Rust + Svelte | Userland: IOCTL, IPC, scans, ETW-TI, dual inject target lists |
 
 **Communication flows:**
-- **GUI ↔ Driver**: IOCTL commands (PIDs, Game/Sensor inject config, scans) + event polling. The poll doubles as a **heartbeat**: the first failed round-trip raises a sticky "KERNEL COMPONENT OFFLINE" banner
+- **GUI ↔ Driver**: IOCTL commands (PIDs, Game/Sensor inject config, scans) + event polling. The poll doubles as a **heartbeat**: the first failed round-trip raises a sticky "KERNEL COMPONENT OFFLINE" banner. Polling starts only after the UI has registered its listeners, so events queued in the kernel while no GUI was running (and the overflow notice) are shown, not discarded
 - **DLL → GUI**: Named pipe `\\.\pipe\peregrine_ipc` (`hello`, hooks, HWBP on Game). Every client is authenticated by its real PID against the kernel's inject records; `callerPID` / `role` are stamped by the GUI, not taken from the message
 - **Driver → target**: APC at `kernel32` load; **Game** success auto-protects PID; **Sensor** does not
 - **GUI → ETW**: PPL-protected real-time session for Threat Intelligence (start/stop in UI)
@@ -107,7 +107,8 @@ Rate limits sit on the **report**, never on the detection, and always carry a `s
 ### Known limits (honest list)
 
 - **Direct syscalls bypass the DLL hook layer entirely.** The MinHook hooks only see callers that go through `ntdll` / `KernelBase` prologues. ObCallback (handles) and ETW-TI are the sensors that survive this; an instrumentation-callback detector is not implemented yet.
-- **The driver can still be stopped** (`sc stop`, `fltmc unload`) by an administrator. This is *detected* (offline banner) but not *prevented*.
+- **A driver stop can be requested** (`sc stop`) by an administrator. While the GUI runs, its open device handle keeps the stop pending: the driver stays loaded and fully working, and the GUI shows a "STOP PENDING" banner (it asks the service manager once a second). The unload completes the moment the GUI exits or is killed — this is *detected* and *delayed*, not *prevented*.
+- **The VEH-list hardware breakpoint is armed per thread by a 5 s watchdog.** A thread created after init (e.g. an injected remote thread) is unarmed until the next pass, so a VEH registered from it right away is not caught by `VehTableTamper`; the thread creation itself and the handle opens are still reported by the kernel.
 - **Scans are on demand** (Modules, IAT/EAT, Threads, VAD, YARA, Blacklist, Overlay). A cheat that acts between two button presses is not seen by them.
 - **Name-based checks remain** in the process/driver blacklists, the ETW-TI system-caller filter and the AC file list (`\Peregrine\<name>`); renaming defeats the blacklists.
 - **Overlay detection** only sees separate top-level windows, not rendering hooked into the game's own swapchain.

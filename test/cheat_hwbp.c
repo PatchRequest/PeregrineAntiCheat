@@ -113,8 +113,8 @@ static void clear_dr_regs(DWORD tid, HANDLE th)
  * Patch offsets (absolute 8-byte addresses):
  *   0x10  handler_addr  (= alloc base + 0x00)
  *   0x1A  AddVectoredExceptionHandler
- *   0x27  Sleep
- *   0x36  RemoveVectoredExceptionHandler
+ *   0x2E  Sleep
+ *   0x3D  RemoveVectoredExceptionHandler
  */
 static unsigned char sc_fakeveh[] = {
     /* 0x00: dummy handler */
@@ -134,12 +134,12 @@ static unsigned char sc_fakeveh[] = {
 
     0xB9, 0xB8, 0x0B, 0x00, 0x00,                  /* mov ecx, 3000  */
     0x48, 0xB8,                                     /* mov rax, imm64 → Sleep */
-      0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,     /* [patch @ 0x2F] */
+      0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,     /* [patch @ 0x2E] */
     0xFF, 0xD0,                                     /* call rax       */
 
     0x48, 0x89, 0xD9,                               /* mov rcx, rbx   */
     0x48, 0xB8,                                     /* mov rax, imm64 → RemoveVEH */
-      0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,     /* [patch @ 0x3C] */
+      0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,     /* [patch @ 0x3D] */
     0xFF, 0xD0,                                     /* call rax       */
 
     0x48, 0x83, 0xC4, 0x28,                         /* add rsp, 0x28  */
@@ -149,8 +149,11 @@ static unsigned char sc_fakeveh[] = {
 
 #define SC_PATCH_HANDLER  0x10
 #define SC_PATCH_ADDVEH   0x1A
-#define SC_PATCH_SLEEP    0x2F
-#define SC_PATCH_REMVEH   0x3C
+#define SC_PATCH_SLEEP    0x2E
+#define SC_PATCH_REMVEH   0x3D
+
+/* The imm64 operands must sit exactly behind their 48 B8 / 48 BA opcodes. */
+C_ASSERT(sizeof(sc_fakeveh) == 0x4E);
 
 static int do_fakeveh_inject(HANDLE hProc)
 {

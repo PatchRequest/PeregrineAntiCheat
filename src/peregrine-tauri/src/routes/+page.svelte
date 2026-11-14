@@ -24,6 +24,8 @@
   type ChannelStatus = { online: boolean; detail: string };
   let driverStatus = $state<ChannelStatus>({ online: false, detail: "starting" });
   let ipcStatus = $state<ChannelStatus>({ online: false, detail: "starting" });
+  /** The SCM has a stop of the driver pending behind our open device handle. */
+  let driverStopPending = $state(false);
   let logs = $state<LogEntry[]>([]);
   let logEl: HTMLDivElement;
   const MAX_LOGS = 2000;
@@ -609,6 +611,17 @@
         );
         break;
 
+      case "driver_stop_pending":
+        driverStopPending = !!d.pending;
+        if (driverStopPending) {
+          addLog(
+            "[Driver] STOP REQUESTED: somebody asked the service manager to stop the kernel component. " +
+              "It keeps running only while this GUI holds its handle and unloads as soon as the GUI exits.",
+            "tamper",
+          );
+        }
+        break;
+
       case "coms_overflow":
         addLog(
           `[Driver] EVENT QUEUE OVERFLOW: ${d.dropped} kernel event(s) were lost — possible event flooding`,
@@ -832,8 +845,14 @@
     await listen("driver-status", (ev: any) => applyDriverStatus(ev.payload));
     await listen("ipc-status", (ev: any) => applyIpcStatus(ev.payload));
 
-    // Status events emitted before the listeners existed are gone; read the
-    // current state once. applyDriverStatus connects on the offline→online edge.
+    // Only now may the backend start draining the driver and the DLL pipe:
+    // an event emitted before the listeners above existed would be lost.
+    try { await invoke("ui_ready"); }
+    catch (e: any) { addLog(`ui_ready failed: ${e}`, "err"); }
+
+    // After a page reload the channels are already running and their last
+    // status event is gone; read the current state once. applyDriverStatus
+    // connects on the offline→online edge.
     try {
       const current: { driver: ChannelStatus; ipc: ChannelStatus } = await invoke("backend_status");
       applyIpcStatus(current.ipc);
@@ -847,6 +866,9 @@
 <main>
   {#if !driverStatus.online}
     <div class="offline-banner">KERNEL COMPONENT OFFLINE — no ring-0 protection or detection ({driverStatus.detail})</div>
+  {/if}
+  {#if driverStatus.online && driverStopPending}
+    <div class="offline-banner">KERNEL COMPONENT STOP PENDING — a driver stop was requested; it unloads when this GUI exits</div>
   {/if}
   {#if !ipcStatus.online}
     <div class="offline-banner">DLL TELEMETRY PIPE OFFLINE — injected DLL events are not received ({ipcStatus.detail})</div>

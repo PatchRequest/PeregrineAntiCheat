@@ -174,6 +174,67 @@ static VOID ObRateLimit(
     KeReleaseSpinLock(&g_ObRlLock, irql);
 }
 
+/*
+ * A burst that simply stops (the tool exits) never produces the "next report"
+ * its count would ride on. Called from the GUI's event poll (PASSIVE_LEVEL):
+ * emits the count of every pair whose window has run out as its own
+ * "ob_callback_suppressed" event, at most a few times per second.
+ */
+#define OB_RL_FLUSH_INTERVAL_100NS (5ULL * 1000 * 1000) /* 500 ms */
+#define OB_RL_FLUSH_BATCH          8
+
+static ULONGLONG g_ObRlLastFlush = 0;
+
+VOID ObFlushSuppressedReports(VOID)
+{
+    struct {
+        UCHAR  Kind;
+        HANDLE CallerPid;
+        HANDLE TargetPid;
+        ULONG  Suppressed;
+    } pending[OB_RL_FLUSH_BATCH];
+    ULONG count = 0;
+
+    /* Table and lock are set up by createRegistration. */
+    if (g_ObRegistration == NULL)
+        return;
+
+    const ULONGLONG now = KeQueryInterruptTime();
+    KIRQL irql;
+    KeAcquireSpinLock(&g_ObRlLock, &irql);
+
+    if ((now - g_ObRlLastFlush) >= OB_RL_FLUSH_INTERVAL_100NS) {
+        g_ObRlLastFlush = now;
+        for (ULONG i = 0; i < OB_RL_SLOTS && count < OB_RL_FLUSH_BATCH; i++) {
+            OB_RL_ENTRY* e = &g_ObRl[i];
+            if (e->InUse && e->Suppressed != 0 &&
+                (now - e->WindowStart) >= OB_RL_WINDOW_100NS) {
+                pending[count].Kind = e->Kind;
+                pending[count].CallerPid = e->CallerPid;
+                pending[count].TargetPid = e->TargetPid;
+                pending[count].Suppressed = e->Suppressed;
+                count++;
+                e->Suppressed = 0;
+            }
+        }
+    }
+
+    KeReleaseSpinLock(&g_ObRlLock, irql);
+
+    for (ULONG i = 0; i < count; i++) {
+        CHAR json[192];
+        RtlStringCchPrintfA(
+            json, ARRAYSIZE(json),
+            "{ \"event\": \"ob_callback_suppressed\", \"type\": \"%s\", "
+            "\"target_pid\": %lu, \"caller_pid\": %lu, \"suppressed\": %lu }",
+            ObKindName((OB_KIND)pending[i].Kind),
+            (ULONG)(ULONG_PTR)pending[i].TargetPid,
+            (ULONG)(ULONG_PTR)pending[i].CallerPid,
+            pending[i].Suppressed);
+        ComsSendToUser(json, (ULONG)strlen(json));
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /*  Pre-operation callback (process + thread handles)                  */
 /* ------------------------------------------------------------------ */
