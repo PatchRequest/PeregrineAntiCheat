@@ -23,7 +23,7 @@ An educational anti-cheat system demonstrating Windows kernel programming, proce
 │  ┌─────────────────────────────────────────────────────┐    │
 │  │  Kernel Driver (Minifilter)                         │    │
 │  │  PeregrineKernelComponent.sys                       │    │
-│  │  • ObCallback (handle monitoring)                   │    │
+│  │  • ObCallback (process + thread handles)            │    │
 │  │  • Thread/Image notify (protected PIDs)             │    │
 │  │  • APC DLL inject (Game + Sensor profiles)          │    │
 │  │  • PPL elevation (EPROCESS patch)                   │    │
@@ -51,8 +51,8 @@ An educational anti-cheat system demonstrating Windows kernel programming, proce
 | **Tauri GUI** | Rust + Svelte | Userland: IOCTL, IPC, scans, ETW-TI, dual inject target lists |
 
 **Communication flows:**
-- **GUI ↔ Driver**: IOCTL commands (PIDs, Game/Sensor inject config, scans) + event polling
-- **DLL → GUI**: Named pipe `\\.\pipe\peregrine_ipc` (`hello` with `role`, hooks, HWBP on Game)
+- **GUI ↔ Driver**: IOCTL commands (PIDs, Game/Sensor inject config, scans) + event polling. The poll doubles as a **heartbeat**: the first failed round-trip raises a sticky "KERNEL COMPONENT OFFLINE" banner
+- **DLL → GUI**: Named pipe `\\.\pipe\peregrine_ipc` (`hello`, hooks, HWBP on Game). Every client is authenticated by its real PID against the kernel's inject records; `callerPID` / `role` are stamped by the GUI, not taken from the message
 - **Driver → target**: APC at `kernel32` load; **Game** success auto-protects PID; **Sensor** does not
 - **GUI → ETW**: PPL-protected real-time session for Threat Intelligence (start/stop in UI)
 
@@ -85,16 +85,44 @@ Expect clean lines only, e.g.:
 !  SUSPEND_THREAD / RESUME_THREAD cheat_etwti → game
 ```
 
+## Detection scope
+
+Peregrine reports only what concerns a **protected game process**, plus its own self-defense:
+
+- **EXTERNAL** — an operation that targets the game (`target ∈ PROTECTED`)
+- **INTERNAL** — an anomaly inside the game process (`host ∈ PROTECTED`)
+- everything else is ignored — no system-wide noise
+
+Two kernel PID sets with different meanings (`AppState.h`), never interchangeable:
+
+| Set | Meaning | Set by | Grants |
+|-----|---------|--------|--------|
+| **PROTECTED** | "we defend this process" (the game) | GUI **Add**, or a successful Game inject | nothing — it only scopes detections |
+| **TRUSTED** | "this process is us" (the GUI) | IOCTL `18`, only for the calling process itself | exempt from ObCallback reports and from the AC file self-defense |
+
+A protected process is **not** trusted: the game (or anything that got itself protected) cannot touch AC files and its handle opens on other protected processes are reported like anyone else's.
+
+Rate limits sit on the **report**, never on the detection, and always carry a `suppressed` count; event-queue overflow is reported as `coms_overflow`. Nothing is dropped silently.
+
+### Known limits (honest list)
+
+- **Direct syscalls bypass the DLL hook layer entirely.** The MinHook hooks only see callers that go through `ntdll` / `KernelBase` prologues. ObCallback (handles) and ETW-TI are the sensors that survive this; an instrumentation-callback detector is not implemented yet.
+- **The driver can still be stopped** (`sc stop`, `fltmc unload`) by an administrator. This is *detected* (offline banner) but not *prevented*.
+- **Scans are on demand** (Modules, IAT/EAT, Threads, VAD, YARA, Blacklist, Overlay). A cheat that acts between two button presses is not seen by them.
+- **Name-based checks remain** in the process/driver blacklists, the ETW-TI system-caller filter and the AC file list (`\Peregrine\<name>`); renaming defeats the blacklists.
+- **Overlay detection** only sees separate top-level windows, not rendering hooked into the game's own swapchain.
+- `rules.yar` is a demonstration rule for the test tools, not a signature set.
+
 ## Detection Capabilities
 
 | # | Detection | Technique |
 |---|-----------|-----------|
 | 1 | **Module Integrity** | `.text` section SHA-256: disk vs memory, relocation-aware; known PeregrineDLL MinHook sites excluded (logged as `ok self-hooks`) |
 | 2 | **IAT/EAT Hook Detection** | PE import/export table scanning for entries outside known modules |
-| 3 | **External Memory Access** | **Sensor DLL** (in cheat) and/or Game DLL hooks: RPM/WPM/NtRead/NtWrite/VirtualAllocEx/VirtualProtectEx/CreateRemoteThread/OpenProcess; also ObCallback + ETW-TI without any DLL |
-| 3b | **Call Stack Validation** | `RtlCaptureStackBackTrace` on hooked APIs — flags callers in `MEM_PRIVATE` executable memory |
+| 3 | **External Memory Access** | **Sensor DLL** (in cheat) and/or Game DLL hooks: NtRead/NtWriteVirtualMemory (covers RPM/WPM, one event per op), VirtualAllocEx/VirtualProtectEx/CreateRemoteThread/OpenProcess; also ObCallback + ETW-TI without any DLL. Bypassed by direct syscalls |
+| 3b | **Call Stack Validation** | `RtlCaptureStackBackTrace` on every hooked call (never rate-limited — only the report is) — flags callers in `MEM_PRIVATE` executable memory |
 | 4 | **Thread & Shellcode Detection** | Kernel `thread_create` (start address) + userland scan: suspend → `GetThreadContext` → RIP/start vs modules |
-| 5 | **Handle Access Monitoring** | Kernel ObCallback on handle create/duplicate with dangerous access flags |
+| 5 | **Handle Access Monitoring** | Kernel ObCallback on **process and thread** handle create/duplicate with dangerous access (incl. `VM_READ`, thread `SET_CONTEXT`/`SUSPEND_RESUME`, `MAXIMUM_ALLOWED`); per caller→target report rate limit with `suppressed` count |
 | 6 | **Process Blacklist** | Keyword scan against running process paths |
 | 7 | **Driver Blacklist** | Ring-0 enumeration of loaded kernel drivers |
 | 8 | **ObCallback Enumeration** | Ring-0 scan of registered object callbacks |
@@ -102,7 +130,7 @@ Expect clean lines only, e.g.:
 | 10 | **Overlay Detection** | `EnumWindows` for layered / transparent / topmost+near-fullscreen windows |
 | 11 | **System Integrity** | Test-signing, HVCI, CPU vendor/hypervisor detection |
 | 12 | **ETW Threat Intelligence** | PPL + **TDH** property parse; UI shows **external→game** only (WRITE/PROTECT/SUSPEND…); drops game→game MinHook noise and system callers |
-| 13 | **File Self-Defense** | Minifilter reports **and denies** write/delete/rename on AC artifacts under `\peregrine\` |
+| 13 | **File Self-Defense** | Minifilter reports **and denies** write/delete/rename of AC artifacts under `\peregrine\`, and rename / hard-link **onto** them (overwrite by replacement), for every non-TRUSTED process |
 | 14 | **HWID Collection** | Hybrid kernel+userland fingerprinting |
 | 15 | **YARA Memory Scanning** | yara-x over process address space (`rules.yar`) |
 | 16 | **HWBP / VEH Protection** | **Game DLL** arms DR0 on VEH list; watchdog re-arms cleared DRs |
@@ -112,30 +140,32 @@ Expect clean lines only, e.g.:
 | | **Game** | **Sensor** |
 |--|----------|------------|
 | Deploy names | `PeregrineGame_x64/x86.dll` | `PeregrineSensor_x64/x86.dll` |
-| Inject targets | Protected game process names | Cheat / tool process names |
-| Hooks | Full set (RPM/WPM/Nt*/VAEx/…/OpenProcess) + `NtSetContextThread` | Same external hooks; **no** `NtSetContextThread` |
+| Inject targets | Full image path of the game | Full image path of the cheat / tool |
+| Hooks | Full set (NtRead/NtWrite/VAEx/…/OpenProcess) + `NtSetContextThread` | Same external hooks; **no** `NtSetContextThread` |
 | HWBP / VEH | Yes | No |
 | Callstack on hooks | Yes | Yes |
-| Auto `StateAddPid` | Yes (on inject success) | **No** |
+| Auto-protect (PROTECTED, never TRUSTED) | Yes (on inject success) | **No** |
 | IOCTL paths | 8 (x64), 9 (x86) | 15 (x64), 16 (x86) |
 | IOCTL add target | 10 | 17 |
 
-**GUI:** Connect loads both path pairs. Use **Game** / **Sensor** buttons for target basenames; **Clear Inj** clears both lists (IOCTL 14).
+**GUI:** Connect loads both path pairs. Enter the **full path** of the executable and use **Game** / **Sensor**; **Clear Inj** clears both lists (IOCTL 14).
 
-**Verified flow (VM):** Game inject `game.exe` → `apc_inject` `role=game` + HWBP + auto-protect; Sensor inject `cheat.exe` → `role=sensor` (not protected); `cheat.exe` RPM/WPM against game → external IPC from Sensor.
+**Target identity is the full image path, never the file name.** The GUI resolves the path to its normalized NT form (`\Device\HarddiskVolumeN\…\game.exe`) and the driver compares it with the FltMgr-normalized name of the image being started. A cheat renamed to `game.exe` in another directory is neither injected nor protected.
+
+**Previously verified flow (VM, before the path-identity change — re-verify):** Game inject `game.exe` → `apc_inject` `role=game` + HWBP + auto-protect; Sensor inject `cheat.exe` → `role=sensor` (not protected); `cheat.exe` RPM/WPM against game → external IPC from Sensor.
 
 ## Kernel APC DLL Injection
 
 OpenEDR-style user-mode APC (no private shellcode):
 
-1. GUI sets **Game** and **Sensor** DLL paths and separate target name lists via IOCTL  
-2. Driver matches on process create (Game list first, then Sensor); when `kernel32.dll` maps, queues a user APC with:
+1. GUI sets **Game** and **Sensor** DLL paths and separate target **path** lists via IOCTL  
+2. Driver matches the normalized image path on process create (Game list first, then Sensor); when `kernel32.dll` maps, queues a user APC with:
    - `NormalRoutine` = `KernelBase!LoadLibraryExW` (real export — not the `kernel32` IAT thunk, which is unbound mid-map)
    - `NormalContext` = full wide path for that **role** in target VA (`PAGE_READWRITE` only)
    - `SystemArgument1` = `NULL`, `SystemArgument2` = load flags (`0` for absolute paths under `C:\Peregrine\`)
 3. **No `KeTestAlertThread`** — APC is delivered by the loader’s later `NtTestAlert` after static imports are initialized (forcing delivery in `LoadImageNotify` crashes the process)
-4. Path buffer is freed on process exit (never freed mid-load)  
-5. On **Game** inject success, kernel calls `StateAddPid` so ObCallback / thread / image notifies apply immediately. **Sensor** inject does not protect the host PID.  
+4. The path buffer is never freed by the driver (it lives in the target's address space and goes away with the process; freeing earlier could race the load)  
+5. On **Game** inject success, kernel adds the PID to PROTECTED so ObCallback / thread / image notifies apply immediately (`"protected": false` in the event if the set is full). **Sensor** inject does not protect the host PID.  
 6. x64 + x86 WoW64 (`PsWrapApcWow64Thread` in the APC kernel routine)
 
 Approach adapted from [OpenEDR](https://github.com/ComodoSecurity/openedr) injectengine (`apcinjector` / `apcqueue`). No RX inject staging (path buffer is RW only).
@@ -144,14 +174,15 @@ Approach adapted from [OpenEDR](https://github.com/ComodoSecurity/openedr) injec
 
 **Module integrity after inject:** `ntdll` / `KernelBase` (and optionally `kernel32`) often fail a naive disk-vs-memory `.text` hash because the Game DLL patches API prologues. The checker masks those known export sites (same list as `dllmain.cpp` hooks) and re-hashes; only residual diffs are reported as **tamper**. UI shows `[ok self-hooks] … (MinHook excluded)` when the only diffs were self-hooks.
 
-**IOCTL notes:** command `14` clears **all** injection targets (Game + Sensor) and disables injection.
+**IOCTL notes:** command `14` clears **all** injection targets (Game + Sensor) and disables injection. Commands `10` / `17` take the target's NT path (UTF-16LE). Command `18` trusts the calling process. `0x803` (`QUERY_INJECTED`) answers whether the kernel injected a given PID and with which role. A rejected command fails the IOCTL with its NTSTATUS — the GUI no longer assumes success. Full list: `COMS_COMMAND` in `Coms.h`.
 
 ## Security model (educational)
 
 | Surface | Policy |
 |---------|--------|
 | Device `\\.\Peregrine` | `IoCreateDeviceSecure` — **SYSTEM + Administrators** only |
-| IPC pipe | SYSTEM + Administrators full; **Authenticated Users** write (injected medium-IL games can still send events). Not world-writable. |
+| IPC pipe | SYSTEM + Administrators full; **Authenticated Users** write-only and **without** `FILE_CREATE_PIPE_INSTANCE` (nobody else can serve the pipe name). Created with `FILE_FLAG_FIRST_PIPE_INSTANCE`, inbound-only, remote clients rejected. Connecting proves nothing: each client PID must be a process the kernel injected, otherwise it is disconnected unread. |
+| Kernel sets | PROTECTED ≠ TRUSTED (see *Detection scope*). TRUSTED only via IOCTL `18` for the caller itself. |
 | GUI | Must run **elevated** |
 | Kernel JSON | Paths escaped in-kernel (`JsonEscapeString`); no userland `\` massaging |
 
@@ -189,8 +220,8 @@ C:\Peregrine\peregrine-tauri.exe
 ```
 
 1. Connect (auto-finds Game + Sensor DLLs under `C:\Peregrine` or next to the EXE)  
-2. **Game** button: e.g. `game.exe` → start game → `apc_inject` with `role=game` + auto-protect  
-3. **Sensor** button (optional): e.g. `cheat.exe` → sensor hooks for outbound APIs (no protect)  
+2. **Game** button: full path, e.g. `C:\test\game.exe` → start game → `apc_inject` with `role=game` + auto-protect  
+3. **Sensor** button (optional): full path, e.g. `C:\test\cheat.exe` → sensor hooks for outbound APIs (no protect)  
 4. Run cheats / scans (Threads, VAD, Overlay, ETW-TI, …)
 
 ## Test Suite
@@ -207,6 +238,8 @@ Purpose-built tools in `test/`:
 | `cheat_yara.exe <PID>` | Marker strings / blob | YARA |
 | `cheat_callstack.exe <PID>` | OpenProcess from private RWX | Callstack anomaly |
 | `cheat_etwti.exe <PID>` | Alloc/WPM/RPM/ProtectEx + Suspend/Resume remote | **ETW-TI** (start ETW before running) |
+| `cheat_thread.exe <PID> [n]` | `OpenThread(SET_CONTEXT\|SUSPEND_RESUME)` without a process handle; `n` loops to show the report rate limit | ObCallback (thread handles) |
+| `cheat_pipe.exe [PID]` | Forged DLL telemetry written to the IPC pipe | Must be **rejected**: disconnected, no log line |
 | `CheatEngine.exe` | Exists | Blacklist |
 
 Start `game.exe` first — it prints PID and a health address.

@@ -16,6 +16,8 @@ cl /nologo /O2 cheat_yara.c /Fe:cheat_yara.exe
 cl /nologo /O2 cheat_callstack.c /Fe:cheat_callstack.exe
 cl /nologo /O2 cheat_etwti.c /Fe:cheat_etwti.exe
 cl /nologo /O2 cheat_hwbp.c /Fe:cheat_hwbp.exe
+cl /nologo /O2 cheat_thread.c /Fe:cheat_thread.exe
+cl /nologo /O2 cheat_pipe.c /Fe:cheat_pipe.exe
 cl /nologo /O2 /LD payload.c /Fe:payload.dll
 
 echo.
@@ -61,3 +63,11 @@ echo    game.exe                        ^<-- note PID, add to Peregrine, inject 
 echo    cheat_hwbp.exe ^<PID^> --read    ^<-- read-only: dump DR registers
 echo    cheat_hwbp.exe ^<PID^> --veh     ^<-- FakeVEH injection only (triggers VehTableTamper)
 echo    cheat_hwbp.exe ^<PID^>           ^<-- full test: FakeVEH + DR clear + re-arm verify
+echo.
+echo 10. Thread-handle access without a process handle (ObCallback PsThreadType):
+echo    game.exe                        ^<-- note PID (must be protected)
+echo    cheat_thread.exe ^<PID^>         ^<-- expect one [Handle Access] ... thread line
+echo    cheat_thread.exe ^<PID^> 500     ^<-- loop: one line + suppressed count, no flood
+echo.
+echo 11. Forged DLL telemetry (IPC pipe authentication):
+echo    cheat_pipe.exe ^<game_PID^>      ^<-- must be disconnected; GUI shows no forged line
