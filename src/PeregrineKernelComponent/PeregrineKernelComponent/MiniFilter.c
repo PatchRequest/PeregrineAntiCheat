@@ -21,69 +21,102 @@ static BOOLEAN ShouldReport(HANDLE Pid)
     return TRUE;
 }
 
-static BOOLEAN EndsWithI(_In_ PCUNICODE_STRING Path, _In_ PCWSTR Suffix, _In_ USHORT SuffixLen)
+static WCHAR LowerAscii(WCHAR c)
 {
-    if (!Path || !Path->Buffer) return FALSE;
-    USHORT pathChars = Path->Length / sizeof(WCHAR);
-    if (pathChars < SuffixLen) return FALSE;
-    for (USHORT i = 0; i < SuffixLen; i++) {
-        WCHAR a = Path->Buffer[pathChars - SuffixLen + i];
-        WCHAR b = Suffix[i];
-        if (a >= L'A' && a <= L'Z') a += 32;
-        if (b >= L'A' && b <= L'Z') b += 32;
-        if (a != b) return FALSE;
+    return (c >= L'A' && c <= L'Z') ? (WCHAR)(c + 32) : c;
+}
+
+/* Suffix/Sub are compile-time constants (RTL_CONSTANT_STRING): their length
+   comes from sizeof, never from a hand-counted number. */
+static BOOLEAN EndsWithI(_In_ PCUNICODE_STRING Path, _In_ PCUNICODE_STRING Suffix)
+{
+    if (!Path->Buffer || Path->Length < Suffix->Length) return FALSE;
+    const USHORT pathChars = Path->Length / sizeof(WCHAR);
+    const USHORT sufChars = Suffix->Length / sizeof(WCHAR);
+    for (USHORT i = 0; i < sufChars; i++) {
+        if (LowerAscii(Path->Buffer[pathChars - sufChars + i]) != LowerAscii(Suffix->Buffer[i]))
+            return FALSE;
     }
     return TRUE;
 }
 
-static BOOLEAN ContainsI(_In_ PCUNICODE_STRING Path, _In_ PCWSTR Sub, _In_ USHORT SubLen)
+static BOOLEAN ContainsI(_In_ PCUNICODE_STRING Path, _In_ PCUNICODE_STRING Sub)
 {
-    if (!Path || !Path->Buffer) return FALSE;
-    USHORT pathChars = Path->Length / sizeof(WCHAR);
-    if (pathChars < SubLen) return FALSE;
-    for (USHORT i = 0; i <= pathChars - SubLen; i++) {
+    if (!Path->Buffer || Path->Length < Sub->Length) return FALSE;
+    const USHORT pathChars = Path->Length / sizeof(WCHAR);
+    const USHORT subChars = Sub->Length / sizeof(WCHAR);
+    for (USHORT i = 0; i <= pathChars - subChars; i++) {
         BOOLEAN ok = TRUE;
-        for (USHORT j = 0; j < SubLen; j++) {
-            WCHAR a = Path->Buffer[i + j];
-            WCHAR b = Sub[j];
-            if (a >= L'A' && a <= L'Z') a += 32;
-            if (b >= L'A' && b <= L'Z') b += 32;
-            if (a != b) { ok = FALSE; break; }
+        for (USHORT j = 0; j < subChars; j++) {
+            if (LowerAscii(Path->Buffer[i + j]) != LowerAscii(Sub->Buffer[j])) { ok = FALSE; break; }
         }
         if (ok) return TRUE;
     }
     return FALSE;
 }
 
+/* AC artifacts live in a directory named "Peregrine" (deploy: C:\Peregrine\). */
+static const UNICODE_STRING g_AcDirectory = RTL_CONSTANT_STRING(L"\\peregrine\\");
+
+/* Leading backslash: these are whole file names, not name suffixes
+   ("xrules.yar" is not ours). */
+static const UNICODE_STRING g_AcFileNames[] = {
+    RTL_CONSTANT_STRING(L"\\peregrinekernelcomponent.sys"),
+    RTL_CONSTANT_STRING(L"\\peregrinekernelcomponent.inf"),
+    RTL_CONSTANT_STRING(L"\\peregrinegame_x64.dll"),
+    RTL_CONSTANT_STRING(L"\\peregrinegame_x86.dll"),
+    RTL_CONSTANT_STRING(L"\\peregrinesensor_x64.dll"),
+    RTL_CONSTANT_STRING(L"\\peregrinesensor_x86.dll"),
+    RTL_CONSTANT_STRING(L"\\peregrine-tauri.exe"),
+    RTL_CONSTANT_STRING(L"\\rules.yar"),
+};
+
 static BOOLEAN IsProtectedFile(_In_ PCUNICODE_STRING Path)
 {
-    if (!ContainsI(Path, L"\\peregrine\\", 11)) return FALSE;
+    if (!ContainsI(Path, &g_AcDirectory)) return FALSE;
 
-    if (EndsWithI(Path, L"peregrinekernelcomponent.sys", 27)) return TRUE;
-    if (EndsWithI(Path, L"peregrinekernelcomponent.inf", 27)) return TRUE;
-    /* Real install names from build_dll.bat / Userland deploy */
-    if (EndsWithI(Path, L"peregrinedll_x64.dll", 20)) return TRUE;
-    if (EndsWithI(Path, L"peregrinedll_x86.dll", 20)) return TRUE;
-    if (EndsWithI(Path, L"peregrinegame_x64.dll", 21)) return TRUE;
-    if (EndsWithI(Path, L"peregrinegame_x86.dll", 21)) return TRUE;
-    if (EndsWithI(Path, L"peregrinesensor_x64.dll", 23)) return TRUE;
-    if (EndsWithI(Path, L"peregrinesensor_x86.dll", 23)) return TRUE;
-    /* Legacy / alternate names still used by connect_driver search */
-    if (EndsWithI(Path, L"peregrine64.dll", 15)) return TRUE;
-    if (EndsWithI(Path, L"peregrine32.dll", 15)) return TRUE;
-    if (EndsWithI(Path, L"peregrine-tauri.exe", 19)) return TRUE;
-    if (EndsWithI(Path, L"rules.yar", 9)) return TRUE;
-
+    for (ULONG i = 0; i < ARRAYSIZE(g_AcFileNames); i++) {
+        if (EndsWithI(Path, &g_AcFileNames[i])) return TRUE;
+    }
     return FALSE;
 }
 
+/* TRUSTED, not PROTECTED: only the AC itself may modify AC files. The game
+   being defended (or anything that managed to get protected) may not. */
 static BOOLEAN IsOurProcess(VOID)
 {
-    return StateIsPidProtected(PsGetCurrentProcessId());
+    return StateIsPidTrusted(PsGetCurrentProcessId());
+}
+
+/* Report (rate-limited per PID) and fail the operation with ACCESS_DENIED. */
+static FLT_PREOP_CALLBACK_STATUS DenyAndReport(
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCUNICODE_STRING Path,
+    _In_z_ const CHAR* OpName)
+{
+    HANDLE callerPid = PsGetCurrentProcessId();
+    if (ShouldReport(callerPid)) {
+        ANSI_STRING ansi = { 0 };
+        if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansi, Path, TRUE))) {
+            CHAR json[COMS_MAX_MESSAGE_SIZE];
+            CHAR escaped[520];
+            if (!JsonEscapeString(escaped, sizeof(escaped), ansi.Buffer))
+                escaped[0] = '\0';
+            RtlStringCchPrintfA(json, ARRAYSIZE(json),
+                "{ \"event\": \"file_access\", \"pid\": %lu, \"path\": \"%s\", \"op\": \"%s\" }",
+                (ULONG)(ULONG_PTR)callerPid, escaped, OpName);
+            ComsSendToUser(json, (ULONG)strlen(json));
+            RtlFreeAnsiString(&ansi);
+        }
+    }
+
+    Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+    Data->IoStatus.Information = 0;
+    return FLT_PREOP_COMPLETE;
 }
 
 /* ------------------------------------------------------------------ */
-/*  Pre-Create: report write/delete access to protected AC files      */
+/*  Pre-Create: deny write/delete access to protected AC files        */
 /*  Only resolves filename if it's a write-like operation.            */
 /* ------------------------------------------------------------------ */
 
@@ -118,38 +151,56 @@ PreCreate(
         FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &nameInfo);
     if (!NT_SUCCESS(st) || nameInfo == NULL) return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
-    FltParseFileNameInformation(nameInfo);
-
-    if (IsProtectedFile(&nameInfo->Name)) {
-        HANDLE callerPid = PsGetCurrentProcessId();
-        if (ShouldReport(callerPid)) {
-            CHAR json[COMS_MAX_MESSAGE_SIZE];
-            ANSI_STRING ansi = { 0 };
-            if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansi, &nameInfo->Name, TRUE))) {
-                CHAR escaped[520];
-                if (!JsonEscapeString(escaped, sizeof(escaped), ansi.Buffer))
-                    escaped[0] = '\0';
-                RtlStringCchPrintfA(json, ARRAYSIZE(json),
-                    "{ \"event\": \"file_access\", \"pid\": %lu, \"path\": \"%s\", \"op\": \"write\" }",
-                    (ULONG)(ULONG_PTR)callerPid, escaped);
-                ComsSendToUser(json, (ULONG)strlen(json));
-                RtlFreeAnsiString(&ansi);
-            }
-        }
-        /* Deny write/create of protected AC files from non-protected processes. */
-        Data->IoStatus.Status = STATUS_ACCESS_DENIED;
-        Data->IoStatus.Information = 0;
-        FltReleaseFileNameInformation(nameInfo);
-        return FLT_PREOP_COMPLETE;
-    }
+    FLT_PREOP_CALLBACK_STATUS result = FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (IsProtectedFile(&nameInfo->Name))
+        result = DenyAndReport(Data, &nameInfo->Name, "write");
 
     FltReleaseFileNameInformation(nameInfo);
-    return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    return result;
 }
 
 /* ------------------------------------------------------------------ */
-/*  Pre-SetInformation: report rename/delete of protected AC files    */
+/*  Pre-SetInformation: deny delete/rename/link touching AC files     */
 /* ------------------------------------------------------------------ */
+
+/*
+ * Rename and hard-link requests name a *destination*. Checking only the file
+ * being renamed misses the overwrite direction: renaming evil.dll onto
+ * C:\Peregrine\PeregrineGame_x64.dll (ReplaceIfExists) replaces an AC file
+ * without ever opening it for write. FILE_RENAME_INFORMATION and
+ * FILE_LINK_INFORMATION share the layout used here.
+ */
+static BOOLEAN IsDestinationProtected(
+    _In_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _Out_ PFLT_FILE_NAME_INFORMATION* DestInfo)
+{
+    *DestInfo = NULL;
+
+    PFILE_RENAME_INFORMATION info =
+        (PFILE_RENAME_INFORMATION)Data->Iopb->Parameters.SetFileInformation.InfoBuffer;
+    ULONG length = Data->Iopb->Parameters.SetFileInformation.Length;
+
+    if (info == NULL || length < (ULONG)FIELD_OFFSET(FILE_RENAME_INFORMATION, FileName) ||
+        info->FileNameLength > length - (ULONG)FIELD_OFFSET(FILE_RENAME_INFORMATION, FileName))
+        return FALSE; /* malformed — the file system rejects it */
+
+    NTSTATUS st = FltGetDestinationFileNameInformation(
+        FltObjects->Instance, FltObjects->FileObject,
+        info->RootDirectory, info->FileName, info->FileNameLength,
+        FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, DestInfo);
+    if (!NT_SUCCESS(st) || *DestInfo == NULL) {
+        *DestInfo = NULL;
+        return FALSE;
+    }
+
+    if (IsProtectedFile(&(*DestInfo)->Name))
+        return TRUE;
+
+    FltReleaseFileNameInformation(*DestInfo);
+    *DestInfo = NULL;
+    return FALSE;
+}
 
 static FLT_PREOP_CALLBACK_STATUS FLTAPI
 PreSetInfo(
@@ -164,46 +215,40 @@ PreSetInfo(
     if (IsOurProcess()) return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
     ULONG infoClass = Data->Iopb->Parameters.SetFileInformation.FileInformationClass;
-    BOOLEAN isDel = (infoClass == FileDispositionInformation ||
-                     infoClass == FileDispositionInformationEx ||
-                     infoClass == FileRenameInformation ||
-                     infoClass == FileRenameInformationEx);
-    if (!isDel) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    BOOLEAN isDelete = (infoClass == FileDispositionInformation ||
+                        infoClass == FileDispositionInformationEx);
+    BOOLEAN isRename = (infoClass == FileRenameInformation ||
+                        infoClass == FileRenameInformationEx);
+    BOOLEAN isLink   = (infoClass == FileLinkInformation ||
+                        infoClass == FileLinkInformationEx);
+    if (!isDelete && !isRename && !isLink) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+
+    /* Destination of a rename / hard link is (or replaces) an AC file. */
+    if (isRename || isLink) {
+        PFLT_FILE_NAME_INFORMATION destInfo = NULL;
+        if (IsDestinationProtected(Data, FltObjects, &destInfo)) {
+            FLT_PREOP_CALLBACK_STATUS result = DenyAndReport(Data, &destInfo->Name,
+                isRename ? "rename_onto" : "link_onto");
+            FltReleaseFileNameInformation(destInfo);
+            return result;
+        }
+    }
+
+    /* The file itself is an AC file being deleted or renamed away. A hard
+       link *from* an AC file only adds a name and is left alone. */
+    if (isLink) return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
     PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
     NTSTATUS st = FltGetFileNameInformation(Data,
         FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &nameInfo);
     if (!NT_SUCCESS(st) || nameInfo == NULL) return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
-    FltParseFileNameInformation(nameInfo);
-
-    if (IsProtectedFile(&nameInfo->Name)) {
-        HANDLE callerPid = PsGetCurrentProcessId();
-        const CHAR* opName = (infoClass == FileRenameInformation ||
-                              infoClass == FileRenameInformationEx) ? "rename" : "delete";
-
-        if (ShouldReport(callerPid)) {
-            CHAR json[COMS_MAX_MESSAGE_SIZE];
-            ANSI_STRING ansi = { 0 };
-            if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansi, &nameInfo->Name, TRUE))) {
-                CHAR escaped[520];
-                if (!JsonEscapeString(escaped, sizeof(escaped), ansi.Buffer))
-                    escaped[0] = '\0';
-                RtlStringCchPrintfA(json, ARRAYSIZE(json),
-                    "{ \"event\": \"file_access\", \"pid\": %lu, \"path\": \"%s\", \"op\": \"%s\" }",
-                    (ULONG)(ULONG_PTR)callerPid, escaped, opName);
-                ComsSendToUser(json, (ULONG)strlen(json));
-                RtlFreeAnsiString(&ansi);
-            }
-        }
-        Data->IoStatus.Status = STATUS_ACCESS_DENIED;
-        Data->IoStatus.Information = 0;
-        FltReleaseFileNameInformation(nameInfo);
-        return FLT_PREOP_COMPLETE;
-    }
+    FLT_PREOP_CALLBACK_STATUS result = FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (IsProtectedFile(&nameInfo->Name))
+        result = DenyAndReport(Data, &nameInfo->Name, isRename ? "rename" : "delete");
 
     FltReleaseFileNameInformation(nameInfo);
-    return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    return result;
 }
 
 /* ------------------------------------------------------------------ */

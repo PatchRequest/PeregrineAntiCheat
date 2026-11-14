@@ -14,13 +14,17 @@ VOID DriverUnload(PDRIVER_OBJECT DriverObject) {
     MfCleanup();
     unregisterNotifyRoutine();
     unregisterRegistration();
-    InjCleanup();
     ComsCleanup();
     KdPrint(("Peregrine: Unload called\n"));
 }
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
     KdPrint(("Peregrine: DriverEntry called\n"));
+
+    /* State first: every callback registered below may fire immediately and
+       reads these tables. */
+    StateInit();
+    InjInit();
 
     NTSTATUS status = ComsInitialize(DriverObject);
     if (!NT_SUCCESS(status)) {
@@ -44,9 +48,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     }
 
     DriverObject->DriverUnload = DriverUnload;
-
-	StateInit();
-    InjInit();
 
     status = MfInit(DriverObject, RegistryPath);
     if (!NT_SUCCESS(status)) {

@@ -1,12 +1,6 @@
 #pragma once
 #include <fltKernel.h>
 
-#ifndef CALLBACK_H
-#define CALLBACK_H
-
-extern PVOID callbackRegistrationHandle;
-
+/* ObCallback registration for process and thread handles (see obCallback.c). */
 NTSTATUS createRegistration(void);
 VOID unregisterRegistration(void);
-
-#endif

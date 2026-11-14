@@ -12,8 +12,9 @@
  *   SystemArgument2 = dwFlags for LoadLibraryExW
  *
  * No private executable shellcode, no ntdll!LdrLoadDll stub, no ZwProtectVirtualMemory.
- * Path buffer is freed on process exit (LoadLibraryExW may still hold the pointer
- * during LoadImageNotify for our DLL — never free while load is in flight).
+ * The path buffer is never freed by us: LoadLibraryExW reads it whenever the APC
+ * is finally delivered, and the allocation lives in the target's address space,
+ * which the memory manager reclaims in full at process teardown.
  *
  * Crash note (early kernel32 LoadImage + KeTestAlertThread):
  *   kernel32!LoadLibraryExW is typically an IAT thunk (ff 25 …) whose slot is
@@ -27,8 +28,12 @@
  * OpenEDR often passes LOAD_IGNORE_CODE_AUTHZ_LEVEL | LOAD_LIBRARY_SEARCH_SYSTEM32
  * for System32-relative names; SEARCH_SYSTEM32 would break non-System32 full paths.
  *
- * Product semantics kept: named targets, IOCTL path config, auto StateAddPid,
- * x64 + WoW64 (PsWrapApcWow64Thread in KernelRoutine).
+ * Target identity: the normalized NT path of the process image, compared in
+ * full (case-insensitive). A basename is not an identity — a cheat renamed to
+ * game.exe must not receive the Game DLL and the PROTECTED status that follows.
+ *
+ * Product semantics kept: IOCTL path config, auto-protect on Game inject
+ * (PROTECTED only, never TRUSTED), x64 + WoW64 (PsWrapApcWow64Thread).
  */
 
 #include "ApcInjection.h"
@@ -42,11 +47,6 @@
 
 NTKERNELAPI PPEB  PsGetProcessPeb(PEPROCESS Process);
 NTKERNELAPI PVOID PsGetProcessWow64Process(PEPROCESS Process);
-
-NTKERNELAPI NTSTATUS PsLookupProcessByProcessId(
-    _In_ HANDLE ProcessId, _Out_ PEPROCESS* Process);
-NTKERNELAPI NTSTATUS PsLookupThreadByThreadId(
-    _In_ HANDLE ThreadId,  _Out_ PETHREAD* Thread);
 
 typedef VOID (NTAPI *PKNORMAL_ROUTINE)(
     PVOID NormalContext, PVOID SystemArgument1, PVOID SystemArgument2);
@@ -88,19 +88,25 @@ NTKERNELAPI NTSTATUS PsWrapApcWow64Thread(
 /*  Global injection state (per-role paths + targets)                 */
 /* ------------------------------------------------------------------ */
 
+/* Upper-cased normalized NT path; compared byte-for-byte under the spinlock. */
+typedef struct _INJ_TARGET {
+    WCHAR  Path[INJ_MAX_PATH];
+    USHORT Bytes;
+} INJ_TARGET;
+
 typedef struct _INJ_PROFILE {
     WCHAR  DllPathX64[INJ_MAX_PATH];
     USHORT DllPathX64Bytes;
     WCHAR  DllPathX86[INJ_MAX_PATH];
     USHORT DllPathX86Bytes;
-    CHAR   Targets[INJ_MAX_TARGETS][INJ_MAX_NAME];
+    INJ_TARGET Targets[INJ_MAX_TARGETS];
     ULONG  TargetCount;
 } INJ_PROFILE;
 
-typedef struct _INJ_PENDING {
+typedef struct _INJ_PID_ROLE {
     HANDLE Pid;
     UCHAR  Role;
-} INJ_PENDING;
+} INJ_PID_ROLE;
 
 typedef struct _INJ_STATE {
     KSPIN_LOCK Lock;
@@ -108,16 +114,14 @@ typedef struct _INJ_STATE {
 
     INJ_PROFILE Profile[INJ_ROLE_COUNT];
 
-    INJ_PENDING Pending[INJ_MAX_PENDING];
-    ULONG       PendingCount;
+    /* Matched at process create, waiting for kernel32 to map. */
+    INJ_PID_ROLE Pending[INJ_MAX_PENDING];
+    ULONG        PendingCount;
 
-    /* Path-only user allocations to free on process exit */
-    struct {
-        HANDLE Pid;
-        PVOID  Base;
-        SIZE_T Size;
-    } PendingFree[INJ_MAX_PENDING];
-    ULONG PendingFreeCount;
+    /* Live processes we queued the inject APC into (source of truth for
+       IOCTL_PEREGRINE_QUERY_INJECTED). Entries leave on process exit. */
+    INJ_PID_ROLE Injected[INJ_MAX_INJECTED];
+    ULONG        InjectedCount;
 } INJ_STATE;
 
 static INJ_STATE g_Inj = { 0 };
@@ -132,67 +136,83 @@ static __forceinline const CHAR* InjRoleName(UCHAR Role)
     return Role == INJ_ROLE_SENSOR ? "sensor" : "game";
 }
 
-static VOID PendingFreeAdd(HANDLE Pid, PVOID Base, SIZE_T Size)
+/* ------------------------------------------------------------------ */
+/*  PID/role tables (spinlock-protected)                              */
+/* ------------------------------------------------------------------ */
+
+/* Caller holds g_Inj.Lock. FALSE when the table is full. Idempotent per PID. */
+static BOOLEAN PidRoleAddLocked(
+    _Inout_updates_(Capacity) INJ_PID_ROLE* Table,
+    _Inout_ ULONG* Count,
+    _In_ ULONG Capacity,
+    _In_ HANDLE Pid,
+    _In_ UCHAR Role)
 {
-    KIRQL irql;
-    KeAcquireSpinLock(&g_Inj.Lock, &irql);
-    if (g_Inj.PendingFreeCount < INJ_MAX_PENDING && Base != NULL) {
-        ULONG i = g_Inj.PendingFreeCount++;
-        g_Inj.PendingFree[i].Pid  = Pid;
-        g_Inj.PendingFree[i].Base = Base;
-        g_Inj.PendingFree[i].Size = Size;
+    for (ULONG i = 0; i < *Count; i++) {
+        if (Table[i].Pid == Pid)
+            return TRUE;
     }
-    KeReleaseSpinLock(&g_Inj.Lock, irql);
+    if (*Count >= Capacity)
+        return FALSE;
+    Table[*Count].Pid  = Pid;
+    Table[*Count].Role = Role;
+    (*Count)++;
+    return TRUE;
 }
 
-/* Free inject path buffer on process exit. */
-static VOID PendingFreeRelease(_In_ HANDLE Pid, _In_ BOOLEAN AttachIfNeeded)
+/* Caller holds g_Inj.Lock. Removes the entry; TRUE and OutRole if it existed. */
+static BOOLEAN PidRoleTakeLocked(
+    _Inout_updates_(*Count) INJ_PID_ROLE* Table,
+    _Inout_ ULONG* Count,
+    _In_ HANDLE Pid,
+    _Out_opt_ UCHAR* OutRole)
 {
-    PVOID bases[INJ_MAX_PENDING];
-    SIZE_T sizes[INJ_MAX_PENDING];
-    ULONG n = 0;
+    for (ULONG i = 0; i < *Count; i++) {
+        if (Table[i].Pid == Pid) {
+            if (OutRole)
+                *OutRole = Table[i].Role;
+            Table[i] = Table[--(*Count)];
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static BOOLEAN PendingAdd(HANDLE Pid, UCHAR Role)
+{
     KIRQL irql;
-
     KeAcquireSpinLock(&g_Inj.Lock, &irql);
-    for (ULONG i = 0; i < g_Inj.PendingFreeCount; ) {
-        if (g_Inj.PendingFree[i].Pid == Pid) {
-            if (n < INJ_MAX_PENDING) {
-                bases[n] = g_Inj.PendingFree[i].Base;
-                sizes[n] = g_Inj.PendingFree[i].Size;
-                n++;
-            }
-            g_Inj.PendingFree[i] = g_Inj.PendingFree[--g_Inj.PendingFreeCount];
-        } else {
-            i++;
-        }
-    }
+    BOOLEAN ok = PidRoleAddLocked(g_Inj.Pending, &g_Inj.PendingCount,
+        INJ_MAX_PENDING, Pid, Role);
     KeReleaseSpinLock(&g_Inj.Lock, irql);
+    return ok;
+}
 
-    if (n == 0) return;
+static BOOLEAN PendingTake(HANDLE Pid, _Out_opt_ UCHAR* OutRole)
+{
+    KIRQL irql;
+    KeAcquireSpinLock(&g_Inj.Lock, &irql);
+    BOOLEAN found = PidRoleTakeLocked(g_Inj.Pending, &g_Inj.PendingCount, Pid, OutRole);
+    KeReleaseSpinLock(&g_Inj.Lock, irql);
+    return found;
+}
 
-    PEPROCESS process = NULL;
-    KAPC_STATE apc;
-    BOOLEAN attached = FALSE;
+static BOOLEAN InjectedAdd(HANDLE Pid, UCHAR Role)
+{
+    KIRQL irql;
+    KeAcquireSpinLock(&g_Inj.Lock, &irql);
+    BOOLEAN ok = PidRoleAddLocked(g_Inj.Injected, &g_Inj.InjectedCount,
+        INJ_MAX_INJECTED, Pid, Role);
+    KeReleaseSpinLock(&g_Inj.Lock, irql);
+    return ok;
+}
 
-    if (AttachIfNeeded && PsGetCurrentProcessId() != Pid) {
-        if (NT_SUCCESS(PsLookupProcessByProcessId(Pid, &process))) {
-            KeStackAttachProcess(process, &apc);
-            attached = TRUE;
-        } else {
-            return; /* process gone — memory already reclaimed */
-        }
-    }
-
-    for (ULONG i = 0; i < n; i++) {
-        PVOID base = bases[i];
-        SIZE_T region = 0;
-        ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &region, MEM_RELEASE);
-    }
-
-    if (attached) {
-        KeUnstackDetachProcess(&apc);
-        ObDereferenceObject(process);
-    }
+static VOID InjectedRemove(HANDLE Pid)
+{
+    KIRQL irql;
+    KeAcquireSpinLock(&g_Inj.Lock, &irql);
+    PidRoleTakeLocked(g_Inj.Injected, &g_Inj.InjectedCount, Pid, NULL);
+    KeReleaseSpinLock(&g_Inj.Lock, irql);
 }
 
 /* ------------------------------------------------------------------ */
@@ -236,66 +256,50 @@ static BOOLEAN UStrContainsI(_In_ PCUNICODE_STRING Str, _In_ PCWSTR Sub)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Pending-PID helpers (spinlock-protected)                          */
+/*  Target matching by full image path (Game first, then Sensor)      */
 /* ------------------------------------------------------------------ */
 
-static VOID PendingAdd(HANDLE Pid, UCHAR Role)
+/*
+ * Copies a counted UTF-16 path into Dest upper-cased, so later comparisons
+ * are a plain memory compare that is legal under a spinlock.
+ * PASSIVE_LEVEL (RtlUpcaseUnicodeString touches pageable NLS tables).
+ */
+static NTSTATUS UpcasePath(
+    _In_ PCUNICODE_STRING Src,
+    _Out_writes_(INJ_MAX_PATH) WCHAR* Dest,
+    _Out_ USHORT* DestBytes)
 {
-    KIRQL irql;
-    KeAcquireSpinLock(&g_Inj.Lock, &irql);
-    if (g_Inj.PendingCount < INJ_MAX_PENDING) {
-        for (ULONG i = 0; i < g_Inj.PendingCount; i++) {
-            if (g_Inj.Pending[i].Pid == Pid) {
-                KeReleaseSpinLock(&g_Inj.Lock, irql);
-                return;
-            }
-        }
-        g_Inj.Pending[g_Inj.PendingCount].Pid  = Pid;
-        g_Inj.Pending[g_Inj.PendingCount].Role = Role;
-        g_Inj.PendingCount++;
-    }
-    KeReleaseSpinLock(&g_Inj.Lock, irql);
+    *DestBytes = 0;
+    if (Src->Length == 0 || (Src->Length % sizeof(WCHAR)) != 0 ||
+        Src->Length > (INJ_MAX_PATH - 1) * sizeof(WCHAR))
+        return STATUS_NAME_TOO_LONG;
+
+    UNICODE_STRING dst;
+    dst.Buffer = Dest;
+    dst.Length = 0;
+    dst.MaximumLength = (USHORT)(INJ_MAX_PATH * sizeof(WCHAR));
+
+    NTSTATUS status = RtlUpcaseUnicodeString(&dst, Src, FALSE);
+    if (NT_SUCCESS(status))
+        *DestBytes = dst.Length;
+    return status;
 }
 
-/* Remove pending entry; returns TRUE and writes Role if found. */
-static BOOLEAN PendingTake(HANDLE Pid, _Out_ UCHAR* OutRole)
+/* Returns TRUE and OutRole if the upper-cased image path is a configured target. */
+static BOOLEAN MatchTargetRole(
+    _In_reads_bytes_(PathBytes) const WCHAR* UpperPath,
+    _In_ USHORT PathBytes,
+    _Out_ UCHAR* OutRole)
 {
-    BOOLEAN found = FALSE;
-    KIRQL irql;
-    KeAcquireSpinLock(&g_Inj.Lock, &irql);
-    for (ULONG i = 0; i < g_Inj.PendingCount; i++) {
-        if (g_Inj.Pending[i].Pid == Pid) {
-            if (OutRole)
-                *OutRole = g_Inj.Pending[i].Role;
-            g_Inj.Pending[i] = g_Inj.Pending[--g_Inj.PendingCount];
-            found = TRUE;
-            break;
-        }
-    }
-    KeReleaseSpinLock(&g_Inj.Lock, irql);
-    return found;
-}
-
-/* ------------------------------------------------------------------ */
-/*  Target-name matching (Game first, then Sensor)                    */
-/* ------------------------------------------------------------------ */
-
-/* Returns TRUE and OutRole if basename matches any profile. */
-static BOOLEAN MatchTargetRole(_In_ const CHAR* ImageName, _Out_ UCHAR* OutRole)
-{
-    if (!ImageName || !*ImageName || !OutRole) return FALSE;
-    const CHAR* fn = ImageName;
-    for (const CHAR* p = ImageName; *p; p++)
-        if (*p == '\\' || *p == '/') fn = p + 1;
-
     KIRQL irql;
     KeAcquireSpinLock(&g_Inj.Lock, &irql);
     BOOLEAN hit = FALSE;
-    /* Prefer Game over Sensor if the same name is listed twice. */
+    /* Prefer Game over Sensor if the same path is listed twice. */
     for (UCHAR role = 0; role < INJ_ROLE_COUNT && !hit; role++) {
         INJ_PROFILE* prof = &g_Inj.Profile[role];
         for (ULONG i = 0; i < prof->TargetCount; i++) {
-            if (_stricmp(fn, prof->Targets[i]) == 0) {
+            if (prof->Targets[i].Bytes == PathBytes &&
+                RtlCompareMemory(prof->Targets[i].Path, UpperPath, PathBytes) == PathBytes) {
                 *OutRole = role;
                 hit = TRUE;
                 break;
@@ -539,7 +543,8 @@ static NTSTATUS DoInjectInContext(
     if (loadLib == 0)
         return STATUS_PROCEDURE_NOT_FOUND;
 
-    /* Path + NUL only — PAGE_READWRITE, never executable. */
+    /* Path + NUL only — PAGE_READWRITE, never executable. Not freed by us:
+       see the file header (owned by the target address space). */
     allocSz = (SIZE_T)dllBytes + sizeof(WCHAR);
     status = ZwAllocateVirtualMemory(ZwCurrentProcess(), &alloc, 0,
         &allocSz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -582,8 +587,6 @@ static NTSTATUS DoInjectInContext(
         return STATUS_UNSUCCESSFUL;
     }
 
-    PendingFreeAdd(PsGetCurrentProcessId(), alloc, allocSz);
-
     return STATUS_SUCCESS;
 }
 
@@ -597,12 +600,11 @@ VOID InjInit(VOID)
     KeInitializeSpinLock(&g_Inj.Lock);
 }
 
-VOID InjCleanup(VOID) { /* static state, nothing to free */ }
-
-NTSTATUS InjSetDllPath(UCHAR Role, BOOLEAN IsX86, const WCHAR* Path, USHORT PathLenBytes)
+NTSTATUS InjSetDllPath(UCHAR Role, BOOLEAN IsX86, const VOID* Path, ULONG PathBytes)
 {
-    if (!InjRoleValid(Role) || !Path || PathLenBytes == 0 ||
-        PathLenBytes > (INJ_MAX_PATH - 1) * sizeof(WCHAR))
+    if (!InjRoleValid(Role) || !Path || PathBytes == 0 ||
+        (PathBytes % sizeof(WCHAR)) != 0 ||
+        PathBytes > (INJ_MAX_PATH - 1) * sizeof(WCHAR))
         return STATUS_INVALID_PARAMETER;
 
     KIRQL irql;
@@ -611,43 +613,68 @@ NTSTATUS InjSetDllPath(UCHAR Role, BOOLEAN IsX86, const WCHAR* Path, USHORT Path
         INJ_PROFILE* prof = &g_Inj.Profile[Role];
         if (IsX86) {
             RtlZeroMemory(prof->DllPathX86, sizeof(prof->DllPathX86));
-            RtlCopyMemory(prof->DllPathX86, Path, PathLenBytes);
-            prof->DllPathX86Bytes = PathLenBytes;
+            RtlCopyMemory(prof->DllPathX86, Path, PathBytes);
+            prof->DllPathX86Bytes = (USHORT)PathBytes;
         } else {
             RtlZeroMemory(prof->DllPathX64, sizeof(prof->DllPathX64));
-            RtlCopyMemory(prof->DllPathX64, Path, PathLenBytes);
-            prof->DllPathX64Bytes = PathLenBytes;
+            RtlCopyMemory(prof->DllPathX64, Path, PathBytes);
+            prof->DllPathX64Bytes = (USHORT)PathBytes;
         }
     }
     KeReleaseSpinLock(&g_Inj.Lock, irql);
     return STATUS_SUCCESS;
 }
 
-NTSTATUS InjAddTarget(UCHAR Role, const CHAR* Name, ULONG NameLen)
+NTSTATUS InjAddTarget(UCHAR Role, const VOID* Path, ULONG PathBytes)
 {
-    if (!InjRoleValid(Role) || !Name || NameLen == 0 || NameLen >= INJ_MAX_NAME)
+    if (!InjRoleValid(Role) || !Path || PathBytes == 0 ||
+        (PathBytes % sizeof(WCHAR)) != 0 ||
+        PathBytes > (INJ_MAX_PATH - 1) * sizeof(WCHAR))
         return STATUS_INVALID_PARAMETER;
 
+    /* The IOCTL payload is unaligned: copy before treating it as WCHARs. */
+    WCHAR raw[INJ_MAX_PATH];
+    RtlCopyMemory(raw, Path, PathBytes);
+
+    /* Only an absolute NT path can equal a normalized image name. */
+    if (raw[0] != L'\\')
+        return STATUS_OBJECT_PATH_SYNTAX_BAD;
+
+    UNICODE_STRING src;
+    src.Buffer = raw;
+    src.Length = (USHORT)PathBytes;
+    src.MaximumLength = (USHORT)PathBytes;
+
+    INJ_TARGET target;
+    NTSTATUS status = UpcasePath(&src, target.Path, &target.Bytes);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    status = STATUS_SUCCESS;
     KIRQL irql;
     KeAcquireSpinLock(&g_Inj.Lock, &irql);
     {
         INJ_PROFILE* prof = &g_Inj.Profile[Role];
-        if (prof->TargetCount >= INJ_MAX_TARGETS) {
-            KeReleaseSpinLock(&g_Inj.Lock, irql);
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
+        BOOLEAN present = FALSE;
         for (ULONG i = 0; i < prof->TargetCount; i++) {
-            if (_stricmp(prof->Targets[i], Name) == 0) {
-                KeReleaseSpinLock(&g_Inj.Lock, irql);
-                return STATUS_ALREADY_COMMITTED;
+            if (prof->Targets[i].Bytes == target.Bytes &&
+                RtlCompareMemory(prof->Targets[i].Path, target.Path, target.Bytes) == target.Bytes) {
+                present = TRUE;
+                break;
             }
         }
-        RtlCopyMemory(prof->Targets[prof->TargetCount], Name, NameLen);
-        prof->Targets[prof->TargetCount][NameLen] = '\0';
-        prof->TargetCount++;
+        if (!present) {
+            if (prof->TargetCount >= INJ_MAX_TARGETS) {
+                status = STATUS_INSUFFICIENT_RESOURCES;
+            } else {
+                INJ_TARGET* slot = &prof->Targets[prof->TargetCount++];
+                RtlCopyMemory(slot->Path, target.Path, target.Bytes);
+                slot->Bytes = target.Bytes;
+            }
+        }
     }
     KeReleaseSpinLock(&g_Inj.Lock, irql);
-    return STATUS_SUCCESS;
+    return status;
 }
 
 NTSTATUS InjClearTargets(VOID)
@@ -657,7 +684,7 @@ NTSTATUS InjClearTargets(VOID)
     for (UCHAR r = 0; r < INJ_ROLE_COUNT; r++)
         g_Inj.Profile[r].TargetCount = 0;
     g_Inj.PendingCount = 0;
-    /* Leave PendingFree entries — still need to free if inject already ran. */
+    /* Injected entries stay: those processes still host our DLL. */
     KeReleaseSpinLock(&g_Inj.Lock, irql);
     return STATUS_SUCCESS;
 }
@@ -668,6 +695,22 @@ VOID InjSetEnabled(BOOLEAN Enabled)
     KeAcquireSpinLock(&g_Inj.Lock, &irql);
     g_Inj.Enabled = Enabled;
     KeReleaseSpinLock(&g_Inj.Lock, irql);
+}
+
+ULONG InjQueryRole(HANDLE Pid)
+{
+    ULONG result = INJ_QUERY_NONE;
+    KIRQL irql;
+    KeAcquireSpinLock(&g_Inj.Lock, &irql);
+    for (ULONG i = 0; i < g_Inj.InjectedCount; i++) {
+        if (g_Inj.Injected[i].Pid == Pid) {
+            result = (g_Inj.Injected[i].Role == INJ_ROLE_SENSOR)
+                ? INJ_QUERY_SENSOR : INJ_QUERY_GAME;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_Inj.Lock, irql);
+    return result;
 }
 
 /* ------------------------------------------------------------------ */
@@ -682,26 +725,38 @@ VOID InjOnImageLoad(HANDLE ProcessId, PUNICODE_STRING FullImageName,
 
     /* Trigger when kernel32 maps in a pending target. KernelBase is already
        initialized by then; APC is delivered later (no KeTestAlertThread). */
-    if (!UStrEndsWith(FullImageName, L"kernel32.dll")) return;
+    if (!UStrEndsWith(FullImageName, L"\\kernel32.dll")) return;
 
     UCHAR role = INJ_ROLE_GAME;
     if (!PendingTake(ProcessId, &role)) return;
 
     BOOLEAN isWow64 = UStrContainsI(FullImageName, L"syswow64");
 
-    NTSTATUS st = DoInjectInContext(isWow64, ImageInfo->ImageBase, role);
+    /* Reserve the bookkeeping slot first: an inject we cannot account for
+       (IPC authentication relies on it) must not happen at all. */
+    NTSTATUS st;
+    if (!InjectedAdd(ProcessId, role)) {
+        st = STATUS_INSUFFICIENT_RESOURCES;
+    } else {
+        st = DoInjectInContext(isWow64, ImageInfo->ImageBase, role);
+        if (!NT_SUCCESS(st))
+            InjectedRemove(ProcessId);
+    }
 
     CHAR json[COMS_MAX_MESSAGE_SIZE];
     ULONG tid = (ULONG)(ULONG_PTR)PsGetCurrentThreadId();
     const CHAR* roleStr = InjRoleName(role);
     if (NT_SUCCESS(st)) {
-        /* Only Game inject auto-protects the PID (Sensor = cheat host). */
+        /* Only Game inject auto-protects the PID (Sensor = cheat host).
+           This grants PROTECTED only — never TRUSTED. */
+        BOOLEAN isProtected = FALSE;
         if (role == INJ_ROLE_GAME)
-            StateAddPid(ProcessId);
+            isProtected = NT_SUCCESS(StateProtectPid(ProcessId));
         RtlStringCchPrintfA(json, ARRAYSIZE(json),
             "{ \"event\": \"apc_inject\", \"pid\": %lu, \"tid\": %lu, "
-            "\"status\": \"success\", \"role\": \"%s\" }",
-            (ULONG)(ULONG_PTR)ProcessId, tid, roleStr);
+            "\"status\": \"success\", \"role\": \"%s\", \"protected\": %s }",
+            (ULONG)(ULONG_PTR)ProcessId, tid, roleStr,
+            isProtected ? "true" : "false");
     } else {
         RtlStringCchPrintfA(json, ARRAYSIZE(json),
             "{ \"event\": \"apc_inject\", \"pid\": %lu, \"tid\": %lu, "
@@ -715,7 +770,7 @@ VOID InjOnImageLoad(HANDLE ProcessId, PUNICODE_STRING FullImageName,
 
 VOID InjOnProcessCreate(HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateInfo)
 {
-    if (!CreateInfo || !CreateInfo->ImageFileName) return;
+    if (!CreateInfo || !CreateInfo->FileObject) return;
 
     KIRQL irql;
     KeAcquireSpinLock(&g_Inj.Lock, &irql);
@@ -728,35 +783,40 @@ VOID InjOnProcessCreate(HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateInfo)
     KeReleaseSpinLock(&g_Inj.Lock, irql);
     if (!go || totalTargets == 0) return;
 
-    ANSI_STRING ansi = { 0 };
-    if (!NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansi, CreateInfo->ImageFileName, TRUE)))
-        return;
+    /* Normalized NT path of the image actually being executed. Unlike
+       CreateInfo->ImageFileName this is independent of how the caller spelled
+       the path (short names, relative paths, links resolved by the FS). */
+    PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
+    NTSTATUS st = FltGetFileNameInformationUnsafe(CreateInfo->FileObject, NULL,
+        FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &nameInfo);
+    if (!NT_SUCCESS(st) || nameInfo == NULL) return;
 
-    CHAR buf[260];
-    SIZE_T n = min(ansi.Length, sizeof(buf) - 1);
-    RtlCopyMemory(buf, ansi.Buffer, n);
-    buf[n] = '\0';
-    RtlFreeAnsiString(&ansi);
+    WCHAR upper[INJ_MAX_PATH];
+    USHORT upperBytes = 0;
+    st = UpcasePath(&nameInfo->Name, upper, &upperBytes);
+    FltReleaseFileNameInformation(nameInfo);
+    if (!NT_SUCCESS(st)) return; /* longer than any configurable target */
 
     UCHAR role = INJ_ROLE_GAME;
-    if (MatchTargetRole(buf, &role)) {
-        PendingAdd(ProcessId, role);
-        KdPrint(("Peregrine: injection pending PID %lu role=%s (%s)\n",
-            (ULONG)(ULONG_PTR)ProcessId, InjRoleName(role), buf));
+    if (!MatchTargetRole(upper, upperBytes, &role)) return;
+
+    if (!PendingAdd(ProcessId, role)) {
+        CHAR json[COMS_MAX_MESSAGE_SIZE];
+        RtlStringCchPrintfA(json, ARRAYSIZE(json),
+            "{ \"event\": \"apc_inject\", \"pid\": %lu, \"tid\": 0, "
+            "\"status\": \"failed\", \"error\": \"0x%08X\", \"role\": \"%s\" }",
+            (ULONG)(ULONG_PTR)ProcessId, (ULONG)STATUS_INSUFFICIENT_RESOURCES,
+            InjRoleName(role));
+        ComsSendToUser(json, (ULONG)strlen(json));
+        return;
     }
+
+    KdPrint(("Peregrine: injection pending PID %lu role=%s\n",
+        (ULONG)(ULONG_PTR)ProcessId, InjRoleName(role)));
 }
 
 VOID InjOnProcessExit(HANDLE ProcessId)
 {
-    UCHAR unusedRole = 0;
-    PendingTake(ProcessId, &unusedRole);
-    PendingFreeRelease(ProcessId, TRUE);
-    StateRemovePid(ProcessId);
-}
-
-BOOLEAN InjOnThreadCreate(HANDLE ProcessId, HANDLE ThreadId)
-{
-    UNREFERENCED_PARAMETER(ProcessId);
-    UNREFERENCED_PARAMETER(ThreadId);
-    return FALSE;
+    PendingTake(ProcessId, NULL);
+    InjectedRemove(ProcessId);
 }

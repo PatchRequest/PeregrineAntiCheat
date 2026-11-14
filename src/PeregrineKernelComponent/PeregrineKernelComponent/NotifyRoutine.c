@@ -68,6 +68,8 @@ VOID CreateProcessNotifyRoutineEx(
         /* process_exit only for protected PIDs (UI list cleanup); silent otherwise. */
         BOOLEAN wasProtected = StateIsPidProtected(ProcessId);
         InjOnProcessExit(ProcessId);
+        /* A recycled PID must inherit neither PROTECTED nor TRUSTED. */
+        StateOnProcessExit(ProcessId);
 
         if (wasProtected) {
             CHAR json[COMS_MAX_MESSAGE_SIZE];
@@ -86,11 +88,6 @@ VOID CreateThreadNotifyRoutine(
     _In_ HANDLE ThreadId,
     _In_ BOOLEAN Create
 ) {
-    if (Create && InjOnThreadCreate(ProcessId, ThreadId)) {
-        /* Injection was performed; also let the normal logging proceed
-           once the PID gets added to the protected list by userland. */
-    }
-
     const CHAR* ev = Create ? "thread_create" : "thread_exit";
 
 	if (!StateIsPidProtected(ProcessId)) {
@@ -181,30 +178,53 @@ VOID LoadImageNotifyRoutine(
     SendJsonString(json);
 }
 
+/* Which routines are currently registered — so a partial failure in
+   registerNotifyRoutine unwinds exactly what was set up. */
+static BOOLEAN g_ProcessNotifyRegistered = FALSE;
+static BOOLEAN g_ThreadNotifyRegistered = FALSE;
+static BOOLEAN g_ImageNotifyRegistered = FALSE;
+
+void unregisterNotifyRoutine() {
+    if (g_ImageNotifyRegistered) {
+        PsRemoveLoadImageNotifyRoutine(LoadImageNotifyRoutine);
+        g_ImageNotifyRegistered = FALSE;
+    }
+    if (g_ThreadNotifyRegistered) {
+        PsRemoveCreateThreadNotifyRoutine(CreateThreadNotifyRoutine);
+        g_ThreadNotifyRegistered = FALSE;
+    }
+    if (g_ProcessNotifyRegistered) {
+        PsSetCreateProcessNotifyRoutineEx(CreateProcessNotifyRoutineEx, TRUE);
+        g_ProcessNotifyRegistered = FALSE;
+    }
+}
+
 NTSTATUS registerNotifyRoutine() {
     NTSTATUS status = PsSetCreateProcessNotifyRoutineEx(CreateProcessNotifyRoutineEx, FALSE);
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
             "PsSetCreateProcessNotifyRoutineEx failed with status 0x%08X\n", status);
+        return status;
     }
+    g_ProcessNotifyRegistered = TRUE;
 
     status = PsSetCreateThreadNotifyRoutine(CreateThreadNotifyRoutine);
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
             "PsSetCreateThreadNotifyRoutine failed with status 0x%08X\n", status);
+        unregisterNotifyRoutine();
+        return status;
     }
+    g_ThreadNotifyRegistered = TRUE;
 
     status = PsSetLoadImageNotifyRoutine(LoadImageNotifyRoutine);
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
             "PsSetLoadImageNotifyRoutine failed with status 0x%08X\n", status);
+        unregisterNotifyRoutine();
+        return status;
     }
+    g_ImageNotifyRegistered = TRUE;
 
-    return status;
-}
-
-void unregisterNotifyRoutine() {
-    PsSetCreateProcessNotifyRoutineEx(CreateProcessNotifyRoutineEx, TRUE);
-    PsRemoveCreateThreadNotifyRoutine(CreateThreadNotifyRoutine);
-    PsRemoveLoadImageNotifyRoutine(LoadImageNotifyRoutine);
+    return STATUS_SUCCESS;
 }

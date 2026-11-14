@@ -77,163 +77,118 @@ static ULONG g_Head = 0; // Next insertion point
 static ULONG g_Tail = 0; // Next removal point
 static ULONG g_Count = 0;
 
-static VOID ComsHandleUserCommand(_In_reads_bytes_(DataSize) const UCHAR* Data,
-    _In_ ULONG DataSize)
+/* Events discarded because the ring was full; reported by the next RECV. */
+static ULONG g_Dropped = 0;
+
+/* Upper bound for the synthesized overflow notice (see ComsDeviceControl). */
+#define COMS_OVERFLOW_NOTICE_MAX 96
+
+static NTSTATUS ReadPidArg(
+    _In_reads_bytes_(DataSize) const UCHAR* Data,
+    _In_ ULONG DataSize,
+    _Out_ HANDLE* Pid)
 {
-    if (!Data || DataSize == 0) {
-        KdPrint(("Peregrine: empty/NULL user command\n"));
-        return;
-    }
-    KdPrint(("Peregrine: Received command 0x%02X, DataSize=%lu\n", Data[0], DataSize));
-    HANDLE pid = 0;
+    *Pid = NULL;
+    if (DataSize < 1 + sizeof(HANDLE))
+        return STATUS_BUFFER_TOO_SMALL;
+    RtlCopyMemory(Pid, Data + 1, sizeof(HANDLE)); /* payload is unaligned */
+    return STATUS_SUCCESS;
+}
+
+/*
+ * PASSIVE_LEVEL. RequestorPid is the process that issued the IOCTL.
+ * The returned status becomes the IOCTL status, so the GUI sees real failures.
+ */
+static NTSTATUS ComsHandleUserCommand(
+    _In_reads_bytes_(DataSize) const UCHAR* Data,
+    _In_ ULONG DataSize,
+    _In_ HANDLE RequestorPid)
+{
+    if (!Data || DataSize == 0)
+        return STATUS_INVALID_PARAMETER;
+
+    const UCHAR* payload = Data + 1;
+    const ULONG payloadSize = DataSize - 1;
+    HANDLE pid = NULL;
+    NTSTATUS status;
+
     switch (Data[0]) {
-    case 1: { // set PID
-        if (DataSize < 1 + sizeof(HANDLE)) {
-            KdPrint(("Peregrine: cmd=1 too small (%lu)\n", DataSize));
-            return;
-        }
-        
-        RtlCopyMemory(&pid, Data + 1, sizeof(pid)); // avoid unaligned deref
-		StateAddPid(pid);
-        KdPrint(("Peregrine: user set target PID to %ld\n", pid));
-        break;
-    }
-    case 2:
-        if (DataSize < 1 + sizeof(HANDLE)) {
-            KdPrint(("Peregrine: cmd=1 too small (%lu)\n", DataSize));
-            return;
-        }
-        
-        RtlCopyMemory(&pid, Data + 1, sizeof(pid)); // avoid unaligned deref
-        StateRemovePid(pid);
-        KdPrint(("Peregrine: user set target PID to %ld\n", pid));
-        break;
+    case ComsCmdProtectPid:
+        status = ReadPidArg(Data, DataSize, &pid);
+        if (NT_SUCCESS(status))
+            status = StateProtectPid(pid);
+        return status;
 
-    case 3:
-	{ // clear all PIDs
-        StateClearPids();
-		KdPrint(("Peregrine: user cleared all target PIDs\n"));
-		break;
-	}
+    case ComsCmdUnprotectPid:
+        status = ReadPidArg(Data, DataSize, &pid);
+        if (NT_SUCCESS(status))
+            status = StateUnprotectPid(pid);
+        return status;
 
-    case 4: { // set process to PPL
-        if (DataSize < 1 + sizeof(HANDLE)) {
-            KdPrint(("Peregrine: cmd=4 too small (%lu)\n", DataSize));
-            return;
-        }
-        
-        RtlCopyMemory(&pid, Data + 1, sizeof(pid));
+    case ComsCmdClearProtected:
+        StateClearProtected();
+        return STATUS_SUCCESS;
 
-        NTSTATUS status = ProtectionSetProcessPPL(pid);
-        if (NT_SUCCESS(status)) {
-            KdPrint(("Peregrine: Set PID %lu to PPL successfully\n", (ULONG)(ULONG_PTR)pid));
-        } else {
-            KdPrint(("Peregrine: Failed to set PID %lu to PPL: 0x%X\n", (ULONG)(ULONG_PTR)pid, status));
-        }
-        break;
-    }
+    case ComsCmdSetPpl:
+        status = ReadPidArg(Data, DataSize, &pid);
+        if (NT_SUCCESS(status))
+            status = ProtectionSetProcessPPL(pid);
+        return status;
 
-    case 5: { // scan loaded drivers
-        KdPrint(("Peregrine: user requested driver scan\n"));
-        DriverScanEnumerate();
-        break;
-    }
+    case ComsCmdScanDrivers:
+        return DriverScanEnumerate();
 
-    case 6: { // scan ObCallbacks
-        KdPrint(("Peregrine: user requested ObCallback scan\n"));
-        ObCallbackScanEnumerate();
-        break;
-    }
+    case ComsCmdScanObCallbacks:
+        return ObCallbackScanEnumerate();
 
-    case 7: { // system integrity checks
-        KdPrint(("Peregrine: user requested system check\n"));
-        SystemCheckRunAll();
-        break;
-    }
+    case ComsCmdSystemCheck:
+        return SystemCheckRunAll();
 
-    case 8: { // set Game x64 DLL path (full wide path)
-        if (DataSize <= 1) { KdPrint(("Peregrine: cmd=8 empty\n")); return; }
-        USHORT pathBytes = (USHORT)(DataSize - 1);
-        InjSetDllPath(INJ_ROLE_GAME, FALSE, (const WCHAR*)(Data + 1), pathBytes);
-        KdPrint(("Peregrine: set Game x64 DLL path (%u bytes)\n", pathBytes));
-        break;
-    }
+    case ComsCmdSetGameDllX64:
+        return InjSetDllPath(INJ_ROLE_GAME, FALSE, payload, payloadSize);
 
-    case 9: { // set Game x86 DLL path (full wide path)
-        if (DataSize <= 1) { KdPrint(("Peregrine: cmd=9 empty\n")); return; }
-        USHORT pathBytes = (USHORT)(DataSize - 1);
-        InjSetDllPath(INJ_ROLE_GAME, TRUE, (const WCHAR*)(Data + 1), pathBytes);
-        KdPrint(("Peregrine: set Game x86 DLL path (%u bytes)\n", pathBytes));
-        break;
-    }
+    case ComsCmdSetGameDllX86:
+        return InjSetDllPath(INJ_ROLE_GAME, TRUE, payload, payloadSize);
 
-    case 10: { // add Game APC injection target (ANSI basename, e.g. game.exe)
-        if (DataSize <= 1) { KdPrint(("Peregrine: cmd=10 empty\n")); return; }
-        ULONG nameLen = DataSize - 1;
-        InjAddTarget(INJ_ROLE_GAME, (const CHAR*)(Data + 1), nameLen);
-        KdPrint(("Peregrine: added Game injection target\n"));
-        break;
-    }
+    case ComsCmdAddGameTarget:
+        return InjAddTarget(INJ_ROLE_GAME, payload, payloadSize);
 
-    case 11: { // enable (1) or disable (0) kernel APC auto-injection
-        if (DataSize < 2) { KdPrint(("Peregrine: cmd=11 too small\n")); return; }
-        BOOLEAN enable = Data[1] != 0;
-        InjSetEnabled(enable);
-        KdPrint(("Peregrine: injection %s\n", enable ? "enabled" : "disabled"));
-        break;
-    }
+    case ComsCmdSetInjectionEnabled:
+        if (payloadSize < 1)
+            return STATUS_BUFFER_TOO_SMALL;
+        InjSetEnabled(payload[0] != 0);
+        return STATUS_SUCCESS;
 
-    case 12: { // collect hardware identifiers
-        KdPrint(("Peregrine: user requested HWID collection\n"));
-        HwidCollectAll();
-        break;
-    }
+    case ComsCmdCollectHwid:
+        return HwidCollectAll();
 
-    case 13: { // VAD scan for executable private memory
-        if (DataSize < 1 + sizeof(HANDLE)) {
-            KdPrint(("Peregrine: cmd=13 too small (%lu)\n", DataSize));
-            return;
-        }
-        RtlCopyMemory(&pid, Data + 1, sizeof(pid));
-        KdPrint(("Peregrine: user requested VAD scan for PID %lu\n", (ULONG)(ULONG_PTR)pid));
-        VadScanProcess(pid);
-        break;
-    }
+    case ComsCmdScanVad:
+        status = ReadPidArg(Data, DataSize, &pid);
+        if (NT_SUCCESS(status))
+            status = VadScanProcess(pid);
+        return status;
 
-    case 14: { // clear injection targets + disable
+    case ComsCmdClearTargets:
         InjClearTargets();
         InjSetEnabled(FALSE);
-        KdPrint(("Peregrine: injection targets cleared and disabled\n"));
-        break;
-    }
+        return STATUS_SUCCESS;
 
-    case 15: { // set Sensor x64 DLL path
-        if (DataSize <= 1) { KdPrint(("Peregrine: cmd=15 empty\n")); return; }
-        USHORT pathBytes = (USHORT)(DataSize - 1);
-        InjSetDllPath(INJ_ROLE_SENSOR, FALSE, (const WCHAR*)(Data + 1), pathBytes);
-        KdPrint(("Peregrine: set Sensor x64 DLL path (%u bytes)\n", pathBytes));
-        break;
-    }
+    case ComsCmdSetSensorDllX64:
+        return InjSetDllPath(INJ_ROLE_SENSOR, FALSE, payload, payloadSize);
 
-    case 16: { // set Sensor x86 DLL path
-        if (DataSize <= 1) { KdPrint(("Peregrine: cmd=16 empty\n")); return; }
-        USHORT pathBytes = (USHORT)(DataSize - 1);
-        InjSetDllPath(INJ_ROLE_SENSOR, TRUE, (const WCHAR*)(Data + 1), pathBytes);
-        KdPrint(("Peregrine: set Sensor x86 DLL path (%u bytes)\n", pathBytes));
-        break;
-    }
+    case ComsCmdSetSensorDllX86:
+        return InjSetDllPath(INJ_ROLE_SENSOR, TRUE, payload, payloadSize);
 
-    case 17: { // add Sensor APC injection target (ANSI basename)
-        if (DataSize <= 1) { KdPrint(("Peregrine: cmd=17 empty\n")); return; }
-        ULONG nameLen = DataSize - 1;
-        InjAddTarget(INJ_ROLE_SENSOR, (const CHAR*)(Data + 1), nameLen);
-        KdPrint(("Peregrine: added Sensor injection target\n"));
-        break;
-    }
+    case ComsCmdAddSensorTarget:
+        return InjAddTarget(INJ_ROLE_SENSOR, payload, payloadSize);
+
+    case ComsCmdTrustCaller:
+        /* Deliberately takes no PID: a process can only ever vouch for itself. */
+        return StateTrustPid(RequestorPid);
 
     default:
         KdPrint(("Peregrine: unknown command 0x%02X\n", Data[0]));
-        break;
+        return STATUS_INVALID_DEVICE_REQUEST;
     }
 }
 
@@ -249,10 +204,12 @@ NTSTATUS ComsSendToUser(_In_reads_bytes_(DataSize) const void* Data, _In_ ULONG 
     KIRQL oldIrql;
     KeAcquireSpinLock(&g_ComsLock, &oldIrql);
 
-    // If full, overwrite the oldest (advance tail) to avoid blocking producers.
+    // If full, discard the oldest entry (never block producers) and count it.
     if (g_Count == COMS_MAX_QUEUE_DEPTH) {
         g_Tail = (g_Tail + 1) % COMS_MAX_QUEUE_DEPTH;
         g_Count--;
+        if (g_Dropped != MAXULONG)
+            g_Dropped++;
     }
 
     RtlCopyMemory(g_MessageQueue[g_Head].Data, Data, DataSize);
@@ -261,8 +218,6 @@ NTSTATUS ComsSendToUser(_In_reads_bytes_(DataSize) const void* Data, _In_ ULONG 
     g_Count++;
 
     KeReleaseSpinLock(&g_ComsLock, oldIrql);
-
-    //KdPrint(("Peregrine: queued %lu bytes for user retrieval (depth %lu/%u)\n", DataSize, g_Count, COMS_MAX_QUEUE_DEPTH));
     return STATUS_SUCCESS;
 }
 
@@ -290,17 +245,60 @@ NTSTATUS ComsDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp) {
             break;
         }
 
-        const ULONG bytesToProcess = (inLength > COMS_MAX_MESSAGE_SIZE) ? COMS_MAX_MESSAGE_SIZE : inLength;
-        ComsHandleUserCommand((const UCHAR*)Irp->AssociatedIrp.SystemBuffer, bytesToProcess);
-        status = STATUS_SUCCESS;
+        if (inLength > COMS_MAX_MESSAGE_SIZE) {
+            status = STATUS_INVALID_BUFFER_SIZE;
+            break;
+        }
+
+        status = ComsHandleUserCommand(
+            (const UCHAR*)Irp->AssociatedIrp.SystemBuffer, inLength,
+            (HANDLE)(ULONG_PTR)IoGetRequestorProcessId(Irp));
         information = 0;
+        break;
+    }
+    case IOCTL_PEREGRINE_QUERY_INJECTED: {
+        if (Irp->AssociatedIrp.SystemBuffer == NULL ||
+            stack->Parameters.DeviceIoControl.InputBufferLength < sizeof(ULONG) ||
+            stack->Parameters.DeviceIoControl.OutputBufferLength < sizeof(ULONG)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        ULONG pid = 0;
+        RtlCopyMemory(&pid, Irp->AssociatedIrp.SystemBuffer, sizeof(pid));
+        ULONG role = InjQueryRole((HANDLE)(ULONG_PTR)pid);
+        RtlCopyMemory(Irp->AssociatedIrp.SystemBuffer, &role, sizeof(role));
+        information = sizeof(role);
+        status = STATUS_SUCCESS;
         break;
     }
     case IOCTL_PEREGRINE_RECV_TO_USER: {
         const ULONG outLength = stack->Parameters.DeviceIoControl.OutputBufferLength;
+        ULONG dropped = 0;
 
         KIRQL oldIrql;
         KeAcquireSpinLock(&g_ComsLock, &oldIrql);
+
+        /* Pending overflow notice goes out first; the queue itself is left
+           untouched and is drained by the following calls. */
+        if (g_Dropped != 0) {
+            if (outLength < COMS_OVERFLOW_NOTICE_MAX) {
+                status = STATUS_BUFFER_TOO_SMALL;
+                KeReleaseSpinLock(&g_ComsLock, oldIrql);
+                break;
+            }
+            dropped = g_Dropped;
+            g_Dropped = 0;
+            KeReleaseSpinLock(&g_ComsLock, oldIrql);
+
+            /* Formatted outside the spinlock (PASSIVE_LEVEL). */
+            PCHAR out = (PCHAR)Irp->AssociatedIrp.SystemBuffer;
+            status = RtlStringCchPrintfA(out, COMS_OVERFLOW_NOTICE_MAX,
+                "{ \"event\": \"coms_overflow\", \"dropped\": %lu }", dropped);
+            if (NT_SUCCESS(status))
+                information = strlen(out);
+            break;
+        }
 
         if (g_Count == 0) {
             status = STATUS_NO_MORE_ENTRIES;
