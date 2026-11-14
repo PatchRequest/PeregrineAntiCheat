@@ -4,20 +4,87 @@ mod detections;
 mod etw_ti;
 mod hwid;
 
-use driver_comm::DriverHandle;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
-use tauri::{AppHandle, Emitter};
+use driver_comm::{DllArch, DriverHandle, InjectRole};
+use serde::Serialize;
+use std::sync::{Arc, Mutex};
+use tauri::{AppHandle, Emitter, Manager};
 
 // Every command opens its own driver handle. No shared state, no mutex, no deadlocks.
 
+/// Liveness of one backend channel, as shown in the UI banner.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct ChannelStatus {
+    online: bool,
+    detail: String,
+}
+
+impl ChannelStatus {
+    fn starting() -> Self {
+        Self { online: false, detail: "starting".into() }
+    }
+}
+
+/// Last known state of the two channels the GUI depends on. The UI reads this
+/// on mount (events emitted before the page listens would otherwise be lost)
+/// and then follows `driver-status` / `ipc-status` events.
+#[derive(Debug, Clone, Serialize)]
+struct BackendStatus {
+    driver: ChannelStatus,
+    ipc: ChannelStatus,
+}
+
+type SharedBackendStatus = Arc<Mutex<BackendStatus>>;
+
+#[derive(Clone, Copy)]
+enum Channel {
+    Driver,
+    Ipc,
+}
+
+/// Records the new state and notifies the UI only when it actually changed.
+fn set_channel_status(
+    app: &AppHandle,
+    shared: &SharedBackendStatus,
+    channel: Channel,
+    online: bool,
+    detail: String,
+) {
+    let new = ChannelStatus { online, detail };
+    {
+        let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = match channel {
+            Channel::Driver => &mut guard.driver,
+            Channel::Ipc => &mut guard.ipc,
+        };
+        if *slot == new {
+            return;
+        }
+        *slot = new.clone();
+    }
+    let event = match channel {
+        Channel::Driver => "driver-status",
+        Channel::Ipc => "ipc-status",
+    };
+    let _ = app.emit(event, &new);
+}
+
+#[tauri::command]
+fn backend_status(state: tauri::State<'_, SharedBackendStatus>) -> BackendStatus {
+    state.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// (Re)establishes this GUI's standing with the driver. Driver state does not
+/// survive a driver restart, so the UI calls this on every offline→online edge.
 #[tauri::command]
 fn connect_driver() -> Result<String, String> {
     let h = DriverHandle::open()?;
-    let my_pid = std::process::id();
-    let _ = h.add_pid(my_pid);
 
-    let mut msg = format!("connected (self PID {} protected)", my_pid);
+    // TRUSTED (not PROTECTED): this process is the AC. Without it the minifilter
+    // would deny our own file access and ObCallback would report our scans.
+    h.trust_self()
+        .map_err(|e| format!("driver refused to trust the GUI: {e}"))?;
+
+    let mut msg = format!("connected (GUI PID {} trusted)", std::process::id());
 
     let exe_dir = std::env::current_exe()
         .ok()
@@ -32,44 +99,28 @@ fn connect_driver() -> Result<String, String> {
     .flatten()
     .collect();
 
-    let find_dll = |names: &[&str]| -> Option<String> {
-        for dir in &search_dirs {
-            for name in names {
-                let p = dir.join(name);
-                if p.exists() {
-                    return Some(p.to_string_lossy().into_owned());
-                }
-            }
-        }
-        None
+    let find_dll = |name: &str| -> Option<String> {
+        search_dirs
+            .iter()
+            .map(|dir| dir.join(name))
+            .find(|p| p.exists())
+            .map(|p| p.to_string_lossy().into_owned())
     };
 
-    // Game DLL (primary inject into protected game)
-    if let Some(x64) = find_dll(&["PeregrineGame_x64.dll"]) {
-        let _ = h.set_dll_path_x64(&x64);
-        msg.push_str(&format!(" | game-x64: {x64}"));
-    } else {
-        msg.push_str(" | game-x64: NOT FOUND");
-    }
-    if let Some(x86) = find_dll(&["PeregrineGame_x86.dll"]) {
-        let _ = h.set_dll_path_x86(&x86);
-        msg.push_str(&format!(" | game-x86: {x86}"));
-    } else {
-        msg.push_str(" | game-x86: NOT FOUND");
-    }
-
-    // Sensor DLL (optional inject into cheats / external tools)
-    if let Some(x64) = find_dll(&["PeregrineSensor_x64.dll"]) {
-        let _ = h.set_sensor_dll_path_x64(&x64);
-        msg.push_str(&format!(" | sensor-x64: {x64}"));
-    } else {
-        msg.push_str(" | sensor-x64: NOT FOUND");
-    }
-    if let Some(x86) = find_dll(&["PeregrineSensor_x86.dll"]) {
-        let _ = h.set_sensor_dll_path_x86(&x86);
-        msg.push_str(&format!(" | sensor-x86: {x86}"));
-    } else {
-        msg.push_str(" | sensor-x86: NOT FOUND");
+    let dlls = [
+        ("game-x64", "PeregrineGame_x64.dll", InjectRole::Game, DllArch::X64),
+        ("game-x86", "PeregrineGame_x86.dll", InjectRole::Game, DllArch::X86),
+        ("sensor-x64", "PeregrineSensor_x64.dll", InjectRole::Sensor, DllArch::X64),
+        ("sensor-x86", "PeregrineSensor_x86.dll", InjectRole::Sensor, DllArch::X86),
+    ];
+    for (label, file, role, arch) in dlls {
+        match find_dll(file) {
+            Some(path) => match h.set_dll_path(role, arch, &path) {
+                Ok(()) => msg.push_str(&format!(" | {label}: {path}")),
+                Err(e) => msg.push_str(&format!(" | {label}: REJECTED ({e})")),
+            },
+            None => msg.push_str(&format!(" | {label}: NOT FOUND")),
+        }
     }
 
     Ok(msg)
@@ -77,17 +128,17 @@ fn connect_driver() -> Result<String, String> {
 
 #[tauri::command]
 fn add_pid(pid: u32) -> Result<(), String> {
-    DriverHandle::open()?.add_pid(pid)
+    DriverHandle::open()?.protect_pid(pid)
 }
 
 #[tauri::command]
 fn remove_pid(pid: u32) -> Result<(), String> {
-    DriverHandle::open()?.remove_pid(pid)
+    DriverHandle::open()?.unprotect_pid(pid)
 }
 
 #[tauri::command]
 fn clear_pids() -> Result<(), String> {
-    DriverHandle::open()?.clear_pids()
+    DriverHandle::open()?.clear_protected()
 }
 
 #[tauri::command]
@@ -110,20 +161,24 @@ fn system_check() -> Result<(), String> {
     DriverHandle::open()?.system_check()
 }
 
-#[tauri::command]
-fn add_injection_target(name: String) -> Result<String, String> {
+/// Registers `path` (an existing executable) as an inject target and returns
+/// the normalized NT path the kernel will match — the target's identity.
+fn add_target(role: InjectRole, path: &str) -> Result<String, String> {
+    let nt_path = driver_comm::image_nt_path(path)?;
     let h = DriverHandle::open()?;
-    h.add_injection_target(&name)?;
+    h.add_injection_target(role, &nt_path)?;
     h.set_injection_enabled(true)?;
-    Ok(format!("Game target '{}' added, injection enabled", name))
+    Ok(nt_path)
 }
 
 #[tauri::command]
-fn add_sensor_injection_target(name: String) -> Result<String, String> {
-    let h = DriverHandle::open()?;
-    h.add_sensor_injection_target(&name)?;
-    h.set_injection_enabled(true)?;
-    Ok(format!("Sensor target '{}' added, injection enabled", name))
+fn add_injection_target(path: String) -> Result<String, String> {
+    add_target(InjectRole::Game, &path)
+}
+
+#[tauri::command]
+fn add_sensor_injection_target(path: String) -> Result<String, String> {
+    add_target(InjectRole::Sensor, &path)
 }
 
 #[tauri::command]
@@ -207,69 +262,93 @@ fn scan_overlays() -> Vec<detections::overlay::OverlayWindow> {
     detections::overlay::detect_overlays()
 }
 
-fn start_ipc_polling(app: AppHandle) {
-    let stop = Arc::new(AtomicBool::new(false));
-    let rx = ipc::start_ipc_server(stop);
+fn start_ipc_polling(app: AppHandle, status: SharedBackendStatus) {
+    let rx = ipc::start_ipc_server();
     std::thread::spawn(move || {
-        let mut count = 0u64;
-        while let Ok(msg) = rx.recv() {
-            count += 1;
-            let ev = msg.get("event").and_then(|v| v.as_str()).unwrap_or("?");
-            eprintln!("[DBG] IPC msg #{}: event={}", count, ev);
-            let _ = app.emit("ipc-event", &msg);
-            eprintln!("[DBG] IPC msg #{} emitted", count);
+        while let Ok(event) = rx.recv() {
+            match event {
+                ipc::IpcEvent::Message(msg) => {
+                    let _ = app.emit("ipc-event", &msg);
+                }
+                ipc::IpcEvent::ServerStatus { online, detail } => {
+                    set_channel_status(&app, &status, Channel::Ipc, online, detail);
+                }
+            }
         }
-        eprintln!("[DBG] IPC polling channel closed!");
+        // Sender dropped: the server thread is gone and nothing will arrive anymore.
+        set_channel_status(
+            &app,
+            &status,
+            Channel::Ipc,
+            false,
+            "IPC server thread exited".into(),
+        );
     });
 }
 
-fn start_driver_polling(app: AppHandle) {
+/// Pause between polls while the kernel queue is empty.
+const DRIVER_IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+/// Pause before retrying after the driver could not be reached.
+const DRIVER_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Drains kernel events and doubles as the driver heartbeat: every poll is a
+/// full IOCTL round-trip, so the first failed one flips the UI to
+/// "kernel component offline" and it stays there until a poll succeeds again.
+fn start_driver_polling(app: AppHandle, status: SharedBackendStatus) {
     std::thread::spawn(move || {
         let mut poll_handle: Option<DriverHandle> = None;
 
         loop {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-
-            if poll_handle.is_none() {
-                poll_handle = DriverHandle::open().ok();
-                if poll_handle.is_none() {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                    continue;
-                }
-            }
-
-            match poll_handle.as_ref().unwrap().recv_event() {
-                Ok(Some(raw)) => {
-                    let s = String::from_utf8_lossy(&raw);
-                    // Kernel emits valid JSON (JsonEscapeString); no massaging.
-                    match serde_json::from_str::<serde_json::Value>(&s) {
-                        Ok(obj) => {
-                            let ev = obj.get("event").and_then(|v| v.as_str()).unwrap_or("");
-                            // High-volume / uninteresting: drop before UI.
-                            // process_exit for protected PIDs is still forwarded
-                            // so the UI can prune protectedPids (no log line).
-                            if matches!(ev, "thread_exit" | "process_create") {
-                                // intentionally filtered
-                            } else {
-                                if !matches!(ev, "process_exit") {
-                                    eprintln!("[DBG] DRV event: {}", ev);
-                                }
-                                let _ = app.emit("driver-event", &obj);
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("[DBG] DRV JSON parse fail: {} | raw={}", e, s);
-                        }
+            let handle = match poll_handle.as_ref() {
+                Some(h) => h,
+                None => match DriverHandle::open() {
+                    Ok(h) => poll_handle.insert(h),
+                    Err(e) => {
+                        set_channel_status(&app, &status, Channel::Driver, false, e);
+                        std::thread::sleep(DRIVER_RETRY);
+                        continue;
                     }
+                },
+            };
+
+            match handle.recv_event() {
+                Ok(Some(raw)) => {
+                    set_channel_status(&app, &status, Channel::Driver, true, "online".into());
+                    forward_driver_event(&app, &raw);
+                    // Keep draining without a pause while events are queued.
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    set_channel_status(&app, &status, Channel::Driver, true, "online".into());
+                    std::thread::sleep(DRIVER_IDLE_POLL);
+                }
                 Err(e) => {
                     eprintln!("[DBG] DRV poll error: {}", e);
+                    set_channel_status(&app, &status, Channel::Driver, false, e);
                     poll_handle = None;
+                    std::thread::sleep(DRIVER_RETRY);
                 }
             }
         }
     });
+}
+
+fn forward_driver_event(app: &AppHandle, raw: &[u8]) {
+    let s = String::from_utf8_lossy(raw);
+    // Kernel emits valid JSON (JsonEscapeString); no massaging.
+    match serde_json::from_str::<serde_json::Value>(&s) {
+        Ok(obj) => {
+            let ev = obj.get("event").and_then(|v| v.as_str()).unwrap_or("");
+            // High-volume / uninteresting: drop before UI.
+            // process_exit for protected PIDs is still forwarded
+            // so the UI can prune protectedPids (no log line).
+            if !matches!(ev, "thread_exit" | "process_create") {
+                let _ = app.emit("driver-event", &obj);
+            }
+        }
+        Err(e) => {
+            eprintln!("[DBG] DRV JSON parse fail: {} | raw={}", e, s);
+        }
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -277,6 +356,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
+            backend_status,
             connect_driver,
             add_pid,
             remove_pid,
@@ -302,9 +382,15 @@ pub fn run() {
         ])
         .setup(|app| {
             detections::threads::enable_debug_privilege();
+            let status: SharedBackendStatus = Arc::new(Mutex::new(BackendStatus {
+                driver: ChannelStatus::starting(),
+                ipc: ChannelStatus::starting(),
+            }));
+            app.manage(status.clone());
+
             let handle = app.handle().clone();
-            start_driver_polling(handle.clone());
-            start_ipc_polling(handle);
+            start_driver_polling(handle.clone(), status.clone());
+            start_ipc_polling(handle, status);
             Ok(())
         })
         .run(tauri::generate_context!())

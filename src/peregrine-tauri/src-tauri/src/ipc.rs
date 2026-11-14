@@ -1,120 +1,256 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+//! Named-pipe server for telemetry from the injected Game / Sensor DLLs.
+//!
+//! Trust model
+//!   * The pipe is writable by any authenticated local user, because the DLL
+//!     runs inside medium-IL game processes. Being able to connect therefore
+//!     proves nothing.
+//!   * Every connection is authenticated by the client PID the pipe driver
+//!     reports (`GetNamedPipeClientProcessId` — not something the client can
+//!     choose) against the kernel's own inject bookkeeping
+//!     (`IOCTL_PEREGRINE_QUERY_INJECTED`). A process the kernel did not inject
+//!     is disconnected before a single byte is read.
+//!   * `callerPID` and `role` in every forwarded message are overwritten with
+//!     those verified values. Message *content* is still only a claim made by
+//!     code running inside that process, and must never promote a PID to
+//!     protected/trusted — only the kernel does that.
+//!
+//! Clients get write access only, and explicitly not FILE_CREATE_PIPE_INSTANCE:
+//! with it, any local process could create its own instance of this pipe name
+//! and swallow the DLL's connections.
+
+use crate::driver_comm::{DriverHandle, InjectRole};
+use std::sync::mpsc::{Receiver, Sender};
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+use windows::Win32::Storage::FileSystem::{
+    ReadFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_INBOUND,
+};
+use windows::Win32::System::Pipes::{
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
+    PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
+    PIPE_WAIT,
+};
 
 const PIPE_NAME: &str = r"\\.\pipe\peregrine_ipc";
-const BUF_SIZE: u32 = 65536;
-const PIPE_UNLIMITED_INSTANCES: u32 = 255;
-const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
+const READ_BUF_SIZE: usize = 64 * 1024;
 
-pub type IpcMessage = serde_json::Value;
-pub type IpcReceiver = std::sync::mpsc::Receiver<IpcMessage>;
+/// The DLL formats every message into a 1 KiB buffer. Anything that has not
+/// produced a complete JSON object within this many bytes is not our DLL.
+const MAX_PENDING_BYTES: usize = 16 * 1024;
 
-pub fn start_ipc_server(stop: Arc<AtomicBool>) -> IpcReceiver {
+/// SYSTEM + Administrators: full control.
+/// Authenticated Users: 0x00120192 =
+///   FILE_GENERIC_WRITE & ~FILE_CREATE_PIPE_INSTANCE | FILE_READ_ATTRIBUTES
+/// i.e. connect and write, but never create a server instance.
+const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00120192;;;AU)";
+
+pub enum IpcEvent {
+    /// A message from a kernel-verified injected process, `callerPID` / `role` stamped.
+    Message(serde_json::Value),
+    /// The server came up, or is unable to serve (pipe name taken, API failure).
+    ServerStatus { online: bool, detail: String },
+}
+
+pub fn start_ipc_server() -> Receiver<IpcEvent> {
     let (tx, rx) = std::sync::mpsc::channel();
-
-    std::thread::spawn(move || {
-        use windows::core::PCWSTR;
-        use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-        use windows::Win32::Storage::FileSystem::ReadFile;
-        use windows::Win32::System::Pipes::{
-            ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe,
-            PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
-        };
-
-        let wide: Vec<u16> = PIPE_NAME.encode_utf16().chain(std::iter::once(0)).collect();
-
-        // SYSTEM + Administrators full access; Authenticated Users read/write
-        // so medium-IL injected game processes can still send telemetry.
-        // Everyone (WD) is intentionally not granted access.
-        let sddl: Vec<u16> =
-            "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)\0".encode_utf16().collect();
-        let mut sd_ptr: *mut windows::Win32::Security::SECURITY_DESCRIPTOR =
-            std::ptr::null_mut();
-        unsafe {
-            let _ = windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                windows::core::PCWSTR(sddl.as_ptr()),
-                1,
-                &mut sd_ptr as *mut _ as *mut _,
-                None,
-            );
-        }
-
-        let mut sa = windows::Win32::Security::SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<windows::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: sd_ptr as *mut _,
-            bInheritHandle: false.into(),
-        };
-
-        while !stop.load(Ordering::Relaxed) {
-            let pipe = unsafe {
-                CreateNamedPipeW(
-                    PCWSTR(wide.as_ptr()),
-                    windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(
-                        PIPE_ACCESS_DUPLEX,
-                    ),
-                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                    PIPE_UNLIMITED_INSTANCES,
-                    BUF_SIZE,
-                    BUF_SIZE,
-                    0,
-                    Some(&mut sa),
-                )
-            };
-
-            if pipe == INVALID_HANDLE_VALUE {
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                continue;
-            }
-
-            if unsafe { ConnectNamedPipe(pipe, None) }.is_err() {
-                let _ = unsafe { CloseHandle(pipe) };
-                continue;
-            }
-
-            eprintln!("[DBG] IPC client connected");
-
-            let tx2 = tx.clone();
-            let stop2 = stop.clone();
-            let raw = pipe.0 as usize;
-
-            std::thread::spawn(move || {
-                use windows::Win32::Foundation::HANDLE;
-                let pipe = HANDLE(raw as *mut _);
-                let mut buf = vec![0u8; BUF_SIZE as usize];
-                let mut leftover = Vec::new();
-
-                while !stop2.load(Ordering::Relaxed) {
-                    let mut read = 0u32;
-                    let ok =
-                        unsafe { ReadFile(pipe, Some(&mut buf), Some(&mut read), None) };
-                    if ok.is_err() || read == 0 {
-                        break;
-                    }
-
-                    leftover.extend_from_slice(&buf[..read as usize]);
-
-                    // Split on JSON boundaries (each message is one {...} object)
-                    while let Some(end) = find_json_end(&leftover) {
-                        let chunk = &leftover[..=end];
-                        if let Ok(s) = std::str::from_utf8(chunk) {
-                            if let Ok(msg) = serde_json::from_str::<serde_json::Value>(s) {
-                                let _ = tx2.send(msg);
-                            }
-                        }
-                        leftover = leftover[end + 1..].to_vec();
-                    }
-                }
-
-                let _ = unsafe { DisconnectNamedPipe(pipe) };
-                let _ = unsafe { CloseHandle(pipe) };
-                eprintln!("[DBG] IPC client disconnected");
-            });
-        }
-    });
-
+    std::thread::spawn(move || run_server(tx));
     rx
 }
 
+fn status(tx: &Sender<IpcEvent>, online: bool, detail: impl Into<String>) {
+    let _ = tx.send(IpcEvent::ServerStatus { online, detail: detail.into() });
+}
+
+/// Security descriptor for the pipe. Allocated once and intentionally kept for
+/// the lifetime of the server thread, which is the lifetime of the process.
+fn pipe_security_descriptor() -> Result<PSECURITY_DESCRIPTOR, String> {
+    let sddl: Vec<u16> = PIPE_SDDL.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            SDDL_REVISION_1,
+            &mut sd,
+            None,
+        )
+    }
+    .map_err(|e| format!("building pipe security descriptor failed: {e}"))?;
+    Ok(sd)
+}
+
+fn create_instance(
+    name: &[u16],
+    sa: &SECURITY_ATTRIBUTES,
+    first_instance: bool,
+) -> Result<HANDLE, String> {
+    // FIRST_PIPE_INSTANCE: if another process already owns this pipe name, fail
+    // instead of silently becoming one more instance of *their* pipe.
+    let mut open_mode = PIPE_ACCESS_INBOUND;
+    if first_instance {
+        open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
+    }
+
+    let pipe = unsafe {
+        CreateNamedPipeW(
+            PCWSTR(name.as_ptr()),
+            FILE_FLAGS_AND_ATTRIBUTES(open_mode.0),
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            PIPE_UNLIMITED_INSTANCES,
+            0,
+            READ_BUF_SIZE as u32,
+            0,
+            Some(sa),
+        )
+    };
+
+    if pipe == INVALID_HANDLE_VALUE {
+        return Err(format!(
+            "CreateNamedPipeW failed: {}",
+            windows::core::Error::from_win32()
+        ));
+    }
+    Ok(pipe)
+}
+
+fn run_server(tx: Sender<IpcEvent>) {
+    let name: Vec<u16> = PIPE_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+
+    let sd = match pipe_security_descriptor() {
+        Ok(sd) => sd,
+        Err(e) => {
+            // Without the descriptor the pipe would get a default DACL; refuse
+            // to serve rather than run with an access policy nobody chose.
+            status(&tx, false, e);
+            return;
+        }
+    };
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd.0,
+        bInheritHandle: false.into(),
+    };
+
+    // The very first instance must be the first instance system-wide.
+    let mut listening = loop {
+        match create_instance(&name, &sa, true) {
+            Ok(pipe) => break pipe,
+            Err(e) => {
+                status(&tx, false, format!("{e} (is another process squatting the pipe name?)"));
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        }
+    };
+    status(&tx, true, "listening");
+
+    loop {
+        // ERROR_PIPE_CONNECTED (client raced in before the call) is reported
+        // as an error by the binding but means "connected".
+        if let Err(e) = unsafe { ConnectNamedPipe(listening, None) } {
+            const ERROR_PIPE_CONNECTED: u32 = 535;
+            if e.code() != windows::core::HRESULT::from_win32(ERROR_PIPE_CONNECTED) {
+                eprintln!("[DBG] IPC ConnectNamedPipe failed: {e}");
+                let _ = unsafe { DisconnectNamedPipe(listening) };
+                continue;
+            }
+        }
+
+        // Create the next listening instance *before* releasing the connected
+        // one, so there is never a moment in which no instance of ours exists
+        // and the name could be taken over.
+        let next = loop {
+            match create_instance(&name, &sa, false) {
+                Ok(pipe) => break pipe,
+                Err(e) => {
+                    status(&tx, false, e);
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            }
+        };
+        status(&tx, true, "listening");
+
+        let connected = std::mem::replace(&mut listening, next);
+        let client_tx = tx.clone();
+        let raw = connected.0 as usize;
+        std::thread::spawn(move || {
+            let pipe = HANDLE(raw as *mut _);
+            serve_client(pipe, &client_tx);
+            let _ = unsafe { DisconnectNamedPipe(pipe) };
+            let _ = unsafe { CloseHandle(pipe) };
+        });
+    }
+}
+
+/// Identifies the client through the kernel. `Err` means "not ours" or
+/// "cannot be verified" — both are treated as a rejection (fail closed).
+fn authenticate(pipe: HANDLE) -> Result<(u32, InjectRole), String> {
+    let mut pid = 0u32;
+    unsafe { GetNamedPipeClientProcessId(pipe, &mut pid) }
+        .map_err(|e| format!("GetNamedPipeClientProcessId failed: {e}"))?;
+
+    match DriverHandle::open()?.query_injected(pid)? {
+        Some(role) => Ok((pid, role)),
+        None => Err(format!("PID {pid} is not a process the kernel injected")),
+    }
+}
+
+fn serve_client(pipe: HANDLE, tx: &Sender<IpcEvent>) {
+    let (pid, role) = match authenticate(pipe) {
+        Ok(identity) => identity,
+        Err(reason) => {
+            // Deliberately not forwarded to the UI log: any local process can
+            // connect, so a UI line per rejection would itself be a flood vector.
+            eprintln!("[DBG] IPC client rejected: {reason}");
+            return;
+        }
+    };
+    eprintln!("[DBG] IPC client connected: PID {pid} role={}", role.as_str());
+
+    let mut buf = vec![0u8; READ_BUF_SIZE];
+    let mut pending: Vec<u8> = Vec::new();
+
+    loop {
+        let mut read = 0u32;
+        let ok = unsafe { ReadFile(pipe, Some(&mut buf), Some(&mut read), None) };
+        if ok.is_err() || read == 0 {
+            break;
+        }
+        pending.extend_from_slice(&buf[..read as usize]);
+
+        // Each message is one {...} object, written back to back.
+        while let Some(end) = find_json_end(&pending) {
+            if let Some(msg) = parse_message(&pending[..=end], pid, role) {
+                if tx.send(IpcEvent::Message(msg)).is_err() {
+                    return;
+                }
+            }
+            pending.drain(..=end);
+        }
+
+        if pending.len() > MAX_PENDING_BYTES {
+            eprintln!("[DBG] IPC PID {pid}: no JSON boundary in {} bytes, dropping client", pending.len());
+            break;
+        }
+    }
+
+    eprintln!("[DBG] IPC client disconnected: PID {pid}");
+}
+
+/// Parses one object and stamps the kernel-verified identity over whatever
+/// the client claimed about itself.
+fn parse_message(chunk: &[u8], pid: u32, role: InjectRole) -> Option<serde_json::Value> {
+    let text = std::str::from_utf8(chunk).ok()?;
+    let mut value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let obj = value.as_object_mut()?;
+    obj.insert("callerPID".into(), serde_json::Value::from(pid));
+    obj.insert("role".into(), serde_json::Value::from(role.as_str()));
+    Some(value)
+}
+
+/// Index of the `}` closing the first top-level JSON object in `data`.
 fn find_json_end(data: &[u8]) -> Option<usize> {
     let mut depth = 0i32;
     let mut in_string = false;
@@ -140,10 +276,48 @@ fn find_json_end(data: &[u8]) -> Option<usize> {
             depth += 1;
         } else if b == b'}' {
             depth -= 1;
-            if depth == 0 {
+            if depth <= 0 {
                 return Some(i);
             }
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_end_handles_nesting_and_strings() {
+        assert_eq!(find_json_end(br#"{"a":1}{"b":2}"#), Some(6));
+        assert_eq!(find_json_end(br#"{"a":{"b":"}"}}"#), Some(14));
+        assert_eq!(find_json_end(br#"{"a":"\"}"}"#), Some(10));
+        assert_eq!(find_json_end(br#"{"a":1"#), None);
+    }
+
+    #[test]
+    fn stray_closing_brace_is_consumed_not_stuck() {
+        // Garbage before a message must not wedge the splitter forever.
+        assert_eq!(find_json_end(b"}{\"a\":1}"), Some(0));
+    }
+
+    #[test]
+    fn verified_identity_overrides_client_claims() {
+        let msg = parse_message(
+            br#"{"event":"hello","callerPID":4,"role":"game"}"#,
+            1234,
+            InjectRole::Sensor,
+        )
+        .unwrap();
+        assert_eq!(msg["callerPID"], 1234);
+        assert_eq!(msg["role"], "sensor");
+        assert_eq!(msg["event"], "hello");
+    }
+
+    #[test]
+    fn non_object_messages_are_dropped() {
+        assert!(parse_message(b"[1,2]", 1, InjectRole::Game).is_none());
+        assert!(parse_message(b"{not json}", 1, InjectRole::Game).is_none());
+    }
 }

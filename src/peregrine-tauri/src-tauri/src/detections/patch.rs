@@ -21,6 +21,11 @@ pub struct ModuleCheck {
 
 /// Exports that PeregrineDLL hooks via MinHook (dllmain.cpp InstallHook list).
 /// Module basename is compared case-insensitively.
+///
+/// Must list exactly what dllmain.cpp hooks: every extra name here is a
+/// prologue a cheat could patch while being excused as "our own hook".
+/// (ReadProcessMemory / WriteProcessMemory are intentionally absent — memory
+/// access is hooked once, at ntdll's NtRead/NtWriteVirtualMemory.)
 const SELF_HOOKED_EXPORTS: &[(&str, &[&str])] = &[
     (
         "ntdll.dll",
@@ -33,8 +38,6 @@ const SELF_HOOKED_EXPORTS: &[(&str, &[&str])] = &[
     (
         "kernelbase.dll",
         &[
-            "ReadProcessMemory",
-            "WriteProcessMemory",
             "VirtualAllocEx",
             "VirtualProtectEx",
             "CreateRemoteThread",
@@ -44,8 +47,6 @@ const SELF_HOOKED_EXPORTS: &[(&str, &[&str])] = &[
     (
         "kernel32.dll",
         &[
-            "ReadProcessMemory",
-            "WriteProcessMemory",
             "VirtualAllocEx",
             "VirtualProtectEx",
             "CreateRemoteThread",

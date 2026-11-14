@@ -12,10 +12,18 @@
   let pidInput = $state("");
   let targetInput = $state("");
   let protectedPids = $state<number[]>([]);
+
+  /** An inject target: the path as entered plus the normalized NT path the kernel matches. */
+  type InjectTarget = { path: string; ntPath: string };
   /** Game inject targets (PeregrineGame DLL + auto-protect) */
-  let gameTargets = $state<string[]>([]);
+  let gameTargets = $state<InjectTarget[]>([]);
   /** Sensor inject targets (PeregrineSensor DLL, no auto-protect) */
-  let sensorTargets = $state<string[]>([]);
+  let sensorTargets = $state<InjectTarget[]>([]);
+
+  /** Backend channel liveness (heartbeat). Offline is sticky until a round-trip succeeds. */
+  type ChannelStatus = { online: boolean; detail: string };
+  let driverStatus = $state<ChannelStatus>({ online: false, detail: "starting" });
+  let ipcStatus = $state<ChannelStatus>({ online: false, detail: "starting" });
   let logs = $state<LogEntry[]>([]);
   let logEl: HTMLDivElement;
   const MAX_LOGS = 2000;
@@ -48,46 +56,84 @@
     return "info";
   }
 
-  async function connect() {
+  async function connect(): Promise<boolean> {
     try {
       const msg: string = await invoke("connect_driver");
       status = "Connected";
       statusColor = "#4ec94e";
       connected = true;
       addLog(msg, "conn");
+      return true;
     } catch (e: any) {
       status = "Disconnected";
       statusColor = "#c83c3c";
       connected = false;
       addLog(`connect failed: ${e}`, "err");
+      return false;
     }
   }
 
-  async function addGameTarget() {
-    const name = targetInput.trim();
-    if (!name) { addLog("target name is empty", "err"); return; }
-    if (!requireDriver()) return;
-    try {
-      const msg: string = await invoke("add_injection_target", { name });
-      if (!gameTargets.includes(name)) gameTargets = [...gameTargets, name];
-      addLog(`[APC] ${msg}`, "apc_ok");
-      targetInput = "";
-    } catch (e: any) {
-      addLog(`[APC] add Game target failed: ${e}`, "err");
+  /**
+   * Kernel state (trusted GUI, DLL paths, protected PIDs, inject targets) does
+   * not survive a driver restart. Whenever the driver (re)appears, push the
+   * UI's configuration again; every command involved is idempotent.
+   */
+  async function syncDriverState() {
+    if (!(await connect())) return;
+    for (const pid of protectedPids) {
+      try { await invoke("add_pid", { pid }); }
+      catch (e: any) { addLog(`re-protect PID ${pid} failed: ${e}`, "err"); }
+    }
+    for (const t of gameTargets) {
+      try { await invoke("add_injection_target", { path: t.path }); }
+      catch (e: any) { addLog(`[APC] re-add Game target ${t.path} failed: ${e}`, "err"); }
+    }
+    for (const t of sensorTargets) {
+      try { await invoke("add_sensor_injection_target", { path: t.path }); }
+      catch (e: any) { addLog(`[APC] re-add Sensor target ${t.path} failed: ${e}`, "err"); }
     }
   }
 
-  async function addSensorTarget() {
-    const name = targetInput.trim();
-    if (!name) { addLog("target name is empty", "err"); return; }
+  function applyDriverStatus(next: ChannelStatus) {
+    const wasOnline = driverStatus.online;
+    driverStatus = next;
+    if (next.online && !wasOnline) {
+      addLog("[Driver] kernel component online", "conn");
+      void syncDriverState();
+    } else if (!next.online && wasOnline) {
+      status = "Disconnected";
+      statusColor = "#c83c3c";
+      connected = false;
+      addLog(`[Driver] KERNEL COMPONENT OFFLINE: ${next.detail}`, "tamper");
+    }
+  }
+
+  function applyIpcStatus(next: ChannelStatus) {
+    const wasOnline = ipcStatus.online;
+    ipcStatus = next;
+    if (!next.online && wasOnline) {
+      addLog(`[IPC] DLL telemetry pipe offline: ${next.detail}`, "tamper");
+    }
+  }
+
+  async function addTarget(kind: "game" | "sensor") {
+    const path = targetInput.trim();
+    if (!path) { addLog("target path is empty", "err"); return; }
     if (!requireDriver()) return;
+    const label = kind === "game" ? "Game" : "Sensor";
+    const command = kind === "game" ? "add_injection_target" : "add_sensor_injection_target";
     try {
-      const msg: string = await invoke("add_sensor_injection_target", { name });
-      if (!sensorTargets.includes(name)) sensorTargets = [...sensorTargets, name];
-      addLog(`[APC] ${msg}`, "apc_ok");
+      const ntPath: string = await invoke(command, { path });
+      const target = { path, ntPath };
+      if (kind === "game") {
+        if (!gameTargets.some((t) => t.ntPath === ntPath)) gameTargets = [...gameTargets, target];
+      } else {
+        if (!sensorTargets.some((t) => t.ntPath === ntPath)) sensorTargets = [...sensorTargets, target];
+      }
+      addLog(`[APC] ${label} target added, injection enabled: ${ntPath}`, "apc_ok");
       targetInput = "";
     } catch (e: any) {
-      addLog(`[APC] add Sensor target failed: ${e}`, "err");
+      addLog(`[APC] add ${label} target failed: ${e}`, "err");
     }
   }
 
@@ -126,7 +172,7 @@
     if (!requireDriver()) return;
     try {
       await invoke("add_pid", { pid });
-      protectedPids = [...protectedPids, pid];
+      if (!protectedPids.includes(pid)) protectedPids = [...protectedPids, pid];
       addLog(`added PID ${pid}`, "ok");
     } catch (e: any) {
       addLog(`add_pid failed: ${e}`, "err");
@@ -454,13 +500,39 @@
     }
   }
 
-  const ACCESS_FLAGS: Record<number, string> = {
+  // Decoding only. Which access is worth reporting is decided once, in the
+  // kernel (obCallback.c DANGEROUS_*_ACCESS) — the UI does not filter again.
+  const UNRESOLVED_ACCESS_FLAGS: Record<number, string> = {
+    0x02000000: "MAXIMUM_ALLOWED", 0x10000000: "GENERIC_ALL",
+    0x20000000: "GENERIC_EXECUTE", 0x40000000: "GENERIC_WRITE",
+    0x80000000: "GENERIC_READ",
+  };
+  const PROCESS_ACCESS_FLAGS: Record<number, string> = {
     0x0001: "TERMINATE", 0x0002: "CREATE_THREAD",
     0x0008: "VM_OPERATION", 0x0010: "VM_READ",
     0x0020: "VM_WRITE", 0x0040: "DUP_HANDLE",
-    0x0800: "SUSPEND_RESUME",
+    0x0200: "SET_INFORMATION", 0x0800: "SUSPEND_RESUME",
+    ...UNRESOLVED_ACCESS_FLAGS,
   };
-  const DANGEROUS = 0x0001 | 0x0002 | 0x0008 | 0x0010 | 0x0020 | 0x0040 | 0x0800;
+  const THREAD_ACCESS_FLAGS: Record<number, string> = {
+    0x0001: "TERMINATE", 0x0002: "SUSPEND_RESUME",
+    0x0008: "GET_CONTEXT", 0x0010: "SET_CONTEXT",
+    0x0020: "SET_INFORMATION",
+    ...UNRESOLVED_ACCESS_FLAGS,
+  };
+
+  function decodeAccess(access: number, names: Record<number, string>): string {
+    // `>>> 0`: bit 31 (GENERIC_READ) must compare as unsigned.
+    return Object.entries(names)
+      .filter(([bit]) => ((access & Number(bit)) >>> 0) !== 0)
+      .map(([, name]) => name)
+      .join("|");
+  }
+
+  function suppressedNote(n: unknown): string {
+    const count = Number(n ?? 0);
+    return count > 0 ? ` (+${count} identical suppressed)` : "";
+  }
 
   // Rate-limit image_load log spam (non-system paths preferred later; simple cap for now)
   let imageLoadBudget = 40;
@@ -515,30 +587,49 @@
 
       case "ob_callback": {
         const raw = d.desired_access ?? "0x0";
-        const access = typeof raw === "string" ? parseInt(raw, 16) : raw;
-        if (access & DANGEROUS) {
-          const flags = Object.entries(ACCESS_FLAGS)
-            .filter(([bit]) => access & Number(bit))
-            .map(([, name]) => name)
-            .join("|");
-          addLog(`[Handle Access] PID=${d.caller_pid} -> PID=${d.target_pid} op=${d.op} [${flags}]`, "handle");
-        }
+        const access = typeof raw === "string" ? parseInt(raw, 16) : Number(raw);
+        const isThread = d.type === "thread";
+        const flags = decodeAccess(access, isThread ? THREAD_ACCESS_FLAGS : PROCESS_ACCESS_FLAGS);
+        const what = isThread ? `thread ${d.target_tid} of PID=${d.target_pid}` : `PID=${d.target_pid}`;
+        const recipient =
+          d.op === "duplicate" && d.recipient_pid && d.recipient_pid !== d.caller_pid
+            ? ` handle goes to PID=${d.recipient_pid}`
+            : "";
+        addLog(
+          `[Handle Access] PID=${d.caller_pid} -> ${what} op=${d.op} [${flags}]${recipient}${suppressedNote(d.suppressed)}`,
+          "handle",
+        );
         break;
       }
+
+      case "ob_callback_suppressed":
+        addLog(
+          `[Handle Access] PID=${d.caller_pid} -> PID=${d.target_pid} (${d.type}): ${d.suppressed} repeated opens were rate-limited`,
+          "handle",
+        );
+        break;
+
+      case "coms_overflow":
+        addLog(
+          `[Driver] EVENT QUEUE OVERFLOW: ${d.dropped} kernel event(s) were lost — possible event flooding`,
+          "tamper",
+        );
+        break;
 
       case "apc_inject": {
         const role = (d.role as string | undefined) || "game";
         if (d.status === "success") {
           addLog(`[ok] APC inject (${role}) PID=${d.pid} TID=${d.tid}`, "apc_ok");
-          // Only Game inject auto-protects (Sensor = cheat host).
+          // Mirror the kernel's decision; the UI never promotes a PID itself.
           if (role === "game" && typeof d.pid === "number") {
-            if (!protectedPids.includes(d.pid)) {
-              protectedPids = [...protectedPids, d.pid];
+            if (d.protected === true) {
+              if (!protectedPids.includes(d.pid)) protectedPids = [...protectedPids, d.pid];
+            } else {
+              addLog(
+                `[Protect FAIL] PID=${d.pid} was injected but NOT protected — kernel protected set is full`,
+                "err",
+              );
             }
-            // Keep UI list in sync; kernel already StateAddPid on Game success.
-            void invoke("add_pid", { pid: d.pid }).catch(() => {
-              /* kernel may already own the PID */
-            });
           }
         } else {
           addLog(
@@ -632,50 +723,79 @@
     }
   }
 
+  const hex = (v: unknown) => `0x${Number(v ?? 0).toString(16).toUpperCase()}`;
+
+  /**
+   * DLL telemetry. `callerPID` and `role` are stamped by the backend from the
+   * kernel-verified pipe client; everything else is a claim by code inside
+   * that process.
+   *
+   * Game scope:
+   *   EXTERNAL  op against another process — shown only if the target is a protected game
+   *   INTERNAL  anomaly inside the DLL's host — shown only if the host is a protected game
+   */
   function handleIpcEvent(d: any) {
     if (!d) return;
     const event = d.event ?? "";
-    const caller = d.callerPID ?? "?";
-    const target = d.targetPID ?? "?";
+    const caller = Number(d.callerPID);
+    const target = Number(d.targetPID);
+    const callerProtected = protectedPids.includes(caller);
+    const targetProtected = protectedPids.includes(target);
+    const suppressed = suppressedNote(d.suppressed);
 
     if (event === "hello") {
-      addLog(`[ok] DLL injected into PID ${caller} (${d.image ?? "?"})`, "apc_ok");
+      addLog(`[ok] ${d.role ?? "?"} DLL loaded in PID ${caller} (${d.image ?? "?"})`, "apc_ok");
       return;
     }
 
-    const isSelf = caller === target;
-    const targetProtected = protectedPids.includes(target);
-    const callerProtected = protectedPids.includes(caller);
+    // External ops: must hit a protected game from outside.
+    const external = targetProtected && caller !== target;
 
     if (event === "ReadProcessMemory" || event === "WriteProcessMemory") {
-      if (!isSelf)
-        addLog(`[External ${event}] PID ${caller} → PID ${target} | ${d.size ?? 0} bytes at 0x${(d.address ?? 0).toString(16).toUpperCase()}`, "handle");
+      if (external)
+        addLog(`[External ${event}] PID ${caller} → PID ${target} | ${d.size ?? 0} bytes at ${hex(d.address)}${suppressed}`, "handle");
       return;
     }
     if (event === "VirtualAllocEx") {
-      if (!isSelf)
-        addLog(`[External VirtualAllocEx] PID ${caller} -> PID ${target} | ${d.size} bytes at 0x${(d.address??0).toString(16).toUpperCase()} protect=${d.protect}`, "handle");
+      if (external)
+        addLog(`[External VirtualAllocEx] PID ${caller} -> PID ${target} | ${d.size} bytes at ${hex(d.address)} protect=${d.protect}${suppressed}`, "handle");
       return;
     }
     if (event === "VirtualProtectEx") {
-      if (!isSelf)
-        addLog(`[External VirtualProtectEx] PID ${caller} -> PID ${target} | ${d.size} bytes protect=${d.newProtect}`, "handle");
+      if (external)
+        addLog(`[External VirtualProtectEx] PID ${caller} -> PID ${target} | ${d.size} bytes protect=${d.newProtect}${suppressed}`, "handle");
       return;
     }
     if (event === "CreateRemoteThread") {
-      if (!isSelf)
-        addLog(`[External CreateRemoteThread] PID ${caller} -> PID ${target} | start=0x${(d.startAddress??0).toString(16).toUpperCase()}`, "remote_thr");
+      if (external)
+        addLog(`[External CreateRemoteThread] PID ${caller} -> PID ${target} | start=${hex(d.startAddress)}${suppressed}`, "remote_thr");
       return;
     }
     if (event === "OpenProcess") {
-      if (!isSelf)
-        addLog(`[External OpenProcess] PID ${caller} -> PID ${target} | access=${d.access}`, "handle");
+      if (external)
+        addLog(`[External OpenProcess] PID ${caller} -> PID ${target} | access=${d.access}${suppressed}`, "handle");
       return;
     }
     if (event === "CallstackAnomaly") {
-      addLog(`[Callstack Anomaly] hook=${d.hook} | suspicious addr=${d.address} frame=${d.frameIndex} region=${d.regionBase} size=${d.regionSize} protect=${d.protect}`, "suspicious");
+      // Internal (unbacked code calling APIs inside the game) or external
+      // (unbacked code in another process operating on the game).
+      if (callerProtected || external) {
+        const where = callerProtected ? `inside PID ${caller}` : `PID ${caller} → PID ${target}`;
+        addLog(`[Callstack Anomaly] ${where} hook=${d.hook} | suspicious addr=${d.address} frame=${d.frameIndex} region=${d.regionBase} size=${d.regionSize} protect=${d.protect}${suppressed}`, "suspicious");
+      }
       return;
     }
+
+    if (event === "RateLimitFlush") {
+      // Tail of a rate-limited burst whose key was recycled before its next report.
+      if (targetProtected || callerProtected)
+        addLog(`[${d.of}] PID ${caller} → PID ${target}: ${d.suppressed} more call(s) were rate-limited`, "handle");
+      return;
+    }
+
+    // Everything below is an internal signal of the Game DLL's own process.
+    if (!callerProtected) return;
+
     if (event === "HwbpInit") {
       if (d.status === "ok")
         addLog(`[HW Breakpoint] Initialized — watching VEH list at ${d.vehListAddr}, ${d.threadsArmed} threads armed`, "ok");
@@ -684,7 +804,7 @@
       return;
     }
     if (event === "VehTableTamper") {
-      addLog(`[VEH TAMPER] VEH handler list modified! PID=${d.callerPID} TID=${d.threadId} DR6=${d.dr6}`, "tamper");
+      addLog(`[VEH TAMPER] VEH handler list modified! PID=${caller} TID=${d.threadId} DR6=${d.dr6}`, "tamper");
       return;
     }
     if (event === "DebugRegisterTamper") {
@@ -692,11 +812,11 @@
       return;
     }
     if (event === "DebugRegisterClearing") {
-      addLog(`[DR CLEARING] NtSetContextThread zeroing DR regs in PID ${d.callerPID} TID ${d.threadId}`, "suspicious");
+      addLog(`[DR CLEARING] NtSetContextThread zeroing DR regs in PID ${caller} TID ${d.threadId}`, "suspicious");
       return;
     }
 
-    addLog(`[IPC] ${event} caller=${caller} target=${target}`, "info");
+    addLog(`[IPC] ${event} from PID ${caller}`, "info");
   }
 
   onMount(async () => {
@@ -709,23 +829,40 @@
     await listen("etw-ti-event", (ev: any) => {
       try { handleEtwTiEvent(ev.payload); } catch (e) { console.error("etw-ti-event error:", e); }
     });
-    connect();
+    await listen("driver-status", (ev: any) => applyDriverStatus(ev.payload));
+    await listen("ipc-status", (ev: any) => applyIpcStatus(ev.payload));
+
+    // Status events emitted before the listeners existed are gone; read the
+    // current state once. applyDriverStatus connects on the offline→online edge.
+    try {
+      const current: { driver: ChannelStatus; ipc: ChannelStatus } = await invoke("backend_status");
+      applyIpcStatus(current.ipc);
+      applyDriverStatus(current.driver);
+    } catch (e: any) {
+      addLog(`backend_status failed: ${e}`, "err");
+    }
   });
 </script>
 
 <main>
+  {#if !driverStatus.online}
+    <div class="offline-banner">KERNEL COMPONENT OFFLINE — no ring-0 protection or detection ({driverStatus.detail})</div>
+  {/if}
+  {#if !ipcStatus.online}
+    <div class="offline-banner">DLL TELEMETRY PIPE OFFLINE — injected DLL events are not received ({ipcStatus.detail})</div>
+  {/if}
   <header>
     <div class="status-row">
       <span class="label">STATUS:</span>
       <span style="color: {statusColor}; font-weight: bold">{status}</span>
-      <button class="btn-small" onclick={connect}>Reconnect</button>
+      <button class="btn-small" onclick={syncDriverState}>Reconnect</button>
     </div>
     <div class="pids">
       Protected: {protectedPids.length ? protectedPids.join(", ") : "None"}
     </div>
     <div class="pids">
-      Game inject: {gameTargets.length ? gameTargets.join(", ") : "None"}
-      &nbsp;|&nbsp; Sensor inject: {sensorTargets.length ? sensorTargets.join(", ") : "None"}
+      Game inject: {gameTargets.length ? gameTargets.map((t) => t.ntPath).join(", ") : "None"}
+      &nbsp;|&nbsp; Sensor inject: {sensorTargets.length ? sensorTargets.map((t) => t.ntPath).join(", ") : "None"}
     </div>
   </header>
 
@@ -736,9 +873,9 @@
     <button class="btn" onclick={clearAll}>Clear</button>
     <button class="btn accent" onclick={setPpl}>PPL</button>
     <span style="color:#585b70">|</span>
-    <input type="text" bind:value={targetInput} placeholder="target.exe" class="pid-input" style="width:110px" />
-    <button class="btn accent" onclick={addGameTarget} title="Inject Game DLL + auto-protect">Game</button>
-    <button class="btn" style="background:#89b4fa;color:black" onclick={addSensorTarget} title="Inject Sensor DLL (hooks, no protect)">Sensor</button>
+    <input type="text" bind:value={targetInput} placeholder="C:\path\to\target.exe" class="pid-input" style="width:220px" title="Full path of the executable — targets are matched by full image path, never by file name" />
+    <button class="btn accent" onclick={() => addTarget("game")} title="Inject Game DLL + auto-protect">Game</button>
+    <button class="btn" style="background:#89b4fa;color:black" onclick={() => addTarget("sensor")} title="Inject Sensor DLL (hooks, no protect)">Sensor</button>
     <button class="btn" onclick={clearTargets}>Clear Inj</button>
     <span style="color:#585b70">|</span>
     <button class="btn" onclick={checkModules}>Modules</button>
@@ -789,6 +926,14 @@
   }
   header {
     flex-shrink: 0;
+  }
+  .offline-banner {
+    flex-shrink: 0;
+    background: #c83c3c;
+    color: white;
+    font-weight: bold;
+    padding: 6px 10px;
+    border-radius: 4px;
   }
   .status-row {
     display: flex;
