@@ -54,8 +54,6 @@ typedef LONG NTSTATUS;
 // ============================================================
 // Original function pointers
 // ============================================================
-typedef BOOL(WINAPI* ReadProcessMemory_t)(HANDLE, LPCVOID, LPVOID, SIZE_T, SIZE_T*);
-typedef BOOL(WINAPI* WriteProcessMemory_t)(HANDLE, LPVOID, LPCVOID, SIZE_T, SIZE_T*);
 typedef NTSTATUS(NTAPI* NtReadVirtualMemory_t)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
 typedef NTSTATUS(NTAPI* NtWriteVirtualMemory_t)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
 typedef LPVOID(WINAPI* VirtualAllocEx_t)(HANDLE, LPVOID, SIZE_T, DWORD, DWORD);
@@ -66,8 +64,6 @@ typedef HANDLE(WINAPI* OpenProcess_t)(DWORD, BOOL, DWORD);
 typedef LONG(NTAPI* NtSetContextThread_t)(HANDLE, PCONTEXT);
 #endif
 
-static ReadProcessMemory_t      oReadProcessMemory = nullptr;
-static WriteProcessMemory_t     oWriteProcessMemory = nullptr;
 static NtReadVirtualMemory_t    oNtReadVirtualMemory = nullptr;
 static NtWriteVirtualMemory_t   oNtWriteVirtualMemory = nullptr;
 static VirtualAllocEx_t         oVirtualAllocEx = nullptr;
@@ -81,53 +77,66 @@ static NtSetContextThread_t     oNtSetContextThread = nullptr;
 // ============================================================
 // Hook implementations
 // ============================================================
+//
+// Every hook: call through, run the call-stack check unconditionally, then
+// report the operation if it targets another process. Reports go through
+// ipc_log_event_limited (per event + target PID), so an API called in a loop
+// yields a few lines plus a suppressed count instead of a flood.
 
-static BOOL WINAPI HookReadProcessMemory(HANDLE hProcess, LPCVOID lpBase, LPVOID lpBuf, SIZE_T nSize, SIZE_T* pRead) {
-    BOOL result = oReadProcessMemory(hProcess, lpBase, lpBuf, nSize, pRead);
-    callstack_check("ReadProcessMemory");
-    DWORD targetPID = GetProcessId(hProcess);
-    ipc_log_event("ReadProcessMemory",
-        "\"callerPID\":%lu,\"targetPID\":%lu,\"address\":%llu,\"size\":%llu",
-        PID, targetPID, (unsigned long long)(ULONG_PTR)lpBase, (unsigned long long)nSize);
-    return result;
+// PID behind a process handle. GetProcessId needs QUERY_(LIMITED_)INFORMATION,
+// which a handle opened with e.g. only PROCESS_VM_READ lacks — exactly the
+// handle an external reader uses — so fall back to a re-opened duplicate.
+// Returns 0 only if the target cannot be identified at all.
+static DWORD TargetPidOf(HANDLE hProcess) {
+    if (hProcess == GetCurrentProcess())
+        return PID;
+
+    DWORD pid = GetProcessId(hProcess);
+    if (pid != 0)
+        return pid;
+
+    HANDLE dup = NULL;
+    if (DuplicateHandle(GetCurrentProcess(), hProcess, GetCurrentProcess(), &dup,
+            PROCESS_QUERY_LIMITED_INFORMATION, FALSE, 0)) {
+        pid = GetProcessId(dup);
+        CloseHandle(dup);
+    }
+    return pid;
 }
 
-static BOOL WINAPI HookWriteProcessMemory(HANDLE hProcess, LPVOID lpBase, LPCVOID lpBuf, SIZE_T nSize, SIZE_T* pWritten) {
-    BOOL result = oWriteProcessMemory(hProcess, lpBase, lpBuf, nSize, pWritten);
-    callstack_check("WriteProcessMemory");
-    DWORD targetPID = GetProcessId(hProcess);
-    ipc_log_event("WriteProcessMemory",
-        "\"callerPID\":%lu,\"targetPID\":%lu,\"address\":%llu,\"size\":%llu",
-        PID, targetPID, (unsigned long long)(ULONG_PTR)lpBase, (unsigned long long)nSize);
-    return result;
-}
-
+// ReadProcessMemory / WriteProcessMemory are not hooked separately: both are
+// thin wrappers over these two ntdll exports, so hooking here reports each
+// operation exactly once and also covers callers that skip KernelBase.
 static NTSTATUS NTAPI HookNtReadVirtualMemory(HANDLE hProcess, PVOID base, PVOID buf, SIZE_T size, PSIZE_T pRead) {
     NTSTATUS status = oNtReadVirtualMemory(hProcess, base, buf, size, pRead);
-    callstack_check("NtReadVirtualMemory");
-    DWORD targetPID = GetProcessId(hProcess);
-    ipc_log_event("ReadProcessMemory",
-        "\"callerPID\":%lu,\"targetPID\":%lu,\"address\":%llu,\"size\":%llu",
-        PID, targetPID, (unsigned long long)(ULONG_PTR)base, (unsigned long long)size);
+    DWORD targetPID = TargetPidOf(hProcess);
+    callstack_check("NtReadVirtualMemory", targetPID);
+    if (targetPID != PID) {
+        ipc_log_event_limited("ReadProcessMemory", NULL, targetPID,
+            "\"callerPID\":%lu,\"targetPID\":%lu,\"address\":%llu,\"size\":%llu",
+            PID, targetPID, (unsigned long long)(ULONG_PTR)base, (unsigned long long)size);
+    }
     return status;
 }
 
 static NTSTATUS NTAPI HookNtWriteVirtualMemory(HANDLE hProcess, PVOID base, PVOID buf, SIZE_T size, PSIZE_T pWritten) {
     NTSTATUS status = oNtWriteVirtualMemory(hProcess, base, buf, size, pWritten);
-    callstack_check("NtWriteVirtualMemory");
-    DWORD targetPID = GetProcessId(hProcess);
-    ipc_log_event("WriteProcessMemory",
-        "\"callerPID\":%lu,\"targetPID\":%lu,\"address\":%llu,\"size\":%llu",
-        PID, targetPID, (unsigned long long)(ULONG_PTR)base, (unsigned long long)size);
+    DWORD targetPID = TargetPidOf(hProcess);
+    callstack_check("NtWriteVirtualMemory", targetPID);
+    if (targetPID != PID) {
+        ipc_log_event_limited("WriteProcessMemory", NULL, targetPID,
+            "\"callerPID\":%lu,\"targetPID\":%lu,\"address\":%llu,\"size\":%llu",
+            PID, targetPID, (unsigned long long)(ULONG_PTR)base, (unsigned long long)size);
+    }
     return status;
 }
 
 static LPVOID WINAPI HookVirtualAllocEx(HANDLE hProcess, LPVOID lpAddr, SIZE_T dwSize, DWORD flType, DWORD flProtect) {
     LPVOID result = oVirtualAllocEx(hProcess, lpAddr, dwSize, flType, flProtect);
-    callstack_check("VirtualAllocEx");
-    DWORD targetPID = GetProcessId(hProcess);
+    DWORD targetPID = TargetPidOf(hProcess);
+    callstack_check("VirtualAllocEx", targetPID);
     if (targetPID != PID) {
-        ipc_log_event("VirtualAllocEx",
+        ipc_log_event_limited("VirtualAllocEx", NULL, targetPID,
             "\"callerPID\":%lu,\"targetPID\":%lu,\"address\":%llu,\"size\":%llu,\"protect\":\"0x%08X\"",
             PID, targetPID, (unsigned long long)(ULONG_PTR)result, (unsigned long long)dwSize, flProtect);
     }
@@ -136,10 +145,10 @@ static LPVOID WINAPI HookVirtualAllocEx(HANDLE hProcess, LPVOID lpAddr, SIZE_T d
 
 static BOOL WINAPI HookVirtualProtectEx(HANDLE hProcess, LPVOID lpAddr, SIZE_T dwSize, DWORD flNew, PDWORD lpflOld) {
     BOOL result = oVirtualProtectEx(hProcess, lpAddr, dwSize, flNew, lpflOld);
-    callstack_check("VirtualProtectEx");
-    DWORD targetPID = GetProcessId(hProcess);
+    DWORD targetPID = TargetPidOf(hProcess);
+    callstack_check("VirtualProtectEx", targetPID);
     if (targetPID != PID) {
-        ipc_log_event("VirtualProtectEx",
+        ipc_log_event_limited("VirtualProtectEx", NULL, targetPID,
             "\"callerPID\":%lu,\"targetPID\":%lu,\"address\":%llu,\"size\":%llu,\"newProtect\":\"0x%08X\"",
             PID, targetPID, (unsigned long long)(ULONG_PTR)lpAddr, (unsigned long long)dwSize, flNew);
     }
@@ -149,10 +158,10 @@ static BOOL WINAPI HookVirtualProtectEx(HANDLE hProcess, LPVOID lpAddr, SIZE_T d
 static HANDLE WINAPI HookCreateRemoteThread(HANDLE hProcess, LPSECURITY_ATTRIBUTES lpAttr, SIZE_T dwStackSize,
     LPTHREAD_START_ROUTINE lpStart, LPVOID lpParam, DWORD dwFlags, LPDWORD lpTid) {
     HANDLE result = oCreateRemoteThread(hProcess, lpAttr, dwStackSize, lpStart, lpParam, dwFlags, lpTid);
-    callstack_check("CreateRemoteThread");
-    DWORD targetPID = GetProcessId(hProcess);
+    DWORD targetPID = TargetPidOf(hProcess);
+    callstack_check("CreateRemoteThread", targetPID);
     if (targetPID != PID) {
-        ipc_log_event("CreateRemoteThread",
+        ipc_log_event_limited("CreateRemoteThread", NULL, targetPID,
             "\"callerPID\":%lu,\"targetPID\":%lu,\"startAddress\":%llu",
             PID, targetPID, (unsigned long long)(ULONG_PTR)lpStart);
     }
@@ -161,10 +170,13 @@ static HANDLE WINAPI HookCreateRemoteThread(HANDLE hProcess, LPSECURITY_ATTRIBUT
 
 static HANDLE WINAPI HookOpenProcess(DWORD dwAccess, BOOL bInherit, DWORD dwPID) {
     HANDLE result = oOpenProcess(dwAccess, bInherit, dwPID);
-    callstack_check("OpenProcess");
-    const DWORD DANGEROUS = 0x0001 | 0x0002 | 0x0008 | 0x0010 | 0x0020 | 0x0040 | 0x0800;
+    callstack_check("OpenProcess", dwPID);
+    // Same access the kernel ObCallback reports (obCallback.c DANGEROUS_PROCESS_ACCESS),
+    // including not-yet-resolved generic / MAXIMUM_ALLOWED requests.
+    const DWORD DANGEROUS = 0x0001 | 0x0002 | 0x0008 | 0x0010 | 0x0020 | 0x0040 | 0x0200 | 0x0800 |
+                            MAXIMUM_ALLOWED | GENERIC_ALL | GENERIC_EXECUTE | GENERIC_WRITE | GENERIC_READ;
     if (dwPID != PID && (dwAccess & DANGEROUS)) {
-        ipc_log_event("OpenProcess",
+        ipc_log_event_limited("OpenProcess", NULL, dwPID,
             "\"callerPID\":%lu,\"targetPID\":%lu,\"access\":\"0x%08X\"",
             PID, dwPID, dwAccess);
     }
@@ -177,7 +189,7 @@ static HANDLE WINAPI HookOpenProcess(DWORD dwAccess, BOOL bInherit, DWORD dwPID)
 static LONG NTAPI HookNtSetContextThread(HANDLE hThread, PCONTEXT ctx) {
     if (!g_hwbp_arming && ctx && (ctx->ContextFlags & CONTEXT_DBG_REGS_FLAG) == CONTEXT_DBG_REGS_FLAG) {
         if (ctx->Dr0 == 0 && ctx->Dr1 == 0 && ctx->Dr2 == 0 && ctx->Dr3 == 0 && ctx->Dr7 == 0) {
-            callstack_check("NtSetContextThread");
+            callstack_check("NtSetContextThread", GetProcessIdOfThread(hThread));
             DWORD tid = GetThreadId(hThread);
             ipc_log_event("DebugRegisterClearing",
                 "\"callerPID\":%lu,\"threadId\":%lu",
@@ -233,9 +245,11 @@ static DWORD WINAPI InitThread(LPVOID) {
     HMODULE k32   = GetModuleHandleW(L"kernel32.dll");
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
 
-    // Memory access hooks (both roles — Game keeps full set for no regression)
-    InstallHook(kb, k32, "ReadProcessMemory",  (void**)&oReadProcessMemory,  (void*)HookReadProcessMemory);
-    InstallHook(kb, k32, "WriteProcessMemory", (void**)&oWriteProcessMemory, (void*)HookWriteProcessMemory);
+    // Keep this list in sync with SELF_HOOKED_EXPORTS in
+    // peregrine-tauri/src-tauri/src/detections/patch.rs (module integrity
+    // excuses exactly these prologues as our own hooks).
+
+    // Memory access hooks (both roles) — ntdll only, see HookNtReadVirtualMemory.
     InstallHook(ntdll, NULL, "NtReadVirtualMemory",  (void**)&oNtReadVirtualMemory,  (void*)HookNtReadVirtualMemory);
     InstallHook(ntdll, NULL, "NtWriteVirtualMemory", (void**)&oNtWriteVirtualMemory, (void*)HookNtWriteVirtualMemory);
 

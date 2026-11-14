@@ -81,61 +81,16 @@ static int is_in_module(ULONG_PTR addr) {
 }
 
 /* ------------------------------------------------------------ */
-/* Per-hook rate limiter                                        */
-/* ------------------------------------------------------------ */
-
-typedef struct {
-    const char*     hook_name;
-    LONG            max_per_minute;
-    volatile LONG   count;
-    volatile ULONGLONG window_start;
-} RateLimit;
-
-#define NUM_HOOKS 9
-
-static RateLimit g_limits[NUM_HOOKS] = {
-    { "OpenProcess",          50, 0, 0 },
-    { "CreateRemoteThread",   50, 0, 0 },
-    { "NtSetContextThread",   50, 0, 0 },
-    { "VirtualAllocEx",       20, 0, 0 },
-    { "VirtualProtectEx",     20, 0, 0 },
-    { "ReadProcessMemory",     2, 0, 0 },
-    { "WriteProcessMemory",    2, 0, 0 },
-    { "NtReadVirtualMemory",   2, 0, 0 },
-    { "NtWriteVirtualMemory",  2, 0, 0 },
-};
-
-static int rate_limit_allow(const char* hook_name) {
-    RateLimit* rl = NULL;
-    for (int i = 0; i < NUM_HOOKS; i++) {
-        if (strcmp(g_limits[i].hook_name, hook_name) == 0) {
-            rl = &g_limits[i];
-            break;
-        }
-    }
-    if (!rl) return 1;
-
-    ULONGLONG now = GetTickCount64();
-    if (now - rl->window_start >= 60000) {
-        rl->window_start = now;
-        InterlockedExchange(&rl->count, 0);
-    }
-
-    LONG c = InterlockedIncrement(&rl->count);
-    return c <= rl->max_per_minute;
-}
-
-/* ------------------------------------------------------------ */
 /* Stack walk + detection                                       */
 /* ------------------------------------------------------------ */
 
 #define MAX_FRAMES  32
 #define SKIP_FRAMES  2
 
-int callstack_check(const char* hook_name) {
-    if (!rate_limit_allow(hook_name))
-        return 0;
-
+int callstack_check(const char* hook_name, DWORD target_pid) {
+    /* No rate limit here: the walk is cheap (cached ranges + binary search)
+       and a limiter in front of it would switch the detection off exactly
+       when a hooked API is called in a loop. The message is limited instead. */
     ULONGLONG now = GetTickCount64();
     if (now - g_cache_last_refresh > CACHE_REFRESH_MS)
         refresh_module_cache();
@@ -158,11 +113,12 @@ int callstack_check(const char* hook_name) {
                                      prot == PAGE_EXECUTE_READWRITE ||
                                      prot == PAGE_EXECUTE_WRITECOPY);
                     if (mbi.Type == MEM_PRIVATE && executable) {
-                        ipc_log_event("CallstackAnomaly",
-                            "\"hook\":\"%s\",\"address\":\"0x%llX\","
+                        ipc_log_event_limited("CallstackAnomaly", hook_name, target_pid,
+                            "\"hook\":\"%s\",\"targetPID\":%lu,\"address\":\"0x%llX\","
                             "\"frameIndex\":%u,\"regionBase\":\"0x%llX\","
                             "\"regionSize\":%llu,\"protect\":\"0x%lX\"",
                             hook_name,
+                            (unsigned long)target_pid,
                             (unsigned long long)addr,
                             (unsigned int)i,
                             (unsigned long long)(ULONG_PTR)mbi.BaseAddress,
@@ -179,9 +135,4 @@ int callstack_check(const char* hook_name) {
 
 void callstack_init(void) {
     refresh_module_cache();
-    ULONGLONG now = GetTickCount64();
-    for (int i = 0; i < NUM_HOOKS; i++) {
-        g_limits[i].window_start = now;
-        g_limits[i].count = 0;
-    }
 }
