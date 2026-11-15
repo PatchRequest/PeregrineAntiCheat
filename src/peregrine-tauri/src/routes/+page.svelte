@@ -24,6 +24,8 @@
   type ChannelStatus = { online: boolean; detail: string };
   let driverStatus = $state<ChannelStatus>({ online: false, detail: "starting" });
   let ipcStatus = $state<ChannelStatus>({ online: false, detail: "starting" });
+  /** Regions of the last VAD-scanned PID that are verifiably our own trampolines. */
+  let vadOwnRegions: { pid: number; bases: number[]; seen: number } = { pid: 0, bases: [], seen: 0 };
   /** The SCM has a stop of the driver pending behind our open device handle. */
   let driverStopPending = $state(false);
   let logs = $state<LogEntry[]>([]);
@@ -75,24 +77,41 @@
     }
   }
 
+  /** The kernel stores target paths upper-cased; compare without case. */
+  const sameNtPath = (a: string, b: string) => a.toUpperCase() === b.toUpperCase();
+
   /**
-   * Kernel state (trusted GUI, DLL paths, protected PIDs, inject targets) does
-   * not survive a driver restart. Whenever the driver (re)appears, push the
-   * UI's configuration again; every command involved is idempotent.
+   * The kernel is the source of truth for what is protected and injected: it
+   * keeps its state while this GUI restarts, and starts empty when the driver
+   * itself was reloaded. Whenever the driver (re)appears, register this GUI
+   * and then mirror the kernel's lists — never push the UI's idea of them.
    */
   async function syncDriverState() {
     if (!(await connect())) return;
-    for (const pid of protectedPids) {
-      try { await invoke("add_pid", { pid }); }
-      catch (e: any) { addLog(`re-protect PID ${pid} failed: ${e}`, "err"); }
-    }
-    for (const t of gameTargets) {
-      try { await invoke("add_injection_target", { path: t.path }); }
-      catch (e: any) { addLog(`[APC] re-add Game target ${t.path} failed: ${e}`, "err"); }
-    }
-    for (const t of sensorTargets) {
-      try { await invoke("add_sensor_injection_target", { path: t.path }); }
-      catch (e: any) { addLog(`[APC] re-add Sensor target ${t.path} failed: ${e}`, "err"); }
+    try {
+      const st: {
+        protected: number[];
+        targets: { role: string; path: string }[];
+      } = await invoke("kernel_state");
+
+      // Keep the spelling the user entered where we know it.
+      const known = [...gameTargets, ...sensorTargets];
+      const toTarget = (ntPath: string): InjectTarget =>
+        known.find((t) => sameNtPath(t.ntPath, ntPath)) ?? { path: ntPath, ntPath };
+
+      protectedPids = st.protected;
+      gameTargets = st.targets.filter((t) => t.role === "game").map((t) => toTarget(t.path));
+      sensorTargets = st.targets.filter((t) => t.role === "sensor").map((t) => toTarget(t.path));
+
+      if (st.protected.length || st.targets.length) {
+        addLog(
+          `[Driver] kernel state adopted: ${st.protected.length} protected PID(s), ` +
+            `${gameTargets.length} Game / ${sensorTargets.length} Sensor target(s)`,
+          "conn",
+        );
+      }
+    } catch (e: any) {
+      addLog(`reading kernel state failed: ${e}`, "err");
     }
   }
 
@@ -128,9 +147,9 @@
       const ntPath: string = await invoke(command, { path });
       const target = { path, ntPath };
       if (kind === "game") {
-        if (!gameTargets.some((t) => t.ntPath === ntPath)) gameTargets = [...gameTargets, target];
+        if (!gameTargets.some((t) => sameNtPath(t.ntPath, ntPath))) gameTargets = [...gameTargets, target];
       } else {
-        if (!sensorTargets.some((t) => t.ntPath === ntPath)) sensorTargets = [...sensorTargets, target];
+        if (!sensorTargets.some((t) => sameNtPath(t.ntPath, ntPath))) sensorTargets = [...sensorTargets, target];
       }
       addLog(`[APC] ${label} target added, injection enabled: ${ntPath}`, "apc_ok");
       targetInput = "";
@@ -293,9 +312,12 @@
             "suspicious",
           );
         }
-        if (t.dr0 || t.dr1 || t.dr2 || t.dr3) drActive++;
-        if (t.dr7 && !t.dr0 && !t.dr1 && !t.dr2 && !t.dr3) {
-          addLog(`[DR TAMPER TID ${t.tid}] DR7=0x${Number(t.dr7).toString(16).toUpperCase()} but DR0-3 cleared`, "suspicious");
+        // DR7 bits 0-7 enable DR0-DR3. Nothing in Peregrine sets hardware
+        // breakpoints, so any enabled one on a game thread is a finding.
+        if (Number(t.dr7) & 0xff) {
+          drActive++;
+          const h = (v: any) => `0x${Number(v).toString(16).toUpperCase()}`;
+          addLog(`[HW BREAKPOINT TID ${t.tid}] DR7=${h(t.dr7)} DR0=${h(t.dr0)} DR1=${h(t.dr1)} DR2=${h(t.dr2)} DR3=${h(t.dr3)}`, "suspicious");
         }
       }
       const drNote = drActive > 0 ? `, ${drActive} with HW breakpoints` : "";
@@ -446,6 +468,15 @@
     if (!requireDriver()) return;
     addLog(`[VAD Scan] Scanning PID ${pid} for executable private memory...`, "info");
     try {
+      // The Game DLL's own MinHook trampolines are executable private memory
+      // too. They are recognised by following our verified hook sites, never
+      // by anything the game process claims.
+      try {
+        const own: number[] = await invoke("own_hook_regions", { pid });
+        vadOwnRegions = { pid, bases: own, seen: 0 };
+      } catch {
+        vadOwnRegions = { pid, bases: [], seen: 0 };
+      }
       await invoke("scan_vad", { pid });
     } catch (e: any) {
       addLog(`[VAD Scan] failed: ${e}`, "err");
@@ -597,16 +628,21 @@
           d.op === "duplicate" && d.recipient_pid && d.recipient_pid !== d.caller_pid
             ? ` handle goes to PID=${d.recipient_pid}`
             : "";
+        const who = d.caller_name ? `${d.caller_name} (PID ${d.caller_pid})` : `PID=${d.caller_pid}`;
+        // Read-only access to the process (AV, Task Manager, WMI do this all
+        // the time) is still reported, but visually below anything that can
+        // write to or control the game. The caller name is only a label.
+        const readOnly = !isThread && flags === "VM_READ";
         addLog(
-          `[Handle Access] PID=${d.caller_pid} -> ${what} op=${d.op} [${flags}]${recipient}${suppressedNote(d.suppressed)}`,
-          "handle",
+          `[Handle Access] ${who} -> ${what} op=${d.op} [${flags}]${recipient}${suppressedNote(d.suppressed)}`,
+          readOnly ? "info" : "handle",
         );
         break;
       }
 
       case "ob_callback_suppressed":
         addLog(
-          `[Handle Access] PID=${d.caller_pid} -> PID=${d.target_pid} (${d.type}): ${d.suppressed} repeated opens were rate-limited`,
+          `[Handle Access] PID ${d.caller_pid} -> PID=${d.target_pid} (${d.type}): ${d.suppressed} repeated opens were rate-limited`,
           "handle",
         );
         break;
@@ -712,16 +748,25 @@
       case "vad_suspicious": {
         const pe = d.has_pe_header ? " [PE HEADER]" : "";
         const rwx = d.rwx ? " [RWX]" : "";
+        const base = parseInt(String(d.base), 16);
+        if (vadOwnRegions.pid === d.pid && !d.has_pe_header && vadOwnRegions.bases.includes(base)) {
+          vadOwnRegions.seen++;
+          addLog(`[VAD] PID=${d.pid} ${d.base} size=${d.size} ${d.protection} — Peregrine's own hook trampolines (verified through the hook sites)`, "ok");
+          break;
+        }
         addLog(`[VAD] SUSPICIOUS PID=${d.pid} ${d.base} size=${d.size} ${d.protection} ${d.type}${pe}${rwx}`, "vad");
         break;
       }
 
-      case "vad_scan_complete":
-        if (d.suspicious_count > 0)
-          addLog(`[VAD Scan] PID=${d.pid}: ${d.suspicious_count} suspicious region(s) found in ${d.regions_scanned} regions`, "vad");
+      case "vad_scan_complete": {
+        const own = vadOwnRegions.pid === d.pid ? vadOwnRegions.seen : 0;
+        const suspicious = d.suspicious_count - own;
+        if (suspicious > 0)
+          addLog(`[VAD Scan] PID=${d.pid}: ${suspicious} suspicious region(s) found in ${d.regions_scanned} regions`, "vad");
         else
           addLog(`[VAD Scan] PID=${d.pid}: Clean — ${d.regions_scanned} regions scanned`, "ok");
         break;
+      }
 
       case "hwid_data":
         addLog(`[HWID] [${d.source}] ${d.name}: ${d.value}${d.detail ? ` (${d.detail})` : ""}`, "hwid");
@@ -799,6 +844,17 @@
       return;
     }
 
+    // Delivery problems are reported whoever the sender is: a flooding or
+    // muted DLL is a finding in itself.
+    if (event === "IpcFlood") {
+      addLog(`[IPC] PID ${caller} (${d.role}) is flooding the telemetry pipe — ${d.dropped} message(s) dropped`, "tamper");
+      return;
+    }
+    if (event === "IpcDropped") {
+      addLog(`[IPC] PID ${caller} could not deliver ${d.dropped} message(s) (pipe unavailable or not being read)`, "err");
+      return;
+    }
+
     if (event === "RateLimitFlush") {
       // Tail of a rate-limited burst whose key was recycled before its next report.
       if (targetProtected || callerProtected)
@@ -809,23 +865,28 @@
     // Everything below is an internal signal of the Game DLL's own process.
     if (!callerProtected) return;
 
-    if (event === "HwbpInit") {
-      if (d.status === "ok")
-        addLog(`[HW Breakpoint] Initialized — watching VEH list at ${d.vehListAddr}, ${d.threadsArmed} threads armed`, "ok");
+    if (event === "VehGuardInit") {
+      if (d.listScan)
+        addLog(`[VEH Guard] active in PID ${caller} — registration hook + handler list scan (list at ${d.vehListAddr})`, "ok");
       else
-        addLog(`[HW Breakpoint] Init FAILED: ${d.reason ?? "unknown"}`, "err");
+        addLog(`[VEH Guard] active in PID ${caller} — registration hook only (handler list layout not recognised on this Windows build)`, "err");
       return;
     }
     if (event === "VehTableTamper") {
-      addLog(`[VEH TAMPER] VEH handler list modified! PID=${caller} TID=${d.threadId} DR6=${d.dr6}`, "tamper");
+      // A vectored exception handler that lives outside every loaded image.
+      const how =
+        d.source === "registration"
+          ? `registered by TID ${d.threadId}${d.first ? " as FIRST handler" : ""}`
+          : `present in the handler list${d.first ? " as FIRST handler" : ""}`;
+      addLog(`[VEH TAMPER] unbacked exception handler ${d.handler} in PID ${caller} — ${how}${suppressed}`, "tamper");
       return;
     }
-    if (event === "DebugRegisterTamper") {
-      addLog(`[DR TAMPER] Debug registers cleared on TID ${d.threadId} — re-armed by watchdog`, "suspicious");
+    if (event === "HardwareBreakpoint") {
+      addLog(`[HW BREAKPOINT] PID ${caller} TID ${d.threadId}: DR7=${d.dr7} DR0=${d.dr0} DR1=${d.dr1} DR2=${d.dr2} DR3=${d.dr3}`, "suspicious");
       return;
     }
-    if (event === "DebugRegisterClearing") {
-      addLog(`[DR CLEARING] NtSetContextThread zeroing DR regs in PID ${caller} TID ${d.threadId}`, "suspicious");
+    if (event === "DebugRegisterSet") {
+      addLog(`[HW BREAKPOINT] set from inside PID ${caller} on TID ${d.threadId} (NtSetContextThread, DR7=${d.dr7})${suppressed}`, "suspicious");
       return;
     }
 

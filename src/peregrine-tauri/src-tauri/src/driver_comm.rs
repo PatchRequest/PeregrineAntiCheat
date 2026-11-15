@@ -24,6 +24,8 @@ const IOCTL_SEND: u32 = ctl_code(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FI
 const IOCTL_RECV: u32 = ctl_code(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS);
 const IOCTL_QUERY_INJECTED: u32 =
     ctl_code(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS);
+const IOCTL_QUERY_STATE: u32 =
+    ctl_code(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_ANY_ACCESS);
 
 /// Kernel event messages are at most COMS_MAX_MESSAGE_SIZE bytes.
 const MAX_EVENT_SIZE: usize = 1024;
@@ -192,6 +194,31 @@ impl DriverHandle {
             2 => Ok(Some(InjectRole::Sensor)),
             other => Err(format!("QUERY_INJECTED returned unknown role {other}")),
         }
+    }
+
+    /// Reads the kernel's current configuration (protected PIDs, inject
+    /// targets, injection switch) as JSON — see IOCTL_PEREGRINE_QUERY_STATE in
+    /// Coms.h. The kernel outlives this GUI, so it is the source of truth.
+    pub fn query_state(&self) -> Result<serde_json::Value, String> {
+        // 64 PIDs + 32 targets of at most 260 (escaped: 520) characters each.
+        let mut buf = vec![0u8; 32 * 1024];
+        let mut returned = 0u32;
+        unsafe {
+            DeviceIoControl(
+                self.handle,
+                IOCTL_QUERY_STATE,
+                None,
+                0,
+                Some(buf.as_mut_ptr() as *mut _),
+                buf.len() as u32,
+                Some(&mut returned),
+                None,
+            )
+        }
+        .map_err(|e| format!("DeviceIoControl(QUERY_STATE) failed: {e}"))?;
+
+        serde_json::from_slice(&buf[..returned as usize])
+            .map_err(|e| format!("QUERY_STATE returned invalid JSON: {e}"))
     }
 
     // ---- High-level commands ----

@@ -6,66 +6,119 @@
 
 #define IPC_PIPE_NAMEA "\\\\.\\pipe\\peregrine_ipc"
 
-static HANDLE g_pipe = INVALID_HANDLE_VALUE;
-static CRITICAL_SECTION g_lock;
-static volatile LONG g_lock_init = 0;
+/*
+ * Everything here runs inside API hooks on arbitrary game threads, so it must
+ * never block for long and never fail loudly:
+ *   - the pipe is opened overlapped and every write has a deadline; a server
+ *     that stops reading (or something else serving this pipe name) costs one
+ *     bounded stall, after which the pipe is dropped;
+ *   - after a failed connect or write no new attempt is made for a while, so
+ *     a missing GUI costs nothing per event;
+ *   - messages that could not be delivered are counted and announced as
+ *     "IpcDropped" once the pipe works again.
+ */
+#define IPC_WRITE_TIMEOUT_MS   250
+#define IPC_RECONNECT_DELAY_MS 1000
 
-static void EnsureLock(void) {
-    if (InterlockedCompareExchange(&g_lock_init, 1, 0) == 0)
-        InitializeCriticalSection(&g_lock);
+static SRWLOCK   g_lock = SRWLOCK_INIT;       /* guards everything below */
+static HANDLE    g_pipe = INVALID_HANDLE_VALUE;
+static HANDLE    g_write_event = NULL;
+static ULONGLONG g_next_connect = 0;          /* GetTickCount64 deadline */
+static unsigned  g_dropped = 0;
+
+static void ClosePipeLocked(void) {
+    if (g_pipe != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_pipe);
+        g_pipe = INVALID_HANDLE_VALUE;
+    }
+    g_next_connect = GetTickCount64() + IPC_RECONNECT_DELAY_MS;
 }
 
-static HANDLE GetPipe(void) {
+static HANDLE GetPipeLocked(void) {
     if (g_pipe != INVALID_HANDLE_VALUE)
         return g_pipe;
 
-    if (!WaitNamedPipeA(IPC_PIPE_NAMEA, 1000))
+    if (GetTickCount64() < g_next_connect)
         return INVALID_HANDLE_VALUE;
+
+    if (!g_write_event) {
+        g_write_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+        if (!g_write_event) {
+            g_next_connect = GetTickCount64() + IPC_RECONNECT_DELAY_MS;
+            return INVALID_HANDLE_VALUE;
+        }
+    }
 
     /* FILE_WRITE_DATA, not GENERIC_WRITE: the generic right includes
        FILE_CREATE_PIPE_INSTANCE, which the server deliberately does not grant
        to ordinary users (it would let any process serve this pipe name).
        SECURITY_IDENTIFICATION: whoever answers on the pipe may learn who we
-       are but can never impersonate the host process. */
+       are but can never impersonate the host process.
+       No WaitNamedPipe: a busy or absent server is retried later, not waited for. */
     g_pipe = CreateFileA(
         IPC_PIPE_NAMEA,
         FILE_WRITE_DATA | SYNCHRONIZE,
         0, NULL,
         OPEN_EXISTING,
-        SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+        FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
         NULL);
 
+    if (g_pipe == INVALID_HANDLE_VALUE)
+        g_next_connect = GetTickCount64() + IPC_RECONNECT_DELAY_MS;
     return g_pipe;
 }
 
-static void ClosePipe(void) {
-    if (g_pipe != INVALID_HANDLE_VALUE) {
-        CloseHandle(g_pipe);
-        g_pipe = INVALID_HANDLE_VALUE;
+/* Caller holds g_lock. FALSE if the message did not go out completely. */
+static BOOL WriteLocked(HANDLE h, const char* data, DWORD len) {
+    OVERLAPPED ov;
+    memset(&ov, 0, sizeof(ov));
+    ov.hEvent = g_write_event;
+    ResetEvent(g_write_event);
+
+    DWORD written = 0;
+    if (WriteFile(h, data, len, &written, &ov))
+        return written == len;
+
+    if (GetLastError() != ERROR_IO_PENDING)
+        return FALSE;
+
+    if (WaitForSingleObject(g_write_event, IPC_WRITE_TIMEOUT_MS) != WAIT_OBJECT_0) {
+        /* The reader is not reading. Cancel and wait for the cancellation to
+           land: `ov` lives on this stack frame. */
+        CancelIoEx(h, &ov);
+        GetOverlappedResult(h, &ov, &written, TRUE);
+        return FALSE;
     }
+    return GetOverlappedResult(h, &ov, &written, FALSE) && written == len;
 }
 
 void ipc_write_json(const char* json) {
     if (!json) return;
-    EnsureLock();
 
-    EnterCriticalSection(&g_lock);
+    AcquireSRWLockExclusive(&g_lock);
 
-    HANDLE h = GetPipe();
+    HANDLE h = GetPipeLocked();
     if (h == INVALID_HANDLE_VALUE) {
-        LeaveCriticalSection(&g_lock);
+        if (g_dropped != 0xFFFFFFFFu) g_dropped++;
+        ReleaseSRWLockExclusive(&g_lock);
         return;
     }
 
-    DWORD len = (DWORD)strlen(json);
-    DWORD written = 0;
-    if (!WriteFile(h, json, len, &written, NULL)) {
-        ClosePipe();
+    if (g_dropped != 0) {
+        char notice[96];
+        _snprintf_s(notice, sizeof(notice), _TRUNCATE,
+            "{\"event\":\"IpcDropped\",\"dropped\":%u}", g_dropped);
+        if (WriteLocked(h, notice, (DWORD)strlen(notice)))
+            g_dropped = 0;
     }
 
-    LeaveCriticalSection(&g_lock);
-}
+    if (!WriteLocked(h, json, (DWORD)strlen(json))) {
+        if (g_dropped != 0xFFFFFFFFu) g_dropped++;
+        ClosePipeLocked();
+    }
 
+    ReleaseSRWLockExclusive(&g_lock);
+}
 #define IPC_PARAMS_MAX  768
 #define IPC_MESSAGE_MAX 1024
 
@@ -113,6 +166,7 @@ typedef struct {
 } RateDecision;
 
 static RateSlot g_rate_slots[RL_SLOTS];
+static RateSlot g_rate_overflow;   /* shared by keys that found no slot */
 static SRWLOCK  g_rate_lock = SRWLOCK_INIT;
 
 static int same_text(const char* a, const char* b) {
@@ -142,7 +196,19 @@ static void rate_limit_decide(const char* event, const char* subkey, DWORD targe
             reclaim = s;
     }
 
-    if (!slot) {
+    /* Every slot holds a key whose window is still running: evicting one
+       would hand out a fresh burst per new key, i.e. no limit at all for a
+       caller that cycles through more than RL_SLOTS targets. Such messages
+       share one bucket instead. */
+    if (!slot && reclaim->in_use && now - reclaim->window_start < RL_WINDOW_MS)
+        slot = &g_rate_overflow;
+
+    if (slot == &g_rate_overflow) {
+        if (now - slot->window_start >= RL_WINDOW_MS) {
+            slot->window_start = now;
+            slot->emitted = 0;
+        }
+    } else if (!slot) {
         if (reclaim->in_use && reclaim->suppressed != 0) {
             out->flush = 1;
             out->flush_event = reclaim->event;

@@ -2,244 +2,259 @@
 #include "ipc.h"
 #include <tlhelp32.h>
 
-volatile LONG g_hwbp_arming = 0;
+/*
+ * VEH-handler and hardware-breakpoint detection (Game DLL only).
+ *
+ * What a FakeVEH / HWBP-hook cheat does inside the game:
+ *   1. registers a vectored exception handler that lives in memory it
+ *      injected (not backed by any image), and
+ *   2. sets hardware breakpoints (DR0-DR3 + DR7) on game threads so the
+ *      handler gets control at the "hooked" addresses.
+ *
+ * Detection, none of which changes the game's own state:
+ *   - a hook on RtlAddVectoredExceptionHandler reports a handler that is not
+ *     inside a loaded image at the moment it is registered;
+ *   - a watchdog thread walks the VEH list itself, which also finds handlers
+ *     that were linked in without the API or before this DLL was loaded;
+ *   - the same watchdog reports every thread with an enabled hardware
+ *     breakpoint, and a hook on NtSetContextThread (dllmain.cpp) reports the
+ *     in-process call that sets one.
+ *
+ * Deliberately NOT done: putting our own data breakpoint on the VEH list.
+ * ntdll modifies the list while holding the list's SRW lock; the resulting
+ * single-step exception is dispatched on the same thread, and vectored
+ * dispatch takes that same lock again — the thread deadlocks, and with it
+ * every later exception in the process. An earlier version did this and froze
+ * any armed thread that registered a first-chance handler.
+ */
 
-static DWORD  g_my_pid        = 0;
-static DWORD  g_watchdog_tid  = 0;
-static ULONG_PTR g_veh_list_addr = 0;
+static DWORD g_my_pid = 0;
 
-/* DR7: local-enable DR0 (bit 0), write-only condition (bits 16-17 = 01),
-   8-byte length (bits 18-19 = 10 on x64).  Result: 0x00090001 */
-#define DR7_WATCH_DR0  0x00090001ULL
-
-#define CONTEXT_AMD64_FLAG  0x00100000UL
-#define CONTEXT_DBG_REGS    (CONTEXT_AMD64_FLAG | 0x10)
+#define WATCHDOG_INTERVAL_MS 2000
 
 /* ------------------------------------------------------------------ */
-/* Resolve LdrpVectorHandlerList                                      */
+/* Helpers                                                            */
 /* ------------------------------------------------------------------ */
 
-typedef struct _VEH_LIST_ENTRY {
-    LIST_ENTRY List;
-} VEH_LIST_ENTRY;
+/* TRUE if addr lies in committed memory that maps an image (exe / dll). */
+static int is_image_backed(const void* addr)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!addr || !VirtualQuery(addr, &mbi, sizeof(mbi)))
+        return 0;
+    return mbi.State == MEM_COMMIT && mbi.Type == MEM_IMAGE;
+}
 
-static LONG NTAPI DummyVeh(PEXCEPTION_POINTERS ep) {
+/* ------------------------------------------------------------------ */
+/* Hook: RtlAddVectoredExceptionHandler                               */
+/* ------------------------------------------------------------------ */
+
+hwbp_add_veh_t hwbp_orig_add_veh = NULL;
+
+PVOID NTAPI hwbp_hook_add_veh(ULONG first, PVECTORED_EXCEPTION_HANDLER handler)
+{
+    /* The original takes and releases the list lock; report afterwards. */
+    PVOID cookie = hwbp_orig_add_veh(first, handler);
+    DWORD last_error = GetLastError();
+
+    if (cookie && !is_image_backed((const void*)handler)) {
+        ipc_log_event_limited("VehTableTamper", "registration", 0,
+            "\"callerPID\":%lu,\"threadId\":%lu,\"handler\":\"0x%llX\","
+            "\"first\":%lu,\"source\":\"registration\"",
+            g_my_pid, (unsigned long)GetCurrentThreadId(),
+            (unsigned long long)(ULONG_PTR)handler, (unsigned long)(first != 0));
+    }
+
+    SetLastError(last_error);
+    return cookie;
+}
+
+/* ------------------------------------------------------------------ */
+/* VEH list walk                                                      */
+/* ------------------------------------------------------------------ */
+/*
+ * The list head and the entry layout are private to ntdll and differ between
+ * Windows versions, so both are measured instead of assumed: register a
+ * handler of our own as first entry, take the head from its back link, and
+ * find the slot that holds the encoded pointer we just registered.
+ */
+
+static LIST_ENTRY* g_veh_head = NULL;
+static SIZE_T      g_handler_offset = 0;   /* 0 = layout not recognised */
+
+static LONG NTAPI CalibrationVeh(PEXCEPTION_POINTERS ep)
+{
     (void)ep;
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-static ULONG_PTR find_veh_list_head(void)
+static void calibrate_veh_list(void)
 {
-    /* Register ourselves as FIRST handler so entry->List.Blink == list head */
-    PVOID h = AddVectoredExceptionHandler(1, DummyVeh);
-    if (!h) return 0;
+    PVOID cookie = AddVectoredExceptionHandler(1, CalibrationVeh);
+    if (!cookie) return;
 
-    VEH_LIST_ENTRY* entry = (VEH_LIST_ENTRY*)h;
-    ULONG_PTR head = (ULONG_PTR)entry->List.Blink;
+    __try {
+        LIST_ENTRY* entry = (LIST_ENTRY*)cookie;
+        LIST_ENTRY* head = entry->Blink;        /* we are first */
+        PVOID encoded = EncodePointer((PVOID)CalibrationVeh);
 
-    RemoveVectoredExceptionHandler(h);
-    return head;
-}
-
-/* ------------------------------------------------------------------ */
-/* Set / verify DR0 on a single thread                                */
-/* ------------------------------------------------------------------ */
-
-static int set_dr0_on_thread(DWORD tid)
-{
-    if (tid == GetCurrentThreadId() || tid == g_watchdog_tid)
-        return 0;
-
-    HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
-                           THREAD_SET_CONTEXT, FALSE, tid);
-    if (!th) return 0;
-
-    SuspendThread(th);
-
-    CONTEXT ctx;
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.ContextFlags = CONTEXT_DBG_REGS;
-
-    int armed = 0;
-    if (GetThreadContext(th, &ctx)) {
-        ctx.Dr0 = (DWORD64)g_veh_list_addr;
-        ctx.Dr7 = (ctx.Dr7 & ~0x000F0003ULL) | DR7_WATCH_DR0;
-        ctx.Dr6 = 0;
-        ctx.ContextFlags = CONTEXT_DBG_REGS;
-
-        InterlockedExchange(&g_hwbp_arming, 1);
-        armed = SetThreadContext(th, &ctx);
-        InterlockedExchange(&g_hwbp_arming, 0);
+        /* Entry: LIST_ENTRY, then at most three pointer-sized fields. */
+        for (SIZE_T off = sizeof(LIST_ENTRY);
+             off <= sizeof(LIST_ENTRY) + 2 * sizeof(PVOID);
+             off += sizeof(PVOID)) {
+            if (*(PVOID*)((BYTE*)entry + off) == encoded) {
+                g_veh_head = head;
+                g_handler_offset = off;
+                break;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_veh_head = NULL;
+        g_handler_offset = 0;
     }
 
-    ResumeThread(th);
-    CloseHandle(th);
-    return armed;
+    RemoveVectoredExceptionHandler(cookie);
 }
 
-static int check_dr0_on_thread(DWORD tid, int* out_cleared)
+#define MAX_VEH_ENTRIES 64
+
+/* Unbacked handlers seen by the previous walk; only the watchdog touches it. */
+static ULONG_PTR g_known_unbacked[MAX_VEH_ENTRIES];
+static int       g_known_unbacked_count = 0;
+
+static void scan_veh_list(void)
 {
-    *out_cleared = 0;
-    if (tid == GetCurrentThreadId() || tid == g_watchdog_tid)
-        return 0;
+    if (!g_veh_head || !g_handler_offset) return;
 
-    HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
-                           THREAD_SET_CONTEXT, FALSE, tid);
-    if (!th) return 0;
+    ULONG_PTR found[MAX_VEH_ENTRIES];
+    int found_first[MAX_VEH_ENTRIES];     /* handler is the first in the list */
+    int found_count = 0;
 
-    SuspendThread(th);
+    /* Walked without ntdll's list lock (not reachable from here): entries can
+       be unlinked and freed underneath us, hence the guard and the bound. */
+    __try {
+        int guard = 0;
+        for (LIST_ENTRY* e = g_veh_head->Flink;
+             e != g_veh_head && guard < MAX_VEH_ENTRIES;
+             e = e->Flink, guard++) {
+            PVOID handler = DecodePointer(*(PVOID*)((BYTE*)e + g_handler_offset));
+            if (!is_image_backed(handler)) {
+                found[found_count] = (ULONG_PTR)handler;
+                found_first[found_count] = (guard == 0);
+                found_count++;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return; /* list changed mid-walk; the next pass sees the result */
+    }
 
-    CONTEXT ctx;
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.ContextFlags = CONTEXT_DBG_REGS;
-
-    int ok = 0;
-    if (GetThreadContext(th, &ctx)) {
-        ok = 1;
-        if ((ULONG_PTR)ctx.Dr0 != g_veh_list_addr) {
-            *out_cleared = 1;
-            /* Re-arm */
-            ctx.Dr0 = (DWORD64)g_veh_list_addr;
-            ctx.Dr7 = (ctx.Dr7 & ~0x000F0003ULL) | DR7_WATCH_DR0;
-            ctx.Dr6 = 0;
-            ctx.ContextFlags = CONTEXT_DBG_REGS;
-
-            InterlockedExchange(&g_hwbp_arming, 1);
-            SetThreadContext(th, &ctx);
-            InterlockedExchange(&g_hwbp_arming, 0);
+    for (int i = 0; i < found_count; i++) {
+        int known = 0;
+        for (int k = 0; k < g_known_unbacked_count; k++)
+            if (g_known_unbacked[k] == found[i]) { known = 1; break; }
+        if (!known) {
+            ipc_log_event("VehTableTamper",
+                "\"callerPID\":%lu,\"threadId\":0,\"handler\":\"0x%llX\","
+                "\"first\":%d,\"source\":\"list\"",
+                g_my_pid, (unsigned long long)found[i], found_first[i]);
         }
     }
 
-    ResumeThread(th);
-    CloseHandle(th);
-    return ok;
+    memcpy(g_known_unbacked, found, (size_t)found_count * sizeof(found[0]));
+    g_known_unbacked_count = found_count;
 }
 
 /* ------------------------------------------------------------------ */
-/* Threads we have armed                                               */
+/* Hardware breakpoints on our threads                                */
 /* ------------------------------------------------------------------ */
-/*
- * A thread that starts after init has empty debug registers because nobody
- * armed it yet, not because somebody cleared them. Only a thread that was
- * armed before and has lost DR0 since is tampering. The list is rebuilt from
- * every watchdog pass, so exited threads (and reused TIDs) drop out.
- * Touched by the init thread first and by the watchdog only afterwards.
- */
-#define MAX_ARMED_THREADS 1024
 
-static DWORD g_armed[MAX_ARMED_THREADS];
-static int   g_armed_count = 0;
+#define MAX_TRACKED_THREADS 256
 
-static int was_armed(DWORD tid)
+typedef struct {
+    DWORD     tid;
+    ULONG_PTR dr[4];
+    ULONG_PTR dr7;
+} ThreadBreakpoints;
+
+/* Breakpoints reported by the previous pass; only the watchdog touches it. */
+static ThreadBreakpoints g_known_bp[MAX_TRACKED_THREADS];
+static int               g_known_bp_count = 0;
+
+/* DR7 bits 0-7 are the local/global enables of DR0-DR3. */
+#define DR7_ENABLE_MASK 0xFF
+
+static void scan_debug_registers(void)
 {
-    for (int i = 0; i < g_armed_count; i++)
-        if (g_armed[i] == tid) return 1;
-    return 0;
-}
+    static ThreadBreakpoints now_bp[MAX_TRACKED_THREADS];
+    int now_count = 0;
 
-/* ------------------------------------------------------------------ */
-/* Arm DR0 on every thread in this process                            */
-/* ------------------------------------------------------------------ */
-
-static int arm_all_threads(void)
-{
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snap == INVALID_HANDLE_VALUE) return 0;
+    if (snap == INVALID_HANDLE_VALUE) return;
 
     THREADENTRY32 te;
     te.dwSize = sizeof(te);
-    int count = 0;
 
     if (Thread32First(snap, &te)) {
         do {
-            if (te.th32OwnerProcessID == g_my_pid &&
-                set_dr0_on_thread(te.th32ThreadID)) {
-                count++;
-                if (g_armed_count < MAX_ARMED_THREADS)
-                    g_armed[g_armed_count++] = te.th32ThreadID;
+            if (te.th32OwnerProcessID != g_my_pid) continue;
+
+            /* Read-only and without suspending the thread: debug registers
+               are kept per thread by the kernel, a running thread is fine. */
+            HANDLE th = OpenThread(THREAD_GET_CONTEXT, FALSE, te.th32ThreadID);
+            if (!th) continue;
+
+            CONTEXT ctx;
+            memset(&ctx, 0, sizeof(ctx));
+            ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            BOOL ok = GetThreadContext(th, &ctx);
+            CloseHandle(th);
+            if (!ok || (ctx.Dr7 & DR7_ENABLE_MASK) == 0) continue;
+
+            ThreadBreakpoints cur;
+            cur.tid = te.th32ThreadID;
+            cur.dr[0] = (ULONG_PTR)ctx.Dr0;
+            cur.dr[1] = (ULONG_PTR)ctx.Dr1;
+            cur.dr[2] = (ULONG_PTR)ctx.Dr2;
+            cur.dr[3] = (ULONG_PTR)ctx.Dr3;
+            cur.dr7 = (ULONG_PTR)ctx.Dr7;
+
+            int known = 0;
+            for (int k = 0; k < g_known_bp_count; k++) {
+                if (memcmp(&g_known_bp[k], &cur, sizeof(cur)) == 0) { known = 1; break; }
             }
+            if (!known) {
+                ipc_log_event("HardwareBreakpoint",
+                    "\"callerPID\":%lu,\"threadId\":%lu,"
+                    "\"dr0\":\"0x%llX\",\"dr1\":\"0x%llX\",\"dr2\":\"0x%llX\",\"dr3\":\"0x%llX\","
+                    "\"dr7\":\"0x%llX\"",
+                    g_my_pid, (unsigned long)cur.tid,
+                    (unsigned long long)cur.dr[0], (unsigned long long)cur.dr[1],
+                    (unsigned long long)cur.dr[2], (unsigned long long)cur.dr[3],
+                    (unsigned long long)cur.dr7);
+            }
+            if (now_count < MAX_TRACKED_THREADS)
+                now_bp[now_count++] = cur;
         } while (Thread32Next(snap, &te));
     }
     CloseHandle(snap);
-    return count;
+
+    memcpy(g_known_bp, now_bp, (size_t)now_count * sizeof(now_bp[0]));
+    g_known_bp_count = now_count;
 }
 
 /* ------------------------------------------------------------------ */
-/* VEH handler: catch EXCEPTION_SINGLE_STEP from our DR0 breakpoint   */
+/* Watchdog                                                           */
 /* ------------------------------------------------------------------ */
-
-static PVOID g_veh_handle = NULL;
-
-static LONG NTAPI HwbpVehHandler(PEXCEPTION_POINTERS ep)
-{
-    if (ep->ExceptionRecord->ExceptionCode != STATUS_SINGLE_STEP)
-        return EXCEPTION_CONTINUE_SEARCH;
-
-    /* Check DR6 bit 0 (B0) — our DR0 triggered */
-    DWORD64 dr6 = ep->ContextRecord->Dr6;
-    if (!(dr6 & 1))
-        return EXCEPTION_CONTINUE_SEARCH;
-
-    DWORD tid = GetCurrentThreadId();
-    ipc_log_event("VehTableTamper",
-        "\"callerPID\":%lu,\"threadId\":%lu,\"dr6\":\"0x%llX\"",
-        g_my_pid, (unsigned long)tid, (unsigned long long)dr6);
-
-    /* Clear B0 and re-arm DR0 */
-    ep->ContextRecord->Dr6 &= ~(DWORD64)1;
-    ep->ContextRecord->Dr0 = (DWORD64)g_veh_list_addr;
-    ep->ContextRecord->Dr7 = (ep->ContextRecord->Dr7 & ~0x000F0003ULL) | DR7_WATCH_DR0;
-
-    return EXCEPTION_CONTINUE_EXECUTION;
-}
-
-/* ------------------------------------------------------------------ */
-/* Watchdog thread: periodic DR0 validation + re-arm                  */
-/* ------------------------------------------------------------------ */
-
-#define WATCHDOG_INTERVAL_MS 5000
 
 static DWORD WINAPI WatchdogThread(LPVOID param)
 {
     (void)param;
-    g_watchdog_tid = GetCurrentThreadId();
 
     for (;;) {
+        scan_veh_list();
+        scan_debug_registers();
         Sleep(WATCHDOG_INTERVAL_MS);
-
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-        if (snap == INVALID_HANDLE_VALUE) continue;
-
-        THREADENTRY32 te;
-        te.dwSize = sizeof(te);
-
-        static DWORD now_armed[MAX_ARMED_THREADS];
-        int now_count = 0;
-
-        if (Thread32First(snap, &te)) {
-            do {
-                if (te.th32OwnerProcessID != g_my_pid) continue;
-
-                int cleared = 0;
-                if (!check_dr0_on_thread(te.th32ThreadID, &cleared)) continue;
-
-                /* check_dr0_on_thread re-arms; a first-time arm of a new
-                   thread is not a finding. */
-                if (cleared && was_armed(te.th32ThreadID)) {
-                    ipc_log_event("DebugRegisterTamper",
-                        "\"callerPID\":%lu,\"threadId\":%lu,\"action\":\"re-armed\"",
-                        g_my_pid, (unsigned long)te.th32ThreadID);
-                }
-                if (now_count < MAX_ARMED_THREADS)
-                    now_armed[now_count++] = te.th32ThreadID;
-            } while (Thread32Next(snap, &te));
-        }
-        CloseHandle(snap);
-
-        memcpy(g_armed, now_armed, (size_t)now_count * sizeof(DWORD));
-        g_armed_count = now_count;
     }
-    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -250,22 +265,13 @@ void hwbp_init(void)
 {
     g_my_pid = GetCurrentProcessId();
 
-    g_veh_list_addr = find_veh_list_head();
-    if (!g_veh_list_addr) {
-        ipc_log_event("HwbpInit", "\"status\":\"failed\",\"reason\":\"cannot resolve LdrpVectorHandlerList\"");
-        return;
-    }
+    calibrate_veh_list();
 
-    /* Register our VEH handler FIRST so we see single-step before anyone else */
-    g_veh_handle = AddVectoredExceptionHandler(1, HwbpVehHandler);
+    ipc_log_event("VehGuardInit",
+        "\"callerPID\":%lu,\"status\":\"ok\",\"listScan\":%s,\"vehListAddr\":\"0x%llX\"",
+        g_my_pid, g_handler_offset ? "true" : "false",
+        (unsigned long long)(ULONG_PTR)g_veh_head);
 
-    int armed = arm_all_threads();
-
-    ipc_log_event("HwbpInit",
-        "\"status\":\"ok\",\"vehListAddr\":\"0x%llX\",\"threadsArmed\":%d",
-        (unsigned long long)g_veh_list_addr, armed);
-
-    /* Start watchdog */
     HANDLE wt = CreateThread(NULL, 0, WatchdogThread, NULL, 0, NULL);
     if (wt) CloseHandle(wt);
 }

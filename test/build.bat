@@ -18,6 +18,8 @@ cl /nologo /O2 cheat_etwti.c /Fe:cheat_etwti.exe
 cl /nologo /O2 cheat_hwbp.c /Fe:cheat_hwbp.exe
 cl /nologo /O2 cheat_thread.c /Fe:cheat_thread.exe
 cl /nologo /O2 cheat_pipe.c /Fe:cheat_pipe.exe
+cl /nologo /O2 cheat_file.c /Fe:cheat_file.exe
+cl /nologo /O2 cheat_ioctl.c /Fe:cheat_ioctl.exe
 cl /nologo /O2 /LD payload.c /Fe:payload.dll
 
 echo.
@@ -58,11 +60,12 @@ echo 8. ETW-TI smoketest (all Threat Intelligence event types):
 echo    game.exe                        ^<-- note PID, add to Peregrine, click ETW-TI
 echo    cheat_etwti.exe ^<PID^>          ^<-- triggers all 8 ETW-TI event types
 echo.
-echo 9. HW breakpoint / FakeVEH / DR clearing (VEH tamper + debug register detection):
-echo    game.exe                        ^<-- note PID, add to Peregrine, inject DLL, click ETW-TI
+echo 9. FakeVEH / hardware breakpoints (VEH handler + debug register detection):
+echo    game.exe                        ^<-- note PID (Game inject target)
 echo    cheat_hwbp.exe ^<PID^> --read    ^<-- read-only: dump DR registers
-echo    cheat_hwbp.exe ^<PID^> --veh     ^<-- FakeVEH injection only (triggers VehTableTamper)
-echo    cheat_hwbp.exe ^<PID^>           ^<-- full test: FakeVEH + DR clear + re-arm verify
+echo    cheat_hwbp.exe ^<PID^> --veh     ^<-- FakeVEH only: expect [VEH TAMPER] unbacked handler
+echo    cheat_hwbp.exe ^<PID^>           ^<-- full test: FakeVEH + [HW BREAKPOINT] per game thread
+echo    game.exe --veh ^| --veh-last ^| --veh-main   ^<-- legitimate VEHs: game keeps running, no report
 echo.
 echo 10. Thread-handle access without a process handle (ObCallback PsThreadType):
 echo    game.exe                        ^<-- note PID (must be protected)
@@ -71,3 +74,9 @@ echo    cheat_thread.exe ^<PID^> 500     ^<-- loop: one line + suppressed count,
 echo.
 echo 11. Forged DLL telemetry (IPC pipe authentication):
 echo    cheat_pipe.exe ^<game_PID^>      ^<-- must be disconnected; GUI shows no forged line
+echo.
+echo 12. AC file tampering (minifilter self-defense, run elevated):
+echo    cheat_file.exe                  ^<-- 9 attempts on C:\Peregrine\rules.yar, all must be refused (PASS)
+echo.
+echo 13. Untrusted IOCTLs (control device authentication, run elevated, GUI running):
+echo    cheat_ioctl.exe                 ^<-- every request must be refused (PASS)

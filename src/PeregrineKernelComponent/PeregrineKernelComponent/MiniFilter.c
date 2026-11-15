@@ -81,43 +81,81 @@ static BOOLEAN IsProtectedFile(_In_ PCUNICODE_STRING Path)
     return FALSE;
 }
 
-/* TRUSTED, not PROTECTED: only the AC itself may modify AC files. The game
-   being defended (or anything that managed to get protected) may not. */
-static BOOLEAN IsOurProcess(VOID)
+/* The AC directory itself, as the last path component (rename / delete of it). */
+static const UNICODE_STRING g_AcDirectoryLeaf = RTL_CONSTANT_STRING(L"\\peregrine");
+
+/*
+ * TRUE if the object named by Info is an AC file (or, with IncludeDirectory,
+ * the AC directory itself). The stream part is ignored: "rules.yar::$DATA"
+ * and "rules.yar:anything" are still rules.yar.
+ */
+static BOOLEAN IsProtectedName(
+    _Inout_ PFLT_FILE_NAME_INFORMATION Info,
+    _In_ BOOLEAN IncludeDirectory)
 {
+    UNICODE_STRING name = Info->Name;
+    if (NT_SUCCESS(FltParseFileNameInformation(Info)) &&
+        Info->Stream.Length != 0 && Info->Stream.Length <= name.Length) {
+        name.Length -= Info->Stream.Length;
+    }
+
+    if (IsProtectedFile(&name))
+        return TRUE;
+    return IncludeDirectory && EndsWithI(&name, &g_AcDirectoryLeaf);
+}
+
+/*
+ * Who is exempt from the file self-defense:
+ *   - the TRUSTED process (the AC GUI itself). Not PROTECTED: the game being
+ *     defended, or anything that managed to get protected, may not touch AC
+ *     files;
+ *   - kernel-mode requestors. A user-mode attacker cannot issue those, and
+ *     denying them would interfere with the system (and other drivers) for no
+ *     gain.
+ */
+static BOOLEAN IsExemptRequest(_In_ PFLT_CALLBACK_DATA Data)
+{
+    if (Data->RequestorMode == KernelMode)
+        return TRUE;
     return StateIsPidTrusted(PsGetCurrentProcessId());
 }
 
-/* Report (rate-limited per PID) and fail the operation with ACCESS_DENIED. */
+/* Report a blocked operation (rate-limited per PID). PASSIVE_LEVEL. */
+static VOID ReportBlocked(_In_ PCUNICODE_STRING Path, _In_z_ const CHAR* OpName)
+{
+    HANDLE callerPid = PsGetCurrentProcessId();
+    if (!ShouldReport(callerPid))
+        return;
+
+    ANSI_STRING ansi = { 0 };
+    if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansi, Path, TRUE))) {
+        CHAR json[COMS_MAX_MESSAGE_SIZE];
+        CHAR escaped[520];
+        if (!JsonEscapeString(escaped, sizeof(escaped), ansi.Buffer))
+            escaped[0] = '\0';
+        RtlStringCchPrintfA(json, ARRAYSIZE(json),
+            "{ \"event\": \"file_access\", \"pid\": %lu, \"path\": \"%s\", \"op\": \"%s\" }",
+            (ULONG)(ULONG_PTR)callerPid, escaped, OpName);
+        ComsSendToUser(json, (ULONG)strlen(json));
+        RtlFreeAnsiString(&ansi);
+    }
+}
+
+/* Report and fail the operation with ACCESS_DENIED (pre-operation). */
 static FLT_PREOP_CALLBACK_STATUS DenyAndReport(
     _Inout_ PFLT_CALLBACK_DATA Data,
     _In_ PCUNICODE_STRING Path,
     _In_z_ const CHAR* OpName)
 {
-    HANDLE callerPid = PsGetCurrentProcessId();
-    if (ShouldReport(callerPid)) {
-        ANSI_STRING ansi = { 0 };
-        if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansi, Path, TRUE))) {
-            CHAR json[COMS_MAX_MESSAGE_SIZE];
-            CHAR escaped[520];
-            if (!JsonEscapeString(escaped, sizeof(escaped), ansi.Buffer))
-                escaped[0] = '\0';
-            RtlStringCchPrintfA(json, ARRAYSIZE(json),
-                "{ \"event\": \"file_access\", \"pid\": %lu, \"path\": \"%s\", \"op\": \"%s\" }",
-                (ULONG)(ULONG_PTR)callerPid, escaped, OpName);
-            ComsSendToUser(json, (ULONG)strlen(json));
-            RtlFreeAnsiString(&ansi);
-        }
-    }
-
+    ReportBlocked(Path, OpName);
     Data->IoStatus.Status = STATUS_ACCESS_DENIED;
     Data->IoStatus.Information = 0;
     return FLT_PREOP_COMPLETE;
 }
 
 /* ------------------------------------------------------------------ */
-/*  Pre-Create: deny write/delete access to protected AC files        */
-/*  Only resolves filename if it's a write-like operation.            */
+/*  Create: deny write/delete access to protected AC files            */
+/*  Only resolves the file name for write-like opens.                 */
 /* ------------------------------------------------------------------ */
 
 #define WRITE_ACCESS_FLAGS (FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | \
@@ -129,34 +167,85 @@ PreCreate(
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
     _Flt_CompletionContext_Outptr_ PVOID* CompletionContext)
 {
-    UNREFERENCED_PARAMETER(CompletionContext);
     UNREFERENCED_PARAMETER(FltObjects);
+    *CompletionContext = NULL;
 
     if (Data == NULL || Data->Iopb == NULL) return FLT_PREOP_SUCCESS_NO_CALLBACK;
-    if (IsOurProcess()) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (IsExemptRequest(Data)) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (FlagOn(Data->Iopb->OperationFlags, SL_OPEN_PAGING_FILE))
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
     ACCESS_MASK desired = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
-    ULONG disposition = (Data->Iopb->Parameters.Create.Options >> 24) & 0xFF;
+    const ULONG options = Data->Iopb->Parameters.Create.Options & 0x00FFFFFF;
+    const ULONG disposition = (Data->Iopb->Parameters.Create.Options >> 24) & 0xFF;
 
-    BOOLEAN isWrite = (desired & WRITE_ACCESS_FLAGS) != 0;
-    BOOLEAN isCreateNew = (disposition == FILE_CREATE ||
-                           disposition == FILE_OVERWRITE ||
-                           disposition == FILE_OVERWRITE_IF ||
-                           disposition == FILE_SUPERSEDE);
+    const BOOLEAN isWrite = (desired & WRITE_ACCESS_FLAGS) != 0 ||
+                            FlagOn(options, FILE_DELETE_ON_CLOSE);
+    const BOOLEAN isDestructive = (disposition == FILE_OVERWRITE ||
+                                   disposition == FILE_OVERWRITE_IF ||
+                                   disposition == FILE_SUPERSEDE);
+    const BOOLEAN isCreateNew = (disposition == FILE_CREATE) || isDestructive;
 
     if (!isWrite && !isCreateNew) return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
     PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
     NTSTATUS st = FltGetFileNameInformation(Data,
         FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &nameInfo);
-    if (!NT_SUCCESS(st) || nameInfo == NULL) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (!NT_SUCCESS(st) || nameInfo == NULL) {
+        /* An open by file ID has no path yet, so "which file is this" cannot
+           be answered before the file system has opened it. */
+        if (FlagOn(options, FILE_OPEN_BY_FILE_ID)) {
+            if (isDestructive) {
+                /* Would truncate before we could look. Nothing legitimate
+                   overwrites by ID. */
+                Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+                Data->IoStatus.Information = 0;
+                return FLT_PREOP_COMPLETE;
+            }
+            return FLT_PREOP_SUCCESS_WITH_CALLBACK; /* decided in PostCreate */
+        }
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
 
     FLT_PREOP_CALLBACK_STATUS result = FLT_PREOP_SUCCESS_NO_CALLBACK;
-    if (IsProtectedFile(&nameInfo->Name))
+    if (IsProtectedName(nameInfo, FALSE))
         result = DenyAndReport(Data, &nameInfo->Name, "write");
 
     FltReleaseFileNameInformation(nameInfo);
     return result;
+}
+
+/* Only reached for write-like opens by file ID (see PreCreate). The file is
+   open now and has a name: if it is an AC file, undo the open. */
+static FLT_POSTOP_CALLBACK_STATUS FLTAPI
+PostCreate(
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_opt_ PVOID CompletionContext,
+    _In_ FLT_POST_OPERATION_FLAGS Flags)
+{
+    UNREFERENCED_PARAMETER(CompletionContext);
+
+    if (FlagOn(Flags, FLTFL_POST_OPERATION_DRAINING))
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    if (!NT_SUCCESS(Data->IoStatus.Status) || Data->IoStatus.Status == STATUS_REPARSE)
+        return FLT_POSTOP_FINISHED_PROCESSING;
+
+    PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
+    NTSTATUS st = FltGetFileNameInformation(Data,
+        FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &nameInfo);
+    if (!NT_SUCCESS(st) || nameInfo == NULL)
+        return FLT_POSTOP_FINISHED_PROCESSING;
+
+    if (IsProtectedName(nameInfo, FALSE)) {
+        ReportBlocked(&nameInfo->Name, "write_by_id");
+        FltCancelFileOpen(FltObjects->Instance, FltObjects->FileObject);
+        Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+        Data->IoStatus.Information = 0;
+    }
+
+    FltReleaseFileNameInformation(nameInfo);
+    return FLT_POSTOP_FINISHED_PROCESSING;
 }
 
 /* ------------------------------------------------------------------ */
@@ -194,7 +283,7 @@ static BOOLEAN IsDestinationProtected(
         return FALSE;
     }
 
-    if (IsProtectedFile(&(*DestInfo)->Name))
+    if (IsProtectedName(*DestInfo, TRUE))
         return TRUE;
 
     FltReleaseFileNameInformation(*DestInfo);
@@ -208,11 +297,11 @@ PreSetInfo(
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
     _Flt_CompletionContext_Outptr_ PVOID* CompletionContext)
 {
-    UNREFERENCED_PARAMETER(CompletionContext);
+    *CompletionContext = NULL;
 
     if (Data == NULL || Data->Iopb == NULL || FltObjects == NULL)
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
-    if (IsOurProcess()) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (IsExemptRequest(Data)) return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
     ULONG infoClass = Data->Iopb->Parameters.SetFileInformation.FileInformationClass;
     BOOLEAN isDelete = (infoClass == FileDispositionInformation ||
@@ -234,33 +323,33 @@ PreSetInfo(
         }
     }
 
-    /* The file itself is an AC file being deleted or renamed away. A hard
-       link *from* an AC file only adds a name and is left alone. */
-    if (isLink) return FLT_PREOP_SUCCESS_NO_CALLBACK;
-
+    /* The object itself is an AC file — or the AC directory — being deleted,
+       renamed away or given a second name. The hard link is denied as well:
+       the new name would be an unprotected path to the same file, writable
+       by anyone. */
     PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
     NTSTATUS st = FltGetFileNameInformation(Data,
         FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &nameInfo);
     if (!NT_SUCCESS(st) || nameInfo == NULL) return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
     FLT_PREOP_CALLBACK_STATUS result = FLT_PREOP_SUCCESS_NO_CALLBACK;
-    if (IsProtectedFile(&nameInfo->Name))
-        result = DenyAndReport(Data, &nameInfo->Name, isRename ? "rename" : "delete");
+    if (IsProtectedName(nameInfo, TRUE))
+        result = DenyAndReport(Data, &nameInfo->Name,
+            isRename ? "rename" : isLink ? "link" : "delete");
 
     FltReleaseFileNameInformation(nameInfo);
     return result;
 }
 
 /* ------------------------------------------------------------------ */
-/*  Registration — only PreCreate + PreSetInfo, no PreWrite           */
+/*  Registration — Create (pre, post for opens by ID) + SetInformation */
 /* ------------------------------------------------------------------ */
 
 static const FLT_OPERATION_REGISTRATION g_Callbacks[] = {
-    { IRP_MJ_CREATE,          0, PreCreate,  NULL },
+    { IRP_MJ_CREATE,          0, PreCreate,  PostCreate },
     { IRP_MJ_SET_INFORMATION, 0, PreSetInfo, NULL },
     { IRP_MJ_OPERATION_END }
 };
-
 NTSTATUS MfInstanceSetup(
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
     _In_ FLT_INSTANCE_SETUP_FLAGS Flags,

@@ -22,6 +22,9 @@
 
 static PVOID g_ObRegistration = NULL;
 
+/* Exported by ntoskrnl, not declared in the WDK headers. */
+NTKERNELAPI PCHAR PsGetProcessImageFileName(_In_ PEPROCESS Process);
+
 /* Access that has not been resolved to specific rights yet. MAXIMUM_ALLOWED in
    particular would otherwise grant everything while matching no specific bit. */
 #define UNRESOLVED_ACCESS ( \
@@ -316,7 +319,7 @@ static OB_PREOP_CALLBACK_STATUS ObPreOperation(
     OB_RL_DECISION decision;
     ObRateLimit(kind, callerPid, targetPid, dangerous, &decision);
 
-    CHAR json[384];
+    CHAR json[448];
 
     if (decision.FlushEvicted) {
         RtlStringCchPrintfA(
@@ -331,10 +334,20 @@ static OB_PREOP_CALLBACK_STATUS ObPreOperation(
     }
 
     if (decision.Report) {
+        /* Image name of the caller (EPROCESS.ImageFileName, at most 15 chars).
+           Informational only: the name is caller-controlled and never used
+           for a decision. Captured here because the process may be gone by
+           the time the GUI could look the PID up. */
+        CHAR callerName[40];
+        if (!JsonEscapeString(callerName, sizeof(callerName),
+                PsGetProcessImageFileName(PsGetCurrentProcess())))
+            callerName[0] = '\0';
+
         RtlStringCchPrintfA(
             json, ARRAYSIZE(json),
             "{ \"event\": \"ob_callback\", \"type\": \"%s\", \"op\": \"%s\", "
             "\"target_pid\": %lu, \"target_tid\": %lu, \"caller_pid\": %lu, "
+            "\"caller_name\": \"%s\", "
             "\"recipient_pid\": %lu, \"desired_access\": \"0x%08X\", "
             "\"suppressed\": %lu }",
             ObKindName(kind),
@@ -342,6 +355,7 @@ static OB_PREOP_CALLBACK_STATUS ObPreOperation(
             (ULONG)(ULONG_PTR)targetPid,
             (ULONG)(ULONG_PTR)targetTid,
             (ULONG)(ULONG_PTR)callerPid,
+            callerName,
             (ULONG)(ULONG_PTR)recipientPid,
             desiredAccess,
             decision.Suppressed);

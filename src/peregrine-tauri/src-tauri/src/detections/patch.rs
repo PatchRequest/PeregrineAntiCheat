@@ -33,6 +33,7 @@ const SELF_HOOKED_EXPORTS: &[(&str, &[&str])] = &[
             "NtReadVirtualMemory",
             "NtWriteVirtualMemory",
             "NtSetContextThread",
+            "RtlAddVectoredExceptionHandler",
         ],
     ),
     (
@@ -331,24 +332,123 @@ fn export_rvas(file: &[u8], names: &[&str]) -> Vec<u32> {
     found
 }
 
-/// Zero known MinHook prologues so self-hooks do not count as tamper.
+/// Base names of the DLLs this anti-cheat injects.
+const OWN_DLL_NAMES: &[&str] = &[
+    "peregrinegame_x64.dll",
+    "peregrinegame_x86.dll",
+    "peregrinesensor_x64.dll",
+    "peregrinesensor_x86.dll",
+];
+
+/// Address ranges of our injected DLL inside the target: right base name
+/// *and* loaded from the directory this GUI runs from (the directory the
+/// driver's file self-defense covers) — a DLL that merely carries the name
+/// somewhere else is not ours.
+fn own_dll_ranges(modules: &[ModuleEntry]) -> Vec<(usize, usize)> {
+    let own_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_string_lossy().to_ascii_lowercase()));
+    let Some(own_dir) = own_dir else {
+        return Vec::new();
+    };
+
+    modules
+        .iter()
+        .filter(|m| {
+            let base = module_basename(&m.path);
+            let dir = Path::new(&m.path)
+                .parent()
+                .map(|d| d.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            OWN_DLL_NAMES.contains(&base.as_str()) && dir == own_dir
+        })
+        .map(|m| (m.base, m.base + m.size))
+        .collect()
+}
+
+fn in_ranges(addr: usize, ranges: &[(usize, usize)]) -> bool {
+    ranges.iter().any(|&(lo, hi)| addr >= lo && addr < hi)
+}
+
+/// Follows the detour MinHook writes at `site`:
+///   x86:  E9 rel32                      -> detour
+///   x64:  E9 rel32 -> relay: FF 25 00000000 <abs64> -> detour
+/// Returns (relay address if there is one, final destination).
+fn hook_destination(proc: &ProcessHandle, site: usize, is64: bool) -> Option<(Option<usize>, usize)> {
+    let head = proc.read_memory(site, 5)?;
+    if head[0] != 0xE9 {
+        return None;
+    }
+    let rel = i32::from_le_bytes(head[1..5].try_into().ok()?) as isize;
+    let mut target = (site as isize).wrapping_add(5).wrapping_add(rel) as usize;
+    if !is64 {
+        target &= 0xFFFF_FFFF;
+        return Some((None, target));
+    }
+
+    let relay = proc.read_memory(target, 14)?;
+    if relay[..6] == [0xFF, 0x25, 0x00, 0x00, 0x00, 0x00] {
+        let dest = u64::from_le_bytes(relay[6..14].try_into().ok()?) as usize;
+        Some((Some(target), dest))
+    } else {
+        Some((None, target))
+    }
+}
+
+fn file_is_64bit(file: &[u8]) -> bool {
+    if file.len() < 0x40 {
+        return false;
+    }
+    let lfanew = u32::from_le_bytes(file[0x3C..0x40].try_into().unwrap_or([0; 4])) as usize;
+    if lfanew + 6 > file.len() {
+        return false;
+    }
+    u16::from_le_bytes([file[lfanew + 4], file[lfanew + 5]]) == IMAGE_FILE_MACHINE_AMD64
+}
+
+/// One export we hook, as found in a target process.
+struct HookSite {
+    address: usize,
+    is64: bool,
+    /// Relay stub inside MinHook's buffer (x64 only).
+    relay: Option<usize>,
+}
+
+/// Hook sites in `m` whose detour really ends inside our injected DLL. A
+/// patched prologue that leads anywhere else is somebody else's hook.
+fn verified_hook_sites(
+    proc: &ProcessHandle,
+    m: &ModuleEntry,
+    file: &[u8],
+    own: &[(usize, usize)],
+) -> Vec<(u32, HookSite)> {
+    let Some(names) = self_hook_names_for(&m.path) else {
+        return Vec::new();
+    };
+    let is64 = file_is_64bit(file);
+    export_rvas(file, names)
+        .into_iter()
+        .filter_map(|rva| {
+            let address = m.base + rva as usize;
+            let (relay, dest) = hook_destination(proc, address, is64)?;
+            in_ranges(dest, own).then_some((rva, HookSite { address, is64, relay }))
+        })
+        .collect()
+}
+
+/// Zero the prologues of *verified* self-hooks so they do not count as tamper.
 fn mask_self_hooks(
     disk_data: &mut [u8],
     mem_data: &mut [u8],
-    file: &[u8],
     text_rva: u32,
-    path: &str,
+    sites: &[(u32, HookSite)],
 ) -> usize {
-    let Some(names) = self_hook_names_for(path) else {
-        return 0;
-    };
-    let rvas = export_rvas(file, names);
     let mut masked = 0usize;
-    for rva in rvas {
-        if rva < text_rva {
+    for (rva, _) in sites {
+        if *rva < text_rva {
             continue;
         }
-        let off = (rva - text_rva) as usize;
+        let off = (*rva - text_rva) as usize;
         if off >= disk_data.len() {
             continue;
         }
@@ -357,6 +457,118 @@ fn mask_self_hooks(
         masked += 1;
     }
     masked
+}
+
+/// Private executable regions in `pid` that hold MinHook's trampolines for our
+/// own hooks. Such a region looks exactly like injected code to a VAD scan, so
+/// it is not exempted by address or by anything the game process says about
+/// itself, but only if it is tied to a verified hook site:
+///   x64: the relay stub the hooked export jumps to lies in the region;
+///   x86: the region contains the trampoline's jump back into the hooked
+///        export (there is no relay on x86).
+pub fn own_hook_regions(pid: u32) -> Result<Vec<u64>, String> {
+    use windows::Win32::System::Memory::{
+        VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_PRIVATE,
+    };
+
+    let proc = ProcessHandle::open(pid).ok_or("OpenProcess failed")?;
+    let modules = proc.modules();
+    let own = own_dll_ranges(&modules);
+    if own.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut sites: Vec<HookSite> = Vec::new();
+    for m in &modules {
+        if self_hook_names_for(&m.path).is_none() {
+            continue;
+        }
+        let disk_path = wow64_fixup(&m.path, m.base);
+        let Ok(file) = std::fs::read(&disk_path) else {
+            continue;
+        };
+        sites.extend(verified_hook_sites(&proc, m, &file, &own).into_iter().map(|(_, s)| s));
+    }
+    if sites.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let region_of = |addr: usize| -> Option<(usize, usize)> {
+        let mut mbi = MEMORY_BASIC_INFORMATION::default();
+        let got = unsafe {
+            VirtualQueryEx(
+                proc.0,
+                Some(addr as *const _),
+                &mut mbi,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        (got != 0 && mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE)
+            .then_some((mbi.BaseAddress as usize, mbi.RegionSize))
+    };
+
+    let mut regions: Vec<u64> = Vec::new();
+    let mut add = |base: usize| {
+        if !regions.contains(&(base as u64)) {
+            regions.push(base as u64);
+        }
+    };
+
+    // x64: the relay is in the buffer.
+    for s in sites.iter().filter(|s| s.is64) {
+        if let Some((base, _)) = s.relay.and_then(|r| region_of(r)) {
+            add(base);
+        }
+    }
+
+    // x86: look for the trampoline's jump back into a hooked export. MinHook
+    // allocates its buffer in 4 KiB blocks; only small regions are candidates.
+    let x86_sites: Vec<&HookSite> = sites.iter().filter(|s| !s.is64).collect();
+    if !x86_sites.is_empty() {
+        const MAX_REGION: usize = 0x10000;
+        let mut addr = 0x10000usize;
+        while addr < 0x8000_0000 {
+            let mut mbi = MEMORY_BASIC_INFORMATION::default();
+            let got = unsafe {
+                VirtualQueryEx(
+                    proc.0,
+                    Some(addr as *const _),
+                    &mut mbi,
+                    std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                )
+            };
+            if got == 0 || mbi.RegionSize == 0 {
+                break;
+            }
+            let base = mbi.BaseAddress as usize;
+            let executable = (mbi.Protect.0 & 0xF0) != 0;
+            if mbi.State == MEM_COMMIT
+                && mbi.Type == MEM_PRIVATE
+                && executable
+                && mbi.RegionSize <= MAX_REGION
+            {
+                if let Some(bytes) = proc.read_memory(base, mbi.RegionSize) {
+                    let jumps_back = bytes.windows(5).enumerate().any(|(i, w)| {
+                        if w[0] != 0xE9 {
+                            return false;
+                        }
+                        let rel = i32::from_le_bytes([w[1], w[2], w[3], w[4]]) as isize;
+                        let dest = ((base + i) as isize).wrapping_add(5).wrapping_add(rel) as usize
+                            & 0xFFFF_FFFF;
+                        x86_sites
+                            .iter()
+                            .any(|s| dest > s.address && dest <= s.address + HOOK_MASK_BYTES)
+                    });
+                    if jumps_back {
+                        add(base);
+                    }
+                }
+            }
+            addr = base + mbi.RegionSize;
+        }
+    }
+
+    Ok(regions)
 }
 
 fn wow64_fixup(disk_path: &str, base: usize) -> String {
@@ -378,6 +590,7 @@ fn wow64_fixup(disk_path: &str, base: usize) -> String {
 pub fn check_process_modules(pid: u32) -> Result<Vec<ModuleCheck>, String> {
     let proc = ProcessHandle::open(pid).ok_or("OpenProcess failed")?;
     let modules = proc.modules();
+    let own = own_dll_ranges(&modules);
     let mut results = Vec::new();
     let max_bytes = 8 * 1024 * 1024;
 
@@ -455,17 +668,14 @@ pub fn check_process_modules(pid: u32) -> Result<Vec<ModuleCheck>, String> {
             entry.disk_sha256 = Some(dh);
             entry.mem_sha256 = Some(mh);
         } else {
-            // PeregrineDLL MinHook patches ntdll/KernelBase prologues — exclude those
-            // sites so we only flag real third-party .text tampering.
+            // PeregrineDLL MinHook patches ntdll/KernelBase prologues — exclude
+            // those sites, but only the ones whose detour verifiably ends in
+            // our own DLL. Anything else at these exports is a foreign hook
+            // and stays in the comparison.
             let mut disk2 = disk_data.clone();
             let mut mem2 = mem_data.clone();
-            let n = mask_self_hooks(
-                &mut disk2,
-                &mut mem2,
-                &file_bytes,
-                ti.text_rva,
-                &disk_path,
-            );
+            let sites = verified_hook_sites(&proc, m, &file_bytes, &own);
+            let n = mask_self_hooks(&mut disk2, &mut mem2, ti.text_rva, &sites);
             let dh2 = sha256_hex(&disk2);
             let mh2 = sha256_hex(&mem2);
             if n > 0 && dh2 == mh2 {

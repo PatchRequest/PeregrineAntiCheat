@@ -94,12 +94,10 @@ fn ui_ready(app: AppHandle, state: tauri::State<'_, SharedBackendStatus>) {
 /// survive a driver restart, so the UI calls this on every offline→online edge.
 #[tauri::command]
 fn connect_driver() -> Result<String, String> {
-    let h = DriverHandle::open()?;
-
-    // TRUSTED (not PROTECTED): this process is the AC. Without it the minifilter
-    // would deny our own file access and ObCallback would report our scans.
-    h.trust_self()
-        .map_err(|e| format!("driver refused to trust the GUI: {e}"))?;
+    // TRUSTED (not PROTECTED): this process is the AC. Without it the driver
+    // answers no request at all, the minifilter would deny our own file
+    // access and ObCallback would report our scans.
+    let h = open_trusted()?;
 
     let mut msg = format!("connected (GUI PID {} trusted)", std::process::id());
 
@@ -107,14 +105,16 @@ fn connect_driver() -> Result<String, String> {
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
 
-    let search_dirs: Vec<std::path::PathBuf> = [
-        exe_dir,
-        Some(std::path::PathBuf::from(r"C:\Peregrine")),
-        Some(std::path::PathBuf::from(r"E:\Peregrine\src\Userland")),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    // The DLLs the kernel injects into the game are taken from next to this
+    // executable only — the directory the driver's file self-defense covers.
+    // Falling back to other well-known directories would let whoever can
+    // write there choose the injected DLL. Development builds additionally
+    // look in the repo's deploy folders.
+    let mut search_dirs: Vec<std::path::PathBuf> = exe_dir.into_iter().collect();
+    if cfg!(debug_assertions) {
+        search_dirs.push(std::path::PathBuf::from(r"C:\Peregrine"));
+        search_dirs.push(std::path::PathBuf::from(r"E:\Peregrine\src\Userland"));
+    }
 
     let find_dll = |name: &str| -> Option<String> {
         search_dirs
@@ -141,6 +141,14 @@ fn connect_driver() -> Result<String, String> {
     }
 
     Ok(msg)
+}
+
+/// What the kernel currently protects and injects into. The UI mirrors this
+/// instead of assuming its own lists are right (they are empty after a GUI
+/// restart while the driver kept running).
+#[tauri::command]
+fn kernel_state() -> Result<serde_json::Value, String> {
+    DriverHandle::open()?.query_state()
 }
 
 #[tauri::command]
@@ -234,6 +242,13 @@ fn check_modules(pid: u32) -> Result<Vec<detections::patch::ModuleCheck>, String
     detections::patch::check_process_modules(pid)
 }
 
+/// Regions a VAD scan of `pid` will flag that are verifiably MinHook
+/// trampolines of our own injected DLL (see `own_hook_regions`).
+#[tauri::command]
+fn own_hook_regions(pid: u32) -> Result<Vec<u64>, String> {
+    detections::patch::own_hook_regions(pid)
+}
+
 #[tauri::command]
 fn check_iat(pid: u32) -> Result<Vec<detections::hooks::IatHook>, String> {
     detections::hooks::check_iat_hooks(pid)
@@ -303,6 +318,20 @@ fn start_ipc_polling(app: AppHandle, status: SharedBackendStatus) {
     });
 }
 
+/// Opens the control device and registers this process as the driver's one
+/// trusted GUI (idempotent for the same process).
+fn open_trusted() -> Result<DriverHandle, String> {
+    let h = DriverHandle::open()?;
+    h.trust_self().map_err(|e| {
+        format!(
+            "the driver refused to trust this GUI ({e}) — another process already \
+             holds the driver's trust; only one GUI can run, and anything else \
+             holding it is hostile"
+        )
+    })?;
+    Ok(h)
+}
+
 /// Pause between polls while the kernel queue is empty.
 const DRIVER_IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 /// Pause before retrying after the driver could not be reached.
@@ -336,7 +365,9 @@ fn start_driver_polling(app: AppHandle, status: SharedBackendStatus) {
 
             let handle = match poll_handle.as_ref() {
                 Some(h) => h,
-                None => match DriverHandle::open() {
+                // The driver answers nobody but its one trusted process, so
+                // the handshake comes before the first poll.
+                None => match open_trusted() {
                     Ok(h) => poll_handle.insert(h),
                     Err(e) => {
                         set_channel_status(&app, &status, Channel::Driver, false, e);
@@ -394,6 +425,7 @@ pub fn run() {
             backend_status,
             ui_ready,
             connect_driver,
+            kernel_state,
             add_pid,
             remove_pid,
             clear_pids,
@@ -407,6 +439,7 @@ pub fn run() {
             start_etw_ti,
             stop_etw_ti,
             check_modules,
+            own_hook_regions,
             check_iat,
             check_eat,
             check_threads,

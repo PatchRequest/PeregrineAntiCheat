@@ -93,7 +93,42 @@ NTSTATUS StateUnprotectPid(HANDLE Pid) { return PidSetRemove(&g_Protected, Pid);
 VOID     StateClearProtected(VOID)     { PidSetClear(&g_Protected); }
 BOOLEAN  StateIsPidProtected(HANDLE Pid) { return PidSetContains(&g_Protected, Pid); }
 
-NTSTATUS StateTrustPid(HANDLE Pid)     { return PidSetAdd(&g_Trusted, Pid); }
+ULONG StateSnapshotProtected(HANDLE* Out, ULONG Capacity)
+{
+    KIRQL irql;
+    KeAcquireSpinLock(&g_Protected.Lock, &irql);
+    const ULONG count = min(g_Protected.Count, Capacity);
+    for (ULONG i = 0; i < count; i++)
+        Out[i] = g_Protected.Pids[i];
+    KeReleaseSpinLock(&g_Protected.Lock, irql);
+    return count;
+}
+
+/*
+ * One GUI at a time. The first process to ask becomes the trusted one and
+ * stays it until it exits (StateOnProcessExit); asking again is a no-op for
+ * that process and STATUS_ACCESS_DENIED for everybody else. Trust is what
+ * unlocks the control device (Coms.c), the file self-defense and the
+ * ObCallback exemption, so it must not be something a second admin process
+ * can simply request.
+ */
+NTSTATUS StateTrustPid(HANDLE Pid)
+{
+    NTSTATUS status;
+    KIRQL irql;
+    KeAcquireSpinLock(&g_Trusted.Lock, &irql);
+    if (g_Trusted.Count == 0) {
+        g_Trusted.Pids[0] = Pid;
+        g_Trusted.Count = 1;
+        status = STATUS_SUCCESS;
+    } else if (g_Trusted.Pids[0] == Pid) {
+        status = STATUS_SUCCESS;
+    } else {
+        status = STATUS_ACCESS_DENIED;
+    }
+    KeReleaseSpinLock(&g_Trusted.Lock, irql);
+    return status;
+}
 BOOLEAN  StateIsPidTrusted(HANDLE Pid) { return PidSetContains(&g_Trusted, Pid); }
 
 VOID StateOnProcessExit(HANDLE Pid)

@@ -193,6 +193,79 @@ static NTSTATUS ComsHandleUserCommand(
     }
 }
 
+/* printf-append into a shrinking buffer; any failure means "does not fit". */
+static NTSTATUS StateAppend(
+    _Inout_ PCHAR* Cursor,
+    _Inout_ size_t* Remaining,
+    _In_z_ _Printf_format_string_ PCSTR Format,
+    ...)
+{
+    va_list args;
+    va_start(args, Format);
+    NTSTATUS status = RtlStringCbVPrintfExA(*Cursor, *Remaining, Cursor, Remaining, 0, Format, args);
+    va_end(args);
+    return NT_SUCCESS(status) ? STATUS_SUCCESS : STATUS_BUFFER_TOO_SMALL;
+}
+
+/* PASSIVE_LEVEL. Writes the IOCTL_PEREGRINE_QUERY_STATE reply (see Coms.h). */
+static NTSTATUS ComsBuildStateJson(
+    _Out_writes_bytes_(OutSize) PCHAR Out,
+    _In_ size_t OutSize,
+    _Out_ ULONG_PTR* Written)
+{
+    static const PCSTR roleNames[INJ_ROLE_COUNT] = { "game", "sensor" };
+
+    PCHAR cur = Out;
+    size_t remaining = OutSize;
+    *Written = 0;
+
+    NTSTATUS status = StateAppend(&cur, &remaining,
+        "{ \"injection_enabled\": %s, \"protected\": [",
+        InjIsEnabled() ? "true" : "false");
+    if (!NT_SUCCESS(status)) return status;
+
+    HANDLE pids[STATE_MAX_PROTECTED];
+    const ULONG pidCount = StateSnapshotProtected(pids, ARRAYSIZE(pids));
+    for (ULONG i = 0; i < pidCount; i++) {
+        status = StateAppend(&cur, &remaining, "%s%lu",
+            i ? ", " : "", (ULONG)(ULONG_PTR)pids[i]);
+        if (!NT_SUCCESS(status)) return status;
+    }
+
+    status = StateAppend(&cur, &remaining, "], \"targets\": [");
+    if (!NT_SUCCESS(status)) return status;
+
+    BOOLEAN first = TRUE;
+    for (UCHAR role = 0; role < INJ_ROLE_COUNT; role++) {
+        WCHAR path[INJ_MAX_PATH];
+        for (ULONG i = 0; InjGetTarget(role, i, path); i++) {
+            UNICODE_STRING wide;
+            ANSI_STRING ansi = { 0 };
+            RtlInitUnicodeString(&wide, path);
+            status = RtlUnicodeStringToAnsiString(&ansi, &wide, TRUE);
+            if (!NT_SUCCESS(status)) return status;
+
+            /* Worst case every character is escaped to two. */
+            CHAR escaped[INJ_MAX_PATH * 2 + 1];
+            const BOOLEAN ok = JsonEscapeString(escaped, sizeof(escaped), ansi.Buffer);
+            RtlFreeAnsiString(&ansi);
+            if (!ok) return STATUS_BUFFER_TOO_SMALL;
+
+            status = StateAppend(&cur, &remaining,
+                "%s{ \"role\": \"%s\", \"path\": \"%s\" }",
+                first ? "" : ", ", roleNames[role], escaped);
+            if (!NT_SUCCESS(status)) return status;
+            first = FALSE;
+        }
+    }
+
+    status = StateAppend(&cur, &remaining, "] }");
+    if (!NT_SUCCESS(status)) return status;
+
+    *Written = (ULONG_PTR)(cur - Out);
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS ComsSendToUser(_In_reads_bytes_(DataSize) const void* Data, _In_ ULONG DataSize) {
     if (Data == NULL || DataSize == 0) {
         return STATUS_INVALID_PARAMETER;
@@ -238,7 +311,30 @@ NTSTATUS ComsDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp) {
     ULONG_PTR information = 0;
     NTSTATUS status = STATUS_INVALID_DEVICE_REQUEST;
 
-    switch (stack->Parameters.DeviceIoControl.IoControlCode) {
+    /*
+     * The device ACL admits every administrator, and a cheat may well run
+     * elevated. Being able to open the device is therefore not enough: only
+     * the one process that holds TRUSTED may configure the driver or read its
+     * events. The single exception is the request that asks for that trust
+     * (ComsCmdTrustCaller), which StateTrustPid grants to one process only.
+     */
+    const HANDLE requestor = (HANDLE)(ULONG_PTR)IoGetRequestorProcessId(Irp);
+    const ULONG ioctl = stack->Parameters.DeviceIoControl.IoControlCode;
+    BOOLEAN allowed = StateIsPidTrusted(requestor);
+    if (!allowed && ioctl == IOCTL_PEREGRINE_SEND_FROM_USER &&
+        Irp->AssociatedIrp.SystemBuffer != NULL &&
+        stack->Parameters.DeviceIoControl.InputBufferLength >= 1 &&
+        *(const UCHAR*)Irp->AssociatedIrp.SystemBuffer == ComsCmdTrustCaller) {
+        allowed = TRUE;
+    }
+    if (!allowed) {
+        Irp->IoStatus.Status = STATUS_ACCESS_DENIED;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_ACCESS_DENIED;
+    }
+
+    switch (ioctl) {
     case IOCTL_PEREGRINE_SEND_FROM_USER: {
         const ULONG inLength = stack->Parameters.DeviceIoControl.InputBufferLength;
         if (Irp->AssociatedIrp.SystemBuffer == NULL || inLength == 0) {
@@ -252,8 +348,7 @@ NTSTATUS ComsDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp) {
         }
 
         status = ComsHandleUserCommand(
-            (const UCHAR*)Irp->AssociatedIrp.SystemBuffer, inLength,
-            (HANDLE)(ULONG_PTR)IoGetRequestorProcessId(Irp));
+            (const UCHAR*)Irp->AssociatedIrp.SystemBuffer, inLength, requestor);
         information = 0;
         break;
     }
@@ -271,6 +366,17 @@ NTSTATUS ComsDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp) {
         RtlCopyMemory(Irp->AssociatedIrp.SystemBuffer, &role, sizeof(role));
         information = sizeof(role);
         status = STATUS_SUCCESS;
+        break;
+    }
+    case IOCTL_PEREGRINE_QUERY_STATE: {
+        const ULONG outLength = stack->Parameters.DeviceIoControl.OutputBufferLength;
+        if (Irp->AssociatedIrp.SystemBuffer == NULL || outLength == 0) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        status = ComsBuildStateJson((PCHAR)Irp->AssociatedIrp.SystemBuffer, outLength, &information);
+        if (!NT_SUCCESS(status))
+            information = 0;
         break;
     }
     case IOCTL_PEREGRINE_RECV_TO_USER: {

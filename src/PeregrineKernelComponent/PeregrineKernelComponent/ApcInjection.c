@@ -235,26 +235,6 @@ static BOOLEAN UStrEndsWith(_In_ PCUNICODE_STRING Str, _In_ PCWSTR Suffix)
     return TRUE;
 }
 
-static BOOLEAN UStrContainsI(_In_ PCUNICODE_STRING Str, _In_ PCWSTR Sub)
-{
-    if (!Str || !Str->Buffer || !Sub) return FALSE;
-    SIZE_T sLen = wcslen(Sub);
-    SIZE_T uLen = Str->Length / sizeof(WCHAR);
-    if (uLen < sLen) return FALSE;
-    for (SIZE_T i = 0; i <= uLen - sLen; i++) {
-        BOOLEAN ok = TRUE;
-        for (SIZE_T j = 0; j < sLen; j++) {
-            WCHAR a = Str->Buffer[i + j];
-            WCHAR b = Sub[j];
-            if (a >= L'A' && a <= L'Z') a += 32;
-            if (b >= L'A' && b <= L'Z') b += 32;
-            if (a != b) { ok = FALSE; break; }
-        }
-        if (ok) return TRUE;
-    }
-    return FALSE;
-}
-
 /* ------------------------------------------------------------------ */
 /*  Target matching by full image path (Game first, then Sensor)      */
 /* ------------------------------------------------------------------ */
@@ -311,6 +291,29 @@ static BOOLEAN MatchTargetRole(
 }
 
 /* ------------------------------------------------------------------ */
+/*  Reading the target's user-mode memory                             */
+/* ------------------------------------------------------------------ */
+/*
+ * Everything below reads structures that live in the target process and are
+ * therefore under that process' control: PEB, loader lists, the PE headers
+ * of mapped images. __try alone is not enough — it catches a fault on a bad
+ * *user* address, but dereferencing a pointer that an attacker aimed at
+ * kernel space bugchecks (or leaks kernel memory). Every pointer taken from
+ * user memory is range-checked against the user address space first, and
+ * every list walk is bounded.
+ */
+
+static __forceinline BOOLEAN UserRange(_In_opt_ const VOID* Address, _In_ SIZE_T Length)
+{
+    const ULONG_PTR start = (ULONG_PTR)Address;
+    const ULONG_PTR end = start + Length;
+    return start != 0 && end >= start && end <= (ULONG_PTR)MmUserProbeAddress;
+}
+
+#define INJ_MAX_MODULES      512
+#define INJ_MAX_EXPORT_NAMES 0x10000
+
+/* ------------------------------------------------------------------ */
 /*  PE export-table parser (reads from user-space while attached)     */
 /* ------------------------------------------------------------------ */
 
@@ -322,14 +325,22 @@ static ULONG_PTR ParseExport(
     ULONG_PTR result = 0;
     if (!ImageBase || !ExportName) return 0;
 
+    const SIZE_T wantLen = strlen(ExportName) + 1; /* compare includes the NUL */
+
     __try {
         PUCHAR base = (PUCHAR)ImageBase;
+        if (!UserRange(base, 0x40)) return 0;
         if (*(PUSHORT)base != 0x5A4D) return 0;            /* MZ */
 
         LONG lfanew = *(PLONG)(base + 0x3C);
+        if (lfanew < 0x40 || lfanew > 0x1000) return 0;
+        if (!UserRange(base + lfanew, 24 + 120)) return 0;
         if (*(PULONG)(base + lfanew) != 0x00004550) return 0; /* PE\0\0 */
 
         PUCHAR opt = base + lfanew + 24;
+        const ULONG imageSize = *(PULONG)(opt + 56);       /* SizeOfImage, PE32 and PE32+ */
+        if (imageSize == 0 || !UserRange(base, imageSize)) return 0;
+
         ULONG  expRva, expSize;
         if (Is32) {
             expRva  = *(PULONG)(opt + 96);                  /* DataDir[0] */
@@ -339,28 +350,45 @@ static ULONG_PTR ParseExport(
             expSize = *(PULONG)(opt + 116);
         }
 
-        if (expRva == 0) return 0;
+        /* Every RVA below is checked against SizeOfImage before it is used:
+           (rva, len) lies inside the image <=> rva <= size && len <= size - rva. */
+#define IN_IMAGE(rva, len) ((ULONG)(rva) <= imageSize && (SIZE_T)(len) <= (SIZE_T)(imageSize - (ULONG)(rva)))
+
+        if (expRva == 0 || !IN_IMAGE(expRva, 40)) return 0;
 
         PUCHAR ed  = base + expRva;
+        ULONG  nFuncs    = *(PULONG)(ed + 20);
         ULONG  nNames    = *(PULONG)(ed + 24);
         ULONG  fnRva     = *(PULONG)(ed + 28);
         ULONG  nameRva   = *(PULONG)(ed + 32);
         ULONG  ordRva    = *(PULONG)(ed + 36);
+
+        if (nNames > INJ_MAX_EXPORT_NAMES || nFuncs > INJ_MAX_EXPORT_NAMES) return 0;
+        if (!IN_IMAGE(nameRva, (SIZE_T)nNames * sizeof(ULONG)) ||
+            !IN_IMAGE(ordRva,  (SIZE_T)nNames * sizeof(USHORT)) ||
+            !IN_IMAGE(fnRva,   (SIZE_T)nFuncs * sizeof(ULONG)))
+            return 0;
 
         PULONG  names    = (PULONG)(base + nameRva);
         PUSHORT ords     = (PUSHORT)(base + ordRva);
         PULONG  funcs    = (PULONG)(base + fnRva);
 
         for (ULONG i = 0; i < nNames; i++) {
-            if (strcmp((const CHAR*)(base + names[i]), ExportName) == 0) {
-                ULONG rva = funcs[ords[i]];
-                /* Forwarded export (RVA inside export directory) — not callable. */
-                if (rva >= expRva && rva < expRva + expSize)
-                    return 0;
-                result = (ULONG_PTR)base + rva;
-                break;
-            }
+            const ULONG strRva = names[i];
+            if (!IN_IMAGE(strRva, wantLen)) continue;
+            if (RtlCompareMemory(base + strRva, ExportName, wantLen) != wantLen) continue;
+
+            const USHORT ord = ords[i];
+            if (ord >= nFuncs) return 0;
+            const ULONG rva = funcs[ord];
+            /* Forwarded export (RVA inside export directory) — not callable. */
+            if (rva >= expRva && rva - expRva < expSize)
+                return 0;
+            if (!IN_IMAGE(rva, 1)) return 0;
+            result = (ULONG_PTR)base + rva;
+            break;
         }
+#undef IN_IMAGE
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         result = 0;
     }
@@ -371,6 +399,7 @@ static ULONG_PTR ParseExport(
 /*  PEB LDR walk — find a loaded module base in the current process   */
 /* ------------------------------------------------------------------ */
 
+/* Name->Buffer has already been range-checked by the caller. */
 static BOOLEAN UStrEqISuffix(_In_ PCUNICODE_STRING Name, _In_ PCWSTR Want)
 {
     if (!Name || !Name->Buffer || !Want) return FALSE;
@@ -390,6 +419,7 @@ static BOOLEAN UStrEqISuffix(_In_ PCUNICODE_STRING Name, _In_ PCWSTR Want)
 /* x64 LDR_DATA_TABLE_ENTRY layout (stable for our fields). */
 #define LDR64_DLLBASE_OFF     0x30
 #define LDR64_BASENAME_OFF    0x58
+#define LDR64_ENTRY_MIN       (LDR64_BASENAME_OFF + sizeof(UNICODE_STRING))
 /* PEB.Ldr */
 #define PEB64_LDR_OFF         0x18
 #define LDR_INLOADORDER_OFF   0x10
@@ -399,6 +429,7 @@ static BOOLEAN UStrEqISuffix(_In_ PCUNICODE_STRING Name, _In_ PCWSTR Want)
 #define LDR32_INLOADORDER_OFF 0x0C
 #define LDR32_DLLBASE_OFF     0x18
 #define LDR32_BASENAME_OFF    0x2C
+#define LDR32_ENTRY_MIN       (LDR32_BASENAME_OFF + 8)
 
 static PVOID FindModuleBaseByName(_In_ BOOLEAN IsWow64, _In_ PCWSTR BaseName)
 {
@@ -406,37 +437,46 @@ static PVOID FindModuleBaseByName(_In_ BOOLEAN IsWow64, _In_ PCWSTR BaseName)
 
     __try {
         if (!IsWow64) {
-            PPEB peb = PsGetProcessPeb(PsGetCurrentProcess());
-            if (!peb) return NULL;
-            PUCHAR pebB = (PUCHAR)peb;
-            PVOID ldr = *(PVOID*)(pebB + PEB64_LDR_OFF);
-            if (!ldr) return NULL;
-            PLIST_ENTRY head = (PLIST_ENTRY)((PUCHAR)ldr + LDR_INLOADORDER_OFF);
-            for (PLIST_ENTRY e = head->Flink; e != head; e = e->Flink) {
+            PUCHAR pebB = (PUCHAR)PsGetProcessPeb(PsGetCurrentProcess());
+            if (!UserRange(pebB + PEB64_LDR_OFF, sizeof(PVOID))) return NULL;
+            PUCHAR ldr = *(PUCHAR*)(pebB + PEB64_LDR_OFF);
+            if (!UserRange(ldr + LDR_INLOADORDER_OFF, sizeof(LIST_ENTRY))) return NULL;
+
+            PLIST_ENTRY head = (PLIST_ENTRY)(ldr + LDR_INLOADORDER_OFF);
+            ULONG guard = 0;
+            for (PLIST_ENTRY e = head->Flink;
+                 e != head && guard < INJ_MAX_MODULES;
+                 e = e->Flink, guard++) {
                 PUCHAR ent = (PUCHAR)e;
+                if (!UserRange(ent, LDR64_ENTRY_MIN)) break;
+
                 UNICODE_STRING name = *(PUNICODE_STRING)(ent + LDR64_BASENAME_OFF);
-                if (UStrEqISuffix(&name, BaseName)) {
-                    found = *(PVOID*)(ent + LDR64_DLLBASE_OFF);
+                if (name.Buffer && name.Length && UserRange(name.Buffer, name.Length) &&
+                    UStrEqISuffix(&name, BaseName)) {
+                    PVOID dllBase = *(PVOID*)(ent + LDR64_DLLBASE_OFF);
+                    if (UserRange(dllBase, PAGE_SIZE))
+                        found = dllBase;
                     break;
                 }
             }
         } else {
-            /* PEB32 in Wow64 process */
+            /* PEB32 in Wow64 process. 32-bit pointers cannot reach kernel
+               space, but they are still range-checked for NULL / wrap. */
             PUCHAR peb32 = (PUCHAR)PsGetProcessWow64Process(PsGetCurrentProcess());
-            if (!peb32) return NULL;
+            if (!UserRange(peb32 + PEB32_LDR_OFF, sizeof(ULONG))) return NULL;
             ULONG ldr32 = *(PULONG)(peb32 + PEB32_LDR_OFF);
-            if (!ldr32) return NULL;
             ULONG head = ldr32 + LDR32_INLOADORDER_OFF;
+            if (!ldr32 || !UserRange((PVOID)(ULONG_PTR)head, sizeof(ULONG))) return NULL;
+
             ULONG flink = *(PULONG)(ULONG_PTR)head;
-            ULONG start = flink;
             ULONG guard = 0;
-            while (flink && flink != head && guard++ < 512) {
+            while (flink && flink != head && guard++ < INJ_MAX_MODULES) {
                 PUCHAR ent = (PUCHAR)(ULONG_PTR)flink;
+                if (!UserRange(ent, LDR32_ENTRY_MIN)) break;
+
                 USHORT len = *(PUSHORT)(ent + LDR32_BASENAME_OFF);
-                USHORT max = *(PUSHORT)(ent + LDR32_BASENAME_OFF + 2);
                 ULONG buf32 = *(PULONG)(ent + LDR32_BASENAME_OFF + 4);
-                UNREFERENCED_PARAMETER(max);
-                if (buf32 && len) {
+                if (buf32 && len && UserRange((PVOID)(ULONG_PTR)buf32, len)) {
                     UNICODE_STRING name;
                     name.Length = len;
                     name.MaximumLength = len;
@@ -447,7 +487,6 @@ static PVOID FindModuleBaseByName(_In_ BOOLEAN IsWow64, _In_ PCWSTR BaseName)
                     }
                 }
                 flink = *(PULONG)(ULONG_PTR)flink; /* InLoadOrderLinks.Flink */
-                if (flink == start) break;
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -455,7 +494,6 @@ static PVOID FindModuleBaseByName(_In_ BOOLEAN IsWow64, _In_ PCWSTR BaseName)
     }
     return found;
 }
-
 /*
  * Prefer KernelBase!LoadLibraryExW (real body, initialized before kernel32).
  * Fall back to kernel32 export only if KernelBase is missing (legacy).
@@ -486,6 +524,15 @@ static ULONG_PTR ResolveLoadLibraryExW(
 /*  APC callbacks (OpenEDR apcqueue pattern, C / pool-tag style)      */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Every queued APC (the deferred kernel work item and the user-mode
+ * LoadLibraryExW APC) has routines inside this driver image. Each one holds a
+ * rundown reference from the moment it is queued until its last routine has
+ * run; DriverUnload waits for all of them (InjWaitForApcs) so the image is
+ * never unmapped underneath a pending APC.
+ */
+static EX_RUNDOWN_REF g_InjRundown;
+
 static VOID NTAPI KernelRoutineCb(
     PRKAPC Apc, PKNORMAL_ROUTINE* NormalRoutine,
     PVOID* NormalContext, PVOID* Sys1, PVOID* Sys2)
@@ -496,11 +543,13 @@ static VOID NTAPI KernelRoutineCb(
     if (PsGetProcessWow64Process(PsGetCurrentProcess()) != NULL)
         PsWrapApcWow64Thread(NormalContext, (PVOID*)NormalRoutine);
     ExFreePoolWithTag(Apc, INJ_POOL_TAG);
+    ExReleaseRundownProtection(&g_InjRundown);
 }
 
 static VOID NTAPI RundownCb(PRKAPC Apc)
 {
     ExFreePoolWithTag(Apc, INJ_POOL_TAG);
+    ExReleaseRundownProtection(&g_InjRundown);
 }
 
 /* ------------------------------------------------------------------ */
@@ -573,12 +622,22 @@ static NTSTATUS DoInjectInContext(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
+    /* Held until KernelRoutineCb / RundownCb has run. Fails once the driver
+       is unloading. */
+    if (!ExAcquireRundownProtection(&g_InjRundown)) {
+        ExFreePoolWithTag(execApc, INJ_POOL_TAG);
+        SIZE_T freeSz = 0;
+        ZwFreeVirtualMemory(ZwCurrentProcess(), &alloc, &freeSz, MEM_RELEASE);
+        return STATUS_DELETE_PENDING;
+    }
+
     KeInitializeApc(execApc, curThread, OriginalApcEnvironment,
         (PKKERNEL_ROUTINE)KernelRoutineCb, (PKRUNDOWN_ROUTINE)RundownCb,
         (PKNORMAL_ROUTINE)loadLib, UserMode, alloc);
 
     if (!KeInsertQueueApc(execApc, NULL,
             (PVOID)(ULONG_PTR)INJ_LOADLIBRARY_FLAGS, 0)) {
+        ExReleaseRundownProtection(&g_InjRundown);
         ExFreePoolWithTag(execApc, INJ_POOL_TAG);
         {
             SIZE_T freeSz = 0;
@@ -598,6 +657,14 @@ VOID InjInit(VOID)
 {
     RtlZeroMemory(&g_Inj, sizeof(g_Inj));
     KeInitializeSpinLock(&g_Inj.Lock);
+    ExInitializeRundownProtection(&g_InjRundown);
+}
+
+VOID InjWaitForApcs(VOID)
+{
+    /* PASSIVE_LEVEL. Blocks until every queued APC has been delivered or run
+       down; afterwards no new one can be queued. */
+    ExWaitForRundownProtectionRelease(&g_InjRundown);
 }
 
 NTSTATUS InjSetDllPath(UCHAR Role, BOOLEAN IsX86, const VOID* Path, ULONG PathBytes)
@@ -697,6 +764,37 @@ VOID InjSetEnabled(BOOLEAN Enabled)
     KeReleaseSpinLock(&g_Inj.Lock, irql);
 }
 
+BOOLEAN InjIsEnabled(VOID)
+{
+    KIRQL irql;
+    KeAcquireSpinLock(&g_Inj.Lock, &irql);
+    BOOLEAN enabled = g_Inj.Enabled;
+    KeReleaseSpinLock(&g_Inj.Lock, irql);
+    return enabled;
+}
+
+BOOLEAN InjGetTarget(UCHAR Role, ULONG Index, WCHAR* Dest)
+{
+    BOOLEAN found = FALSE;
+    Dest[0] = L'\0';
+    if (!InjRoleValid(Role))
+        return FALSE;
+
+    KIRQL irql;
+    KeAcquireSpinLock(&g_Inj.Lock, &irql);
+    const INJ_PROFILE* prof = &g_Inj.Profile[Role];
+    if (Index < prof->TargetCount) {
+        const INJ_TARGET* t = &prof->Targets[Index];
+        /* Bytes <= (INJ_MAX_PATH - 1) * sizeof(WCHAR), enforced by InjAddTarget. */
+        const ULONG chars = min((ULONG)t->Bytes / sizeof(WCHAR), INJ_MAX_PATH - 1);
+        RtlCopyMemory(Dest, t->Path, chars * sizeof(WCHAR));
+        Dest[chars] = L'\0';
+        found = TRUE;
+    }
+    KeReleaseSpinLock(&g_Inj.Lock, irql);
+    return found;
+}
+
 ULONG InjQueryRole(HANDLE Pid)
 {
     ULONG result = INJ_QUERY_NONE;
@@ -717,57 +815,154 @@ ULONG InjQueryRole(HANDLE Pid)
 /*  Callback hooks (called from NotifyRoutine.c)                      */
 /* ------------------------------------------------------------------ */
 
-VOID InjOnImageLoad(HANDLE ProcessId, PUNICODE_STRING FullImageName,
-    PIMAGE_INFO ImageInfo)
+static VOID InjReport(_In_ HANDLE ProcessId, _In_ UCHAR Role, _In_ NTSTATUS Status,
+    _In_ BOOLEAN IsProtected)
 {
-    if (!FullImageName || !ImageInfo || !ImageInfo->ImageBase) return;
-    if ((ULONG_PTR)ProcessId == 0) return;
+    CHAR json[384];
+    const ULONG tid = (ULONG)(ULONG_PTR)PsGetCurrentThreadId();
+    const CHAR* roleStr = InjRoleName(Role);
 
-    /* Trigger when kernel32 maps in a pending target. KernelBase is already
-       initialized by then; APC is delivered later (no KeTestAlertThread). */
-    if (!UStrEndsWith(FullImageName, L"\\kernel32.dll")) return;
-
-    UCHAR role = INJ_ROLE_GAME;
-    if (!PendingTake(ProcessId, &role)) return;
-
-    BOOLEAN isWow64 = UStrContainsI(FullImageName, L"syswow64");
-
-    /* Reserve the bookkeeping slot first: an inject we cannot account for
-       (IPC authentication relies on it) must not happen at all. */
-    NTSTATUS st;
-    if (!InjectedAdd(ProcessId, role)) {
-        st = STATUS_INSUFFICIENT_RESOURCES;
-    } else {
-        st = DoInjectInContext(isWow64, ImageInfo->ImageBase, role);
-        if (!NT_SUCCESS(st))
-            InjectedRemove(ProcessId);
-    }
-
-    CHAR json[COMS_MAX_MESSAGE_SIZE];
-    ULONG tid = (ULONG)(ULONG_PTR)PsGetCurrentThreadId();
-    const CHAR* roleStr = InjRoleName(role);
-    if (NT_SUCCESS(st)) {
-        /* Only Game inject auto-protects the PID (Sensor = cheat host).
-           This grants PROTECTED only — never TRUSTED. */
-        BOOLEAN isProtected = FALSE;
-        if (role == INJ_ROLE_GAME)
-            isProtected = NT_SUCCESS(StateProtectPid(ProcessId));
+    if (NT_SUCCESS(Status)) {
         RtlStringCchPrintfA(json, ARRAYSIZE(json),
             "{ \"event\": \"apc_inject\", \"pid\": %lu, \"tid\": %lu, "
             "\"status\": \"success\", \"role\": \"%s\", \"protected\": %s }",
             (ULONG)(ULONG_PTR)ProcessId, tid, roleStr,
-            isProtected ? "true" : "false");
+            IsProtected ? "true" : "false");
     } else {
         RtlStringCchPrintfA(json, ARRAYSIZE(json),
             "{ \"event\": \"apc_inject\", \"pid\": %lu, \"tid\": %lu, "
             "\"status\": \"failed\", \"error\": \"0x%08X\", \"role\": \"%s\" }",
-            (ULONG)(ULONG_PTR)ProcessId, tid, st, roleStr);
+            (ULONG)(ULONG_PTR)ProcessId, tid, Status, roleStr);
     }
     ComsSendToUser(json, (ULONG)strlen(json));
     KdPrint(("Peregrine: APC inject role=%s PID=%lu => 0x%08X\n",
-        roleStr, (ULONG)(ULONG_PTR)ProcessId, st));
+        roleStr, (ULONG)(ULONG_PTR)ProcessId, Status));
 }
 
+/*
+ * The actual injection is not done in the load-image notify routine: such a
+ * routine must not allocate, map or otherwise operate on user-space virtual
+ * memory (documented deadlock). The notify routine only queues a kernel-mode
+ * APC to the loading thread; its normal routine runs at PASSIVE_LEVEL in the
+ * same thread and process once the image mapping has completed, and does the
+ * work there (the OpenEDR apcqueue pattern).
+ */
+typedef struct _INJ_WORK {
+    KAPC    Apc;
+    HANDLE  ProcessId;
+    PVOID   Kernel32Base;
+    UCHAR   Role;
+    BOOLEAN IsWow64;
+} INJ_WORK;
+
+static VOID NTAPI InjWorkKernelRoutine(
+    PRKAPC Apc, PKNORMAL_ROUTINE* NormalRoutine,
+    PVOID* NormalContext, PVOID* Sys1, PVOID* Sys2)
+{
+    /* Nothing to do at APC_LEVEL; InjWorkNormalRoutine follows and owns the item. */
+    UNREFERENCED_PARAMETER(Apc);
+    UNREFERENCED_PARAMETER(NormalRoutine);
+    UNREFERENCED_PARAMETER(NormalContext);
+    UNREFERENCED_PARAMETER(Sys1);
+    UNREFERENCED_PARAMETER(Sys2);
+}
+
+static VOID NTAPI InjWorkRundown(PRKAPC Apc)
+{
+    /* The thread went away before the APC was delivered. */
+    INJ_WORK* work = CONTAINING_RECORD(Apc, INJ_WORK, Apc);
+    ExFreePoolWithTag(work, INJ_POOL_TAG);
+    ExReleaseRundownProtection(&g_InjRundown);
+}
+
+/* PASSIVE_LEVEL, in the target process, on the thread that mapped kernel32. */
+static VOID NTAPI InjWorkNormalRoutine(PVOID NormalContext, PVOID Sys1, PVOID Sys2)
+{
+    UNREFERENCED_PARAMETER(Sys1);
+    UNREFERENCED_PARAMETER(Sys2);
+
+    INJ_WORK* work = (INJ_WORK*)NormalContext;
+    const HANDLE processId = work->ProcessId;
+    const UCHAR role = work->Role;
+
+    /* Reserve the bookkeeping slot first: an inject we cannot account for
+       (IPC authentication relies on it) must not happen at all. */
+    NTSTATUS st;
+    if (!InjectedAdd(processId, role)) {
+        st = STATUS_INSUFFICIENT_RESOURCES;
+    } else {
+        st = DoInjectInContext(work->IsWow64, work->Kernel32Base, role);
+        if (!NT_SUCCESS(st))
+            InjectedRemove(processId);
+    }
+
+    /* Only Game inject auto-protects the PID (Sensor = cheat host).
+       This grants PROTECTED only — never TRUSTED. */
+    BOOLEAN isProtected = FALSE;
+    if (NT_SUCCESS(st) && role == INJ_ROLE_GAME)
+        isProtected = NT_SUCCESS(StateProtectPid(processId));
+
+    InjReport(processId, role, st, isProtected);
+
+    ExFreePoolWithTag(work, INJ_POOL_TAG);
+    ExReleaseRundownProtection(&g_InjRundown);
+}
+
+VOID InjOnImageLoad(HANDLE ProcessId, PUNICODE_STRING FullImageName,
+    PIMAGE_INFO ImageInfo)
+{
+    if (!FullImageName || !ImageInfo || !ImageInfo->ImageBase) return;
+    if ((ULONG_PTR)ProcessId == 0 || ImageInfo->SystemModeImage) return;
+
+    /* The image must be mapped by the process itself (its loader). When
+       another process maps a section into the target, this routine runs on
+       the *mapper's* thread: an APC queued here would never run in the game,
+       and reporting success would vouch for a game without our DLL. */
+    if (PsGetCurrentProcessId() != ProcessId) return;
+
+    /* Trigger: the system's own kernel32 for this process' bitness. */
+    const BOOLEAN isWow64 = PsGetProcessWow64Process(PsGetCurrentProcess()) != NULL;
+    if (!UStrEndsWith(FullImageName,
+            isWow64 ? L"\\windows\\syswow64\\kernel32.dll"
+                    : L"\\windows\\system32\\kernel32.dll"))
+        return;
+
+    UCHAR role = INJ_ROLE_GAME;
+    if (!PendingTake(ProcessId, &role)) return;
+
+    NTSTATUS st = STATUS_SUCCESS;
+    INJ_WORK* work = NULL;
+
+    if (!ExAcquireRundownProtection(&g_InjRundown)) {
+        st = STATUS_DELETE_PENDING;
+    } else {
+        work = (INJ_WORK*)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(INJ_WORK), INJ_POOL_TAG);
+        if (!work) {
+            ExReleaseRundownProtection(&g_InjRundown);
+            st = STATUS_INSUFFICIENT_RESOURCES;
+        }
+    }
+
+    if (work) {
+        work->ProcessId = ProcessId;
+        work->Kernel32Base = ImageInfo->ImageBase;
+        work->Role = role;
+        work->IsWow64 = isWow64;
+
+        KeInitializeApc(&work->Apc, (PRKTHREAD)PsGetCurrentThread(), OriginalApcEnvironment,
+            (PKKERNEL_ROUTINE)InjWorkKernelRoutine, (PKRUNDOWN_ROUTINE)InjWorkRundown,
+            (PKNORMAL_ROUTINE)InjWorkNormalRoutine, KernelMode, work);
+
+        if (!KeInsertQueueApc(&work->Apc, NULL, NULL, 0)) {
+            ExFreePoolWithTag(work, INJ_POOL_TAG);
+            ExReleaseRundownProtection(&g_InjRundown);
+            st = STATUS_UNSUCCESSFUL;
+        }
+    }
+
+    if (!NT_SUCCESS(st))
+        InjReport(ProcessId, role, st, FALSE);
+}
 VOID InjOnProcessCreate(HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateInfo)
 {
     if (!CreateInfo || !CreateInfo->FileObject) return;

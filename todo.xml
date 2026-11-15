@@ -20,7 +20,7 @@
   Source of truth for "the game":
     Kernel: StateIsPidProtected (set by add_pid and auto StateAddPid on inject success)
     UI: protectedPids (must stay in sync)
-    DLL: today has NO protected set — only "not self" (must fix)
+    DLL: has NO protected set (task 4, still open) — the UI filter is the safety net; was: today has NO protected set — only "not self" (must fix)
 
   Environments:
     DEV  = edit/build only
@@ -46,16 +46,18 @@
       DLL IPC and UI handleIpcEvent currently use "not self" only — that is noise.
     </description>
 
-    <task id="1" status="todo">
+    <task id="1" status="done" verified="2026-11-15">
       <title>Document policy in README (short "Detection scope" section)</title>
+      <result>README 'Detection scope' section.</result>
       <description>
         State explicitly: Peregrine only cares about protected game PIDs (and AC self-defense).
         External = against game; Internal = inside game. Other processes ignored for AC logs.
       </description>
     </task>
 
-    <task id="2" status="todo">
+    <task id="2" status="done" verified="2026-11-15">
       <title>UI: filter all IPC external events on protectedPids</title>
+      <result>handleIpcEvent filters on protectedPids. VM: cheat.exe (Sensor) against the game logs External RPM/WPM; against notepad nothing.</result>
       <description>
         File: src/peregrine-tauri/src/routes/+page.svelte — handleIpcEvent
 
@@ -81,8 +83,9 @@
       </acceptance>
     </task>
 
-    <task id="3" status="todo">
+    <task id="3" status="done" verified="2026-11-15">
       <title>UI: audit driver-event and ETW paths for game scope</title>
+      <result>Audited: ob_callback / thread_create / image_load are kernel-scoped to PROTECTED, ETW drops non-game and local, file_access stays a separate self-defense class.</result>
       <description>
         Confirm / fix:
         - ETW: already drops if target not in protectedPids — keep; ensure caller==target drop stays
@@ -123,8 +126,9 @@
       </description>
     </task>
 
-    <task id="5" status="todo">
+    <task id="5" status="done" verified="2026-11-15">
       <title>RPM/WPM hooks: do not log every remote; require game target</title>
+      <result>Memory access is hooked once, at ntdll NtRead/NtWriteVirtualMemory (no KernelBase duplicate); self access is not reported; UI drops non-game targets.</result>
       <description>
         dllmain.cpp currently logs all NtR/NtW/RPM/WPM with targetPID without checking game set.
         After task 2/4: either UI drops non-game, or DLL never sends.
@@ -167,8 +171,9 @@
       </description>
     </task>
 
-    <task id="11" status="todo">
+    <task id="11" status="done" verified="2026-11-15">
       <title>Callstack_check only for game-scoped hook fires</title>
+      <result>callstack_check runs on every hooked call and is never rate-limited; only the message is (per hook + target). CallstackAnomaly carries targetPID and is shown for game-scoped calls only. VM: cheat_callstack against the game.</result>
       <description>
         Rate limits (2/min on RPM) already drop signal. After game filter, fewer fires —
         raise limits slightly for game-targeted ops only so real cheats still produce CallstackAnomaly.
@@ -187,8 +192,9 @@
       in README or test/README.
     </description>
 
-    <task id="20" status="todo">
+    <task id="20" status="done" verified="2026-11-15">
       <title>Positive matrix (document + run on VM)</title>
+      <result>Run on the VM against x64 and x86 game builds with the driver under Driver Verifier; matrix and expected output in the README Test Suite.</result>
       <description>
         With injection target = game.exe, connect GUI, let inject + auto-protect:
 
@@ -202,8 +208,9 @@
       </description>
     </task>
 
-    <task id="21" status="todo">
+    <task id="21" status="done" verified="2026-11-15">
       <title>Negative test: external ops against non-game PID</title>
+      <result>No separate tool needed: cheat.exe / cheat_thread.exe / cheat_shellcode.exe against notepad while a game is protected produce no AC line.</result>
       <description>
         New tool e.g. test/cheat_noise.c (or flag on cheat.exe):
         - OpenProcess + RPM against a benign PID (e.g. current process of another helper,
@@ -219,16 +226,18 @@
       </description>
     </task>
 
-    <task id="22" status="todo">
+    <task id="22" status="done" verified="2026-11-15">
       <title>Negative test: activity inside non-game process with no inject</title>
+      <result>Covered by the same run: an uninjected, non-game process produces no hello, no callstack and no handle lines.</result>
       <description>
         Run a process that allocates RWX / calls OpenProcess on itself without being game or inject target.
         Expect: no Peregrine AC cheat hits (no hello, no callstack from our DLL).
       </description>
     </task>
 
-    <task id="23" status="todo">
+    <task id="23" status="done" verified="2026-11-15">
       <title>Positive: internal-only in game still visible</title>
+      <result>cheat_callstack and cheat_hwbp against the game still report (Callstack Anomaly, VEH TAMPER, HW BREAKPOINT).</result>
       <description>
         After inject into game:
         - cheat_callstack / cheat_hwbp targeting game must still show CallstackAnomaly / HWBP events
@@ -237,16 +246,18 @@
       </description>
     </task>
 
-    <task id="24" status="todo">
+    <task id="24" status="done" verified="2026-11-15">
       <title>test/README.md or README Test Suite section: game-scope matrix</title>
+      <result>README Test Suite: tools, technique, expected detection, and the must-be-refused cases (cheat_pipe, cheat_file, cheat_ioctl).</result>
       <description>
         Document positive/negative cases and how to run on VM.
         Explicit pass criteria: zero AC log spam when noise cheat runs against non-game.
       </description>
     </task>
 
-    <task id="25" status="todo">
+    <task id="25" status="done" verified="2026-11-15">
       <title>build.bat: include new noise test binary</title>
+      <result>No noise binary was added (see 21); build.bat builds the new cheat_file / cheat_ioctl tools and documents the game --veh modes.</result>
       <description>
         Wire cheat_noise.exe (or equivalent) into test/build.bat.
       </description>
@@ -255,8 +266,9 @@
 
   <feature name="optional-followups" priority="low">
     <title>Later — only if still game-scoped</title>
-    <task id="30" status="todo" optional="true">
+    <task id="30" status="done" verified="2026-11-15" optional="true">
       <title>Thread ObCallbacks report-only for handles to game threads</title>
+      <result>ObCallback covers PsThreadType for threads of protected processes, report-only, rate-limited with suppressed counts. VM: cheat_thread.</result>
       <description>
         Same filter: only when thread belongs to protected process. No system-wide thread noise.
       </description>

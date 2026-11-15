@@ -14,14 +14,26 @@
 //!     code running inside that process, and must never promote a PID to
 //!     protected/trusted — only the kernel does that.
 //!
+//!   * An authenticated client is still hostile: a Sensor target *is* the
+//!     cheat. Each connection is therefore rate-limited, the queue to the UI
+//!     is bounded, and the number of connections is capped. Whatever is
+//!     dropped is counted and reported (`IpcFlood`), never dropped silently.
+//!   * The identity is re-checked for the lifetime of the connection: the
+//!     server holds a handle to the authenticated process and stops reading
+//!     the moment that process is gone, so a pipe handle passed on to another
+//!     process cannot keep speaking under the old PID.
+//!
 //! Clients get write access only, and explicitly not FILE_CREATE_PIPE_INSTANCE:
 //! with it, any local process could create its own instance of this pipe name
 //! and swallow the DLL's connections.
 
 use crate::driver_comm::{DriverHandle, InjectRole};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+use std::time::Instant;
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
+use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
@@ -42,6 +54,19 @@ const READ_BUF_SIZE: usize = 64 * 1024;
 /// produced a complete JSON object within this many bytes is not our DLL.
 const MAX_PENDING_BYTES: usize = 16 * 1024;
 
+/// Messages waiting for the UI. A full queue drops (and counts) instead of
+/// growing without bound inside this elevated process.
+const QUEUE_DEPTH: usize = 8192;
+
+/// Per-connection budget. The DLL limits itself to a few messages per key and
+/// second; a client far above that is not our DLL behaving normally.
+const CLIENT_BURST: f64 = 200.0;
+const CLIENT_MSGS_PER_SEC: f64 = 100.0;
+
+/// Concurrent connections (each costs a thread and a read buffer).
+const MAX_CLIENTS: usize = 64;
+static ACTIVE_CLIENTS: AtomicUsize = AtomicUsize::new(0);
+
 /// SYSTEM + Administrators: full control.
 /// Authenticated Users: 0x00120192 =
 ///   FILE_GENERIC_WRITE & ~FILE_CREATE_PIPE_INSTANCE | FILE_READ_ATTRIBUTES
@@ -56,13 +81,15 @@ pub enum IpcEvent {
 }
 
 pub fn start_ipc_server() -> Receiver<IpcEvent> {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::sync_channel(QUEUE_DEPTH);
     std::thread::spawn(move || run_server(tx));
     rx
 }
 
-fn status(tx: &Sender<IpcEvent>, online: bool, detail: impl Into<String>) {
-    let _ = tx.send(IpcEvent::ServerStatus { online, detail: detail.into() });
+fn status(tx: &SyncSender<IpcEvent>, online: bool, detail: impl Into<String>) {
+    // Never block the accept loop on a full queue; the next status change
+    // (or the UI reading `backend_status`) corrects a lost one.
+    let _ = tx.try_send(IpcEvent::ServerStatus { online, detail: detail.into() });
 }
 
 /// Security descriptor for the pipe. Allocated once and intentionally kept for
@@ -116,7 +143,7 @@ fn create_instance(
     Ok(pipe)
 }
 
-fn run_server(tx: Sender<IpcEvent>) {
+fn run_server(tx: SyncSender<IpcEvent>) {
     let name: Vec<u16> = PIPE_NAME.encode_utf16().chain(std::iter::once(0)).collect();
 
     let sd = match pipe_security_descriptor() {
@@ -173,32 +200,147 @@ fn run_server(tx: Sender<IpcEvent>) {
         status(&tx, true, "listening");
 
         let connected = std::mem::replace(&mut listening, next);
+        let close = |pipe: HANDLE| unsafe {
+            let _ = DisconnectNamedPipe(pipe);
+            let _ = CloseHandle(pipe);
+        };
+
+        if ACTIVE_CLIENTS.load(Ordering::Relaxed) >= MAX_CLIENTS {
+            eprintln!("[DBG] IPC connection refused: {MAX_CLIENTS} clients already connected");
+            close(connected);
+            continue;
+        }
+
+        ACTIVE_CLIENTS.fetch_add(1, Ordering::Relaxed);
         let client_tx = tx.clone();
         let raw = connected.0 as usize;
-        std::thread::spawn(move || {
-            let pipe = HANDLE(raw as *mut _);
-            serve_client(pipe, &client_tx);
-            let _ = unsafe { DisconnectNamedPipe(pipe) };
-            let _ = unsafe { CloseHandle(pipe) };
-        });
+        let spawned = std::thread::Builder::new()
+            .name("ipc-client".into())
+            .spawn(move || {
+                let pipe = HANDLE(raw as *mut _);
+                serve_client(pipe, &client_tx);
+                unsafe {
+                    let _ = DisconnectNamedPipe(pipe);
+                    let _ = CloseHandle(pipe);
+                }
+                ACTIVE_CLIENTS.fetch_sub(1, Ordering::Relaxed);
+            });
+        if let Err(e) = spawned {
+            // Out of threads: drop this client, keep accepting.
+            eprintln!("[DBG] IPC client thread could not be started: {e}");
+            ACTIVE_CLIENTS.fetch_sub(1, Ordering::Relaxed);
+            close(connected);
+        }
+    }
+}
+
+/// Handle to the authenticated client process, closed on drop.
+struct ClientProcess(HANDLE);
+
+impl ClientProcess {
+    fn alive(&self) -> bool {
+        unsafe { WaitForSingleObject(self.0, 0) != WAIT_OBJECT_0 }
+    }
+}
+
+impl Drop for ClientProcess {
+    fn drop(&mut self) {
+        let _ = unsafe { CloseHandle(self.0) };
     }
 }
 
 /// Identifies the client through the kernel. `Err` means "not ours" or
 /// "cannot be verified" — both are treated as a rejection (fail closed).
-fn authenticate(pipe: HANDLE) -> Result<(u32, InjectRole), String> {
+fn authenticate(pipe: HANDLE) -> Result<(u32, InjectRole, ClientProcess), String> {
     let mut pid = 0u32;
     unsafe { GetNamedPipeClientProcessId(pipe, &mut pid) }
         .map_err(|e| format!("GetNamedPipeClientProcessId failed: {e}"))?;
 
+    // Pin the process *before* asking the kernel about the PID: the kernel
+    // forgets an injected PID when its process exits, so a positive answer
+    // while we hold this handle is about exactly this process, not about a
+    // later one that got the same PID.
+    let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }
+        .map(ClientProcess)
+        .map_err(|e| format!("cannot open client PID {pid}: {e}"))?;
+
     match DriverHandle::open()?.query_injected(pid)? {
-        Some(role) => Ok((pid, role)),
+        Some(role) if process.alive() => Ok((pid, role, process)),
+        Some(_) => Err(format!("PID {pid} exited during authentication")),
         None => Err(format!("PID {pid} is not a process the kernel injected")),
     }
 }
 
-fn serve_client(pipe: HANDLE, tx: &Sender<IpcEvent>) {
-    let (pid, role) = match authenticate(pipe) {
+/// Token bucket for one connection.
+struct Budget {
+    tokens: f64,
+    last: Instant,
+}
+
+impl Budget {
+    fn new() -> Self {
+        Self { tokens: CLIENT_BURST, last: Instant::now() }
+    }
+
+    fn take(&mut self) -> bool {
+        let now = Instant::now();
+        let refill = now.duration_since(self.last).as_secs_f64() * CLIENT_MSGS_PER_SEC;
+        self.tokens = (self.tokens + refill).min(CLIENT_BURST);
+        self.last = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Forwards one message unless the client is over budget or the UI queue is
+/// full; `dropped` accumulates what was not forwarded and is announced ahead
+/// of the next message that does get through. `false`: the receiver is gone.
+fn forward(
+    tx: &SyncSender<IpcEvent>,
+    budget: &mut Budget,
+    dropped: &mut u64,
+    pid: u32,
+    role: InjectRole,
+    msg: serde_json::Value,
+) -> bool {
+    if !budget.take() {
+        *dropped += 1;
+        return true;
+    }
+
+    if *dropped > 0 {
+        let notice = serde_json::json!({
+            "event": "IpcFlood",
+            "callerPID": pid,
+            "role": role.as_str(),
+            "dropped": *dropped,
+        });
+        match tx.try_send(IpcEvent::Message(notice)) {
+            Ok(()) => *dropped = 0,
+            Err(TrySendError::Full(_)) => {
+                *dropped += 1;
+                return true;
+            }
+            Err(TrySendError::Disconnected(_)) => return false,
+        }
+    }
+
+    match tx.try_send(IpcEvent::Message(msg)) {
+        Ok(()) => true,
+        Err(TrySendError::Full(_)) => {
+            *dropped += 1;
+            true
+        }
+        Err(TrySendError::Disconnected(_)) => false,
+    }
+}
+
+fn serve_client(pipe: HANDLE, tx: &SyncSender<IpcEvent>) {
+    let (pid, role, process) = match authenticate(pipe) {
         Ok(identity) => identity,
         Err(reason) => {
             // Deliberately not forwarded to the UI log: any local process can
@@ -211,6 +353,8 @@ fn serve_client(pipe: HANDLE, tx: &Sender<IpcEvent>) {
 
     let mut buf = vec![0u8; READ_BUF_SIZE];
     let mut pending: Vec<u8> = Vec::new();
+    let mut budget = Budget::new();
+    let mut dropped = 0u64;
 
     loop {
         let mut read = 0u32;
@@ -218,17 +362,26 @@ fn serve_client(pipe: HANDLE, tx: &Sender<IpcEvent>) {
         if ok.is_err() || read == 0 {
             break;
         }
+        // Whoever wrote these bytes must still be the process we verified.
+        if !process.alive() {
+            eprintln!("[DBG] IPC PID {pid}: data after the authenticated process exited, dropping");
+            break;
+        }
         pending.extend_from_slice(&buf[..read as usize]);
 
-        // Each message is one {...} object, written back to back.
-        while let Some(end) = find_json_end(&pending) {
-            if let Some(msg) = parse_message(&pending[..=end], pid, role) {
-                if tx.send(IpcEvent::Message(msg)).is_err() {
+        // Each message is one {...} object, written back to back. Scan with a
+        // cursor and remove the consumed prefix once per read.
+        let mut start = 0usize;
+        while let Some(len) = find_json_end(&pending[start..]) {
+            let end = start + len;
+            if let Some(msg) = parse_message(&pending[start..=end], pid, role) {
+                if !forward(tx, &mut budget, &mut dropped, pid, role, msg) {
                     return;
                 }
             }
-            pending.drain(..=end);
+            start = end + 1;
         }
+        pending.drain(..start);
 
         if pending.len() > MAX_PENDING_BYTES {
             eprintln!("[DBG] IPC PID {pid}: no JSON boundary in {} bytes, dropping client", pending.len());
@@ -313,6 +466,46 @@ mod tests {
         assert_eq!(msg["callerPID"], 1234);
         assert_eq!(msg["role"], "sensor");
         assert_eq!(msg["event"], "hello");
+    }
+
+    #[test]
+    fn budget_allows_a_burst_then_throttles() {
+        let mut budget = Budget::new();
+        let allowed = (0..1000).filter(|_| budget.take()).count();
+        // The whole burst, plus at most the little that refills while looping.
+        assert!(allowed >= CLIENT_BURST as usize);
+        assert!(allowed < CLIENT_BURST as usize + 50, "allowed {allowed}");
+    }
+
+    #[test]
+    fn over_budget_messages_are_counted_and_announced() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(QUEUE_DEPTH);
+        let mut budget = Budget { tokens: 1.0, last: Instant::now() };
+        let mut dropped = 0u64;
+        let msg = || serde_json::json!({ "event": "x" });
+
+        assert!(forward(&tx, &mut budget, &mut dropped, 7, InjectRole::Sensor, msg()));
+        // Out of tokens: swallowed, but counted.
+        budget.tokens = 0.0;
+        budget.last = Instant::now();
+        assert!(forward(&tx, &mut budget, &mut dropped, 7, InjectRole::Sensor, msg()));
+        assert_eq!(dropped, 1);
+        // Budget back: the notice goes out ahead of the message.
+        budget.tokens = 5.0;
+        assert!(forward(&tx, &mut budget, &mut dropped, 7, InjectRole::Sensor, msg()));
+        assert_eq!(dropped, 0);
+
+        let events: Vec<serde_json::Value> = rx
+            .try_iter()
+            .filter_map(|e| match e {
+                IpcEvent::Message(m) => Some(m),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[1]["event"], "IpcFlood");
+        assert_eq!(events[1]["dropped"], 1);
+        assert_eq!(events[1]["callerPID"], 7);
     }
 
     #[test]

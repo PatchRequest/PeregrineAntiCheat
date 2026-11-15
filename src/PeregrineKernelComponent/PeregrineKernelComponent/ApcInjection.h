@@ -23,6 +23,9 @@
 #define INJ_QUERY_SENSOR ((ULONG)2)
 
 VOID InjInit(VOID);
+/* DriverUnload, after the notify routines are gone: waits until no APC that
+   runs code of this image is pending any more. */
+VOID InjWaitForApcs(VOID);
 
 /* Path: UTF-16LE DOS path of the DLL, no terminator, possibly unaligned. */
 NTSTATUS InjSetDllPath(_In_ UCHAR Role, _In_ BOOLEAN IsX86,
@@ -40,6 +43,13 @@ NTSTATUS InjAddTarget(_In_ UCHAR Role,
     _In_ ULONG PathBytes);
 NTSTATUS InjClearTargets(VOID);
 VOID     InjSetEnabled(_In_ BOOLEAN Enabled);
+
+/* State readback for the GUI (IOCTL_PEREGRINE_QUERY_STATE). */
+BOOLEAN  InjIsEnabled(VOID);
+/* Copies target number Index of Role (upper-cased NT path, NUL-terminated)
+   into Dest. FALSE once Index is past the end of the list. */
+BOOLEAN  InjGetTarget(_In_ UCHAR Role, _In_ ULONG Index,
+    _Out_writes_(INJ_MAX_PATH) WCHAR* Dest);
 
 /* INJ_QUERY_*: which of our DLLs (if any) the kernel injected into Pid. */
 ULONG    InjQueryRole(_In_ HANDLE Pid);

@@ -5,28 +5,32 @@
 #include <tlhelp32.h>
 
 /*
- * Hardware-breakpoint / FakeVEH / debug-register smoke test.
+ * FakeVEH / hardware-breakpoint smoke test — the two halves of a VEH hook.
  *
- * Two attack phases:
- *   Phase A — FakeVEH simulation: injects shellcode into game.exe that
- *             calls AddVectoredExceptionHandler, modifying the VEH list
- *             from inside the process.  Triggers DR0 hardware breakpoint
- *             → VehTableTamper event.
+ *   Phase A — FakeVEH: injects shellcode into game.exe that registers a
+ *             vectored exception handler which itself lives in the injected
+ *             (unbacked) memory, keeps it for 3 s and removes it again.
+ *             Expected: [VEH TAMPER] unbacked exception handler … (twice:
+ *             once from the registration hook, once from the list scan).
  *
- *   Phase B — DR clearing: zeroes DR0-DR7 on game threads via remote
- *             SetThreadContext.  Triggers DebugRegisterClearing (hook)
- *             and DebugRegisterTamper (watchdog re-arm).
+ *   Phase B — Hardware breakpoint: sets DR0 + DR7 on every game thread via
+ *             remote SetThreadContext (a write watch on an address nothing
+ *             ever writes to, so the game is not disturbed), leaves it for
+ *             a few seconds and clears it again.
+ *             Expected: [HW BREAKPOINT] … for each thread.
  *
  * Usage:
- *   cheat_hwbp.exe <PID>           full test (VEH inject + DR clear)
- *   cheat_hwbp.exe <PID> --veh     VEH injection only, don't clear DRs
+ *   cheat_hwbp.exe <PID>           full test (FakeVEH + hardware breakpoints)
+ *   cheat_hwbp.exe <PID> --veh     FakeVEH only
  *   cheat_hwbp.exe <PID> --read    just dump DR registers, no attacks
  */
 
-#ifndef CONTEXT_AMD64
-#define CONTEXT_AMD64  0x00100000
-#endif
-#define CONTEXT_DBG_REGS  (CONTEXT_AMD64 | 0x10)
+#define CONTEXT_DBG_REGS  CONTEXT_DEBUG_REGISTERS
+
+/* DR7: L0 (bit 0) + write-only condition (bits 16-17 = 01), 1 byte. */
+#define DR7_WRITE_WATCH_DR0  0x00010001ULL
+/* An address in the never-mapped first page: armed, but can never trigger. */
+#define WATCH_ADDRESS        0x10ULL
 
 typedef struct { DWORD tid; HANDLE handle; } ThreadSlot;
 #define MAX_THREADS 64
@@ -67,6 +71,25 @@ static void print_dr_regs(DWORD tid, HANDLE th)
     ResumeThread(th);
 }
 
+static void set_dr_regs(DWORD tid, HANDLE th)
+{
+    SuspendThread(th);
+    CONTEXT ctx;  memset(&ctx, 0, sizeof(ctx));  ctx.ContextFlags = CONTEXT_DBG_REGS;
+    if (GetThreadContext(th, &ctx)) {
+        ctx.Dr0 = WATCH_ADDRESS;
+        ctx.Dr7 = DR7_WRITE_WATCH_DR0;
+        ctx.Dr6 = 0;
+        ctx.ContextFlags = CONTEXT_DBG_REGS;
+        if (SetThreadContext(th, &ctx))
+            printf("  TID %5lu: hardware breakpoint set\n", (unsigned long)tid);
+        else
+            printf("  TID %5lu: SetThreadContext failed (%lu)\n", (unsigned long)tid, GetLastError());
+    } else {
+        printf("  TID %5lu: GetThreadContext failed (%lu)\n", (unsigned long)tid, GetLastError());
+    }
+    ResumeThread(th);
+}
+
 static void clear_dr_regs(DWORD tid, HANDLE th)
 {
     SuspendThread(th);
@@ -87,7 +110,7 @@ static void clear_dr_regs(DWORD tid, HANDLE th)
 /* ------------------------------------------------------------------ */
 /* FakeVEH simulation — shellcode that calls AddVectoredExceptionHandler */
 /* inside the target process, modifying LdrpVectorHandlerList.          */
-/* This triggers the DR0 hardware breakpoint (VehTableTamper event).    */
+/* The handler is the shellcode itself: unbacked -> VehTableTamper.      */
 /* ------------------------------------------------------------------ */
 
 /*
@@ -215,8 +238,8 @@ int main(int argc, char* argv[])
 {
     if (argc < 2) {
         printf("Usage: cheat_hwbp.exe <target_PID> [--veh | --read]\n\n");
-        printf("  (no flag)  Full test: FakeVEH injection + DR register clearing\n");
-        printf("  --veh      VEH injection only (triggers VehTableTamper)\n");
+        printf("  (no flag)  Full test: FakeVEH injection + hardware breakpoints\n");
+        printf("  --veh      FakeVEH injection only (triggers VEH TAMPER)\n");
         printf("  --read     Just dump DR registers, no attacks\n");
         return 1;
     }
@@ -225,7 +248,7 @@ int main(int argc, char* argv[])
     int mode_veh  = (argc >= 3 && strcmp(argv[2], "--veh") == 0);
     int mode_read = (argc >= 3 && strcmp(argv[2], "--read") == 0);
 
-    const char* modeStr = mode_read ? "READ ONLY" : mode_veh ? "VEH INJECTION ONLY" : "FULL (VEH + DR CLEAR)";
+    const char* modeStr = mode_read ? "READ ONLY" : mode_veh ? "VEH INJECTION ONLY" : "FULL (FakeVEH + HW BREAKPOINTS)";
     printf("[HWBP] PID %lu (self %lu) — mode: %s\n\n", pid, GetCurrentProcessId(), modeStr);
 
     /* Collect threads for DR operations */
@@ -262,25 +285,24 @@ int main(int argc, char* argv[])
 
     if (mode_veh) goto done;
 
-    /* Phase B: Clear DR registers */
+    /* Phase B: hardware breakpoints on the game's threads */
     Sleep(1000);
-    printf("[HWBP] === Phase B: Clear DR registers (SetThreadContext) ===\n");
+    printf("[HWBP] === Phase B: set hardware breakpoints (remote SetThreadContext) ===\n");
+    for (int i = 0; i < tcount; i++)
+        set_dr_regs(threads[i].tid, threads[i].handle);
+    printf("\n");
+
+    printf("[HWBP] === Verify set ===\n");
+    for (int i = 0; i < tcount; i++)
+        print_dr_regs(threads[i].tid, threads[i].handle);
+    printf("\n");
+
+    printf("[HWBP] === Leaving them armed for 6s (Peregrine scans every 2s)... ===\n");
+    Sleep(6000);
+
+    printf("[HWBP] === Clean up: clear the breakpoints again ===\n");
     for (int i = 0; i < tcount; i++)
         clear_dr_regs(threads[i].tid, threads[i].handle);
-    printf("\n");
-    Sleep(1000);
-
-    printf("[HWBP] === Verify cleared ===\n");
-    for (int i = 0; i < tcount; i++)
-        print_dr_regs(threads[i].tid, threads[i].handle);
-    printf("\n");
-
-    printf("[HWBP] === Waiting 10s for Peregrine watchdog to re-arm... ===\n");
-    Sleep(10000);
-
-    printf("[HWBP] === Re-read (should be re-armed) ===\n");
-    for (int i = 0; i < tcount; i++)
-        print_dr_regs(threads[i].tid, threads[i].handle);
     printf("\n");
 
 done:
@@ -288,11 +310,9 @@ done:
         CloseHandle(threads[i].handle);
 
     printf("[HWBP] Done. Expected Peregrine events:\n");
-    if (!mode_read) printf("  - VehTableTamper       (DR0 breakpoint on VEH list write)\n");
-    if (!mode_read && !mode_veh) {
-        printf("  - DebugRegisterClearing (NtSetContextThread hook)\n");
-        printf("  - DebugRegisterTamper   (watchdog re-arm)\n");
-    }
+    if (!mode_read) printf("  - [VEH TAMPER]     unbacked exception handler (registration hook + list scan)\n");
+    if (!mode_read && !mode_veh)
+        printf("  - [HW BREAKPOINT]  one line per game thread\n");
     if (mode_read) printf("  - (none — read-only mode)\n");
     printf("\nPress Enter to exit.\n");
     getchar();

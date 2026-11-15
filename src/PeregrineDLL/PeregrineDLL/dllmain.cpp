@@ -1,7 +1,7 @@
 // dllmain.cpp : Defines the entry point for the DLL application.
 //
 // Build roles (PEREGRINE_DLL_ROLE):
-//   0 = Game   — full hooks + HWBP/VEH (inject into protected game)
+//   0 = Game   — full hooks + VEH / hardware-breakpoint detection (inject into protected game)
 //   1 = Sensor — external API hooks + callstack, no HWBP (inject into cheats)
 //
 #include "pch.h"
@@ -83,6 +83,15 @@ static NtSetContextThread_t     oNtSetContextThread = nullptr;
 // ipc_log_event_limited (per event + target PID), so an API called in a loop
 // yields a few lines plus a suppressed count instead of a flood.
 
+// A hook must be invisible to its caller: everything it does after the real
+// call (PID lookups, the pipe write) may change the thread's last-error value,
+// which the host reads right after the API returns.
+struct KeepLastError {
+    DWORD value;
+    KeepLastError() : value(GetLastError()) {}
+    ~KeepLastError() { SetLastError(value); }
+};
+
 // PID behind a process handle. GetProcessId needs QUERY_(LIMITED_)INFORMATION,
 // which a handle opened with e.g. only PROCESS_VM_READ lacks — exactly the
 // handle an external reader uses — so fall back to a re-opened duplicate.
@@ -109,6 +118,7 @@ static DWORD TargetPidOf(HANDLE hProcess) {
 // operation exactly once and also covers callers that skip KernelBase.
 static NTSTATUS NTAPI HookNtReadVirtualMemory(HANDLE hProcess, PVOID base, PVOID buf, SIZE_T size, PSIZE_T pRead) {
     NTSTATUS status = oNtReadVirtualMemory(hProcess, base, buf, size, pRead);
+    KeepLastError keep;
     DWORD targetPID = TargetPidOf(hProcess);
     callstack_check("NtReadVirtualMemory", targetPID);
     if (targetPID != PID) {
@@ -121,6 +131,7 @@ static NTSTATUS NTAPI HookNtReadVirtualMemory(HANDLE hProcess, PVOID base, PVOID
 
 static NTSTATUS NTAPI HookNtWriteVirtualMemory(HANDLE hProcess, PVOID base, PVOID buf, SIZE_T size, PSIZE_T pWritten) {
     NTSTATUS status = oNtWriteVirtualMemory(hProcess, base, buf, size, pWritten);
+    KeepLastError keep;
     DWORD targetPID = TargetPidOf(hProcess);
     callstack_check("NtWriteVirtualMemory", targetPID);
     if (targetPID != PID) {
@@ -133,6 +144,7 @@ static NTSTATUS NTAPI HookNtWriteVirtualMemory(HANDLE hProcess, PVOID base, PVOI
 
 static LPVOID WINAPI HookVirtualAllocEx(HANDLE hProcess, LPVOID lpAddr, SIZE_T dwSize, DWORD flType, DWORD flProtect) {
     LPVOID result = oVirtualAllocEx(hProcess, lpAddr, dwSize, flType, flProtect);
+    KeepLastError keep;
     DWORD targetPID = TargetPidOf(hProcess);
     callstack_check("VirtualAllocEx", targetPID);
     if (targetPID != PID) {
@@ -145,6 +157,7 @@ static LPVOID WINAPI HookVirtualAllocEx(HANDLE hProcess, LPVOID lpAddr, SIZE_T d
 
 static BOOL WINAPI HookVirtualProtectEx(HANDLE hProcess, LPVOID lpAddr, SIZE_T dwSize, DWORD flNew, PDWORD lpflOld) {
     BOOL result = oVirtualProtectEx(hProcess, lpAddr, dwSize, flNew, lpflOld);
+    KeepLastError keep;
     DWORD targetPID = TargetPidOf(hProcess);
     callstack_check("VirtualProtectEx", targetPID);
     if (targetPID != PID) {
@@ -158,6 +171,7 @@ static BOOL WINAPI HookVirtualProtectEx(HANDLE hProcess, LPVOID lpAddr, SIZE_T d
 static HANDLE WINAPI HookCreateRemoteThread(HANDLE hProcess, LPSECURITY_ATTRIBUTES lpAttr, SIZE_T dwStackSize,
     LPTHREAD_START_ROUTINE lpStart, LPVOID lpParam, DWORD dwFlags, LPDWORD lpTid) {
     HANDLE result = oCreateRemoteThread(hProcess, lpAttr, dwStackSize, lpStart, lpParam, dwFlags, lpTid);
+    KeepLastError keep;
     DWORD targetPID = TargetPidOf(hProcess);
     callstack_check("CreateRemoteThread", targetPID);
     if (targetPID != PID) {
@@ -170,6 +184,7 @@ static HANDLE WINAPI HookCreateRemoteThread(HANDLE hProcess, LPSECURITY_ATTRIBUT
 
 static HANDLE WINAPI HookOpenProcess(DWORD dwAccess, BOOL bInherit, DWORD dwPID) {
     HANDLE result = oOpenProcess(dwAccess, bInherit, dwPID);
+    KeepLastError keep;
     callstack_check("OpenProcess", dwPID);
     // Same access the kernel ObCallback reports (obCallback.c DANGEROUS_PROCESS_ACCESS),
     // including not-yet-resolved generic / MAXIMUM_ALLOWED requests.
@@ -184,19 +199,30 @@ static HANDLE WINAPI HookOpenProcess(DWORD dwAccess, BOOL bInherit, DWORD dwPID)
 }
 
 #if !PEREGRINE_IS_SENSOR
-#define CONTEXT_DBG_REGS_FLAG 0x00100010
-
+// Game only: somebody *inside* the game installs a hardware breakpoint on a
+// game thread — the second half of a VEH/HWBP hook (see hwbp.c). A remote
+// SetThreadContext from another process never passes through here; the
+// watchdog in hwbp.c reports its result instead.
 static LONG NTAPI HookNtSetContextThread(HANDLE hThread, PCONTEXT ctx) {
-    if (!g_hwbp_arming && ctx && (ctx->ContextFlags & CONTEXT_DBG_REGS_FLAG) == CONTEXT_DBG_REGS_FLAG) {
-        if (ctx->Dr0 == 0 && ctx->Dr1 == 0 && ctx->Dr2 == 0 && ctx->Dr3 == 0 && ctx->Dr7 == 0) {
-            callstack_check("NtSetContextThread", GetProcessIdOfThread(hThread));
-            DWORD tid = GetThreadId(hThread);
-            ipc_log_event("DebugRegisterClearing",
-                "\"callerPID\":%lu,\"threadId\":%lu",
-                PID, (unsigned long)tid);
+    // CONTEXT_DEBUG_REGISTERS from winnt.h: the value differs between x86 and x64.
+    const bool setsBreakpoint =
+        ctx &&
+        (ctx->ContextFlags & CONTEXT_DEBUG_REGISTERS) == CONTEXT_DEBUG_REGISTERS &&
+        (ctx->Dr7 & 0xFF) != 0;   // DR7 bits 0-7: local/global enables of DR0-DR3
+
+    LONG status = oNtSetContextThread(hThread, ctx);
+    KeepLastError keep;
+
+    if (setsBreakpoint) {
+        DWORD targetPID = GetProcessIdOfThread(hThread);
+        callstack_check("NtSetContextThread", targetPID);
+        if (targetPID == PID) {
+            ipc_log_event_limited("DebugRegisterSet", NULL, PID,
+                "\"callerPID\":%lu,\"threadId\":%lu,\"dr7\":\"0x%llX\"",
+                PID, (unsigned long)GetThreadId(hThread), (unsigned long long)ctx->Dr7);
         }
     }
-    return oNtSetContextThread(hThread, ctx);
+    return status;
 }
 #endif
 
@@ -262,8 +288,9 @@ static DWORD WINAPI InitThread(LPVOID) {
     InstallHook(kb, k32, "OpenProcess",        (void**)&oOpenProcess,        (void*)HookOpenProcess);
 
 #if !PEREGRINE_IS_SENSOR
-    // Game only: debug register / VEH protection
+    // Game only: VEH handler / hardware breakpoint detection (hwbp.c)
     InstallHook(ntdll, NULL, "NtSetContextThread", (void**)&oNtSetContextThread, (void*)HookNtSetContextThread);
+    InstallHook(ntdll, NULL, "RtlAddVectoredExceptionHandler", (void**)&hwbp_orig_add_veh, (void*)hwbp_hook_add_veh);
 #endif
 
     callstack_init();
@@ -272,11 +299,18 @@ static DWORD WINAPI InitThread(LPVOID) {
 #endif
     DebugLog("[PeregrineDLL] Initialization complete\n");
 
-    char exeName[MAX_PATH] = {0};
-    GetModuleFileNameA(NULL, exeName, MAX_PATH);
-    const char* baseName = exeName;
-    for (const char* p = exeName; *p; p++)
-        if (*p == '\\' || *p == '/') baseName = p + 1;
+    // Image base name as UTF-8 (the pipe carries JSON; an ANSI name with
+    // non-ASCII characters would make the whole message invalid).
+    wchar_t exePath[MAX_PATH] = {0};
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    const wchar_t* baseNameW = exePath;
+    for (const wchar_t* p = exePath; *p; p++)
+        if (*p == L'\\' || *p == L'/') baseNameW = p + 1;
+
+    char baseName[MAX_PATH * 3] = {0};
+    WideCharToMultiByte(CP_UTF8, 0, baseNameW, -1, baseName, sizeof(baseName), NULL, NULL);
+    for (char* p = baseName; *p; p++)
+        if (*p == '"' || *p == '\\' || (unsigned char)*p < 0x20) *p = '_';
 
 #if PEREGRINE_IS_SENSOR
     ipc_log_event("hello",

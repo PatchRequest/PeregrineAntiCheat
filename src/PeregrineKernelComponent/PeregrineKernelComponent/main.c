@@ -13,6 +13,8 @@ VOID DriverUnload(PDRIVER_OBJECT DriverObject) {
     UNREFERENCED_PARAMETER(DriverObject);
     MfCleanup();
     unregisterNotifyRoutine();
+    /* No new inject APC can be queued now; wait for the ones in flight. */
+    InjWaitForApcs();
     unregisterRegistration();
     ComsCleanup();
     KdPrint(("Peregrine: Unload called\n"));

@@ -11,6 +11,11 @@
 #define IOCTL_PEREGRINE_RECV_TO_USER   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
 /* in: ULONG pid; out: ULONG INJ_QUERY_* — did the kernel inject one of our DLLs into this PID? */
 #define IOCTL_PEREGRINE_QUERY_INJECTED CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
+/* out: JSON text (no NUL) describing the kernel's current configuration:
+   { "injection_enabled": bool, "protected": [pid, ...],
+     "targets": [ { "role": "game"|"sensor", "path": "<upper-cased NT path>" }, ... ] }
+   The kernel is the source of truth for this; a GUI that (re)starts reads it back. */
+#define IOCTL_PEREGRINE_QUERY_STATE    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 /*
  * Command bytes for IOCTL_PEREGRINE_SEND_FROM_USER.
